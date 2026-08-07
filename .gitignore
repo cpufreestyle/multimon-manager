@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
+
+# 运行时生成的图标（resources.py 自动生成）
+app.ico
+
+# 调试/临时产物
+*.txt
+_out_*
