@@ -1,4 +1,5 @@
 """入口：启动多屏管理器（GUI + 系统托盘），跨 Windows / macOS。"""
+import atexit
 import os
 import sys
 import tkinter as tk
@@ -6,6 +7,20 @@ import tkinter as tk
 import backend
 import resources
 import ui
+
+
+def _cleanup():
+    """进程退出时释放 COM 资源。"""
+    if sys.platform == "win32":
+        try:
+            dw = backend.wallpaper.get_desktop_wallpaper()
+            if hasattr(dw, "close"):
+                dw.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+atexit.register(_cleanup)
 
 
 def main():

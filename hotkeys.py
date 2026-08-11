@@ -96,14 +96,17 @@ class HotkeyManager:
         wc.hInstance = kernel32.GetModuleHandleW(None)
         try:
             atom = user32.RegisterClassExW(ctypes.byref(wc))
-            self._reg_err = ctypes.GetLastError() if not atom else 0
+            if not atom:
+                print(f"[hotkeys] RegisterClassExW 失败, err={ctypes.GetLastError()}")
         except Exception as e:  # noqa: BLE001
-            self._reg_err = -1
             print("[hotkeys] RegisterClassExW 异常:", e)
         self.hwnd = user32.CreateWindowExW(
             0, self._clsname, "hk", 0, 0, 0, 0, 0, wintypes.HWND(-3), None, None, None
         )
-        self._create_err = ctypes.GetLastError() if not self.hwnd else 0
+        if not self.hwnd:
+            print("[hotkeys] CreateWindowExW 失败")
+            self._running = False
+            return
         for hid, (mod, vk, _cb) in self.hotkeys.items():
             if not user32.RegisterHotKey(self.hwnd, hid, mod, vk):
                 print(f"[hotkeys] 注册失败 id={hid} (mod={mod}, vk={vk})")
@@ -111,7 +114,7 @@ class HotkeyManager:
         while self._running and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == WM_HOTKEY:
                 entry = self.hotkeys.get(msg.wParam)
-                if entry:
+                if entry and self._running:  # 仅在 running 时回调
                     try:
                         entry[2]()
                     except Exception as e:  # noqa: BLE001
@@ -127,9 +130,12 @@ class HotkeyManager:
 
     def stop(self):
         self._running = False
-        if self.hwnd:
-            for hid in self.hotkeys:
+        # 复制一份再遍历，防止字典在迭代中修改
+        hks = dict(self.hotkeys)
+        for hid in hks:
+            if self.hwnd:
                 user32.UnregisterHotKey(self.hwnd, hid)
+        if self.hwnd:
             try:
                 user32.PostMessageW(self.hwnd, WM_DESTROY, 0, 0)
             except Exception:  # noqa: BLE001
@@ -139,6 +145,7 @@ class HotkeyManager:
             except Exception:  # noqa: BLE001
                 pass
             self.hwnd = None
+        self.hotkeys.clear()
 
 
 if __name__ == "__main__":

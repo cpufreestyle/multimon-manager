@@ -6,6 +6,7 @@ macOS 坐标系原点在左下角，且与图像坐标 y 轴相反；这里统�
 """
 import json
 import subprocess
+import time
 
 try:
     from monitors import MonitorInfo
@@ -36,6 +37,11 @@ except ImportError:  # 独立运行
             return (self.work_left, self.work_top, self.work_width, self.work_height)
 
 
+# 枚举结果缓存（TTL=2s）
+_cache = {"data": None, "ts": 0}
+_CACHE_TTL = 2.0
+
+
 def _run(cmd):
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
@@ -45,7 +51,10 @@ def _run(cmd):
 
 
 def enum_monitors():
-    """枚举所有显示器，返回 MonitorInfo 列表（按系统排列顺序）。"""
+    """枚举所有显示器，返回 MonitorInfo 列表（按系统排列顺序）。带短期缓存。"""
+    now = time.time()
+    if _cache["data"] is not None and (now - _cache["ts"]) < _CACHE_TTL:
+        return list(_cache["data"])
     raw = _run(["system_profiler", "SPDisplaysDataType", "-json"])
     monitors = []
     if not raw:
@@ -113,7 +122,9 @@ def enum_monitors():
             work_width=w,
             work_height=h,
         ))
-    return monitors
+    _cache["data"] = list(monitors)
+    _cache["ts"] = time.time()
+    return list(monitors)
 
 
 def get_virtual_screen():
@@ -129,11 +140,10 @@ def get_virtual_screen():
 
 
 def get_primary_monitor():
-    ms = enum_monitors()
-    for m in ms:
+    for m in enum_monitors():
         if m.is_primary:
             return m
-    return ms[0] if ms else None
+    return None
 
 
 if __name__ == "__main__":

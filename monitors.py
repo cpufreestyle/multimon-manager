@@ -1,9 +1,14 @@
 """显示器枚举与虚拟桌面信息（纯 ctypes，无第三方依赖）。"""
 import ctypes
+import time
 from ctypes import wintypes
 from dataclasses import dataclass
 
 user32 = ctypes.windll.user32
+
+# 枚举结果缓存（TTL=2s，避免同一次操作内重复调用 Windows API）
+_cache = {"data": None, "ts": 0}
+_CACHE_TTL = 2.0
 
 
 class RECT(ctypes.Structure):
@@ -53,7 +58,10 @@ class MonitorInfo:
 
 
 def enum_monitors():
-    """枚举所有显示器，返回 MonitorInfo 列表（按设备顺序排列）。"""
+    """枚举所有显示器，返回 MonitorInfo 列表（按设备顺序排列）。带短期缓存。"""
+    now = time.time()
+    if _cache["data"] is not None and (now - _cache["ts"]) < _CACHE_TTL:
+        return list(_cache["data"])
     monitors = []
 
     def callback(hmon, hdc, lprect, lparam):
@@ -89,7 +97,9 @@ def enum_monitors():
     ]
     user32.EnumDisplayMonitors.restype = ctypes.c_bool
     user32.EnumDisplayMonitors(None, None, proc, None)
-    return monitors
+    _cache["data"] = list(monitors)
+    _cache["ts"] = time.time()
+    return list(monitors)
 
 
 def get_virtual_screen():
@@ -105,8 +115,7 @@ def get_primary_monitor():
     for m in enum_monitors():
         if m.is_primary:
             return m
-    ms = enum_monitors()
-    return ms[0] if ms else None
+    return None
 
 
 if __name__ == "__main__":

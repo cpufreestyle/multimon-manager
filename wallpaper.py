@@ -68,8 +68,10 @@ class DesktopWallpaper:
         self.pv = None
         self._vtbl = None
         self._available = False
+        self._coinit = False
         try:
-            ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+            hr = ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+            self._coinit = hr >= 0
             self._create()
             self._available = True
         except Exception as e:  # noqa: BLE001
@@ -112,6 +114,22 @@ class DesktopWallpaper:
         """monitor_id 为设备路径（如 \\\\.\\DISPLAY1）；None 表示所有显示器。"""
         self._SetWallpaper(self.pv, monitor_id, path)
 
+    def close(self):
+        """释放 COM 资源。"""
+        if self.pv is not None:
+            self.pv = None
+            self._vtbl = None
+        if self._coinit:
+            try:
+                ole32.CoUninitialize()
+            except Exception:  # noqa: BLE001
+                pass
+            self._coinit = False
+        self._available = False
+
+    def __del__(self):
+        self.close()
+
 
 _dw = None
 
@@ -147,7 +165,7 @@ def apply_single(image_path, position="fill"):
 
 
 def _set_legacy(path, position):
-    """无 COM 时的回退方案：设置注册表并调用 SystemParametersInfoW。"""
+    """无 COM 时的回退方案：设置注册表并调用 SystemParametersInfoW + 广播刷新。"""
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop", 0, winreg.KEY_SET_VALUE)
@@ -159,6 +177,13 @@ def _set_legacy(path, position):
     except Exception:  # noqa: BLE001
         pass
     user32.SystemParametersInfoW(20, 0, path, 3)  # SPI_SETDESKWALLPAPER | UPDATEINIFILE | SENDCHANGE
+    # 额外广播 WM_SETTINGCHANGE 确保所有窗口即时刷新
+    HWND_BROADCAST = 0xFFFF
+    WM_SETTINGCHANGE = 0x001A
+    user32.SendNotifyMessageW = ctypes.windll.user32.SendNotifyMessageW
+    user32.SendNotifyMessageW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+    user32.SendNotifyMessageW.restype = ctypes.c_bool
+    user32.SendNotifyMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment")
 
 
 if __name__ == "__main__":

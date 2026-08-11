@@ -1,12 +1,10 @@
 """多屏管理器 GUI（tkinter，零第三方依赖）。"""
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import backend
-import backend as monitors
-import backend as wallpaper
-import backend as windows
-import backend as hotkeys_mod
+from backend import monitors, wallpaper, windows, hotkeys as hotkeys_mod
 import profiles
 
 VK_LEFT = backend.VK_LEFT
@@ -172,11 +170,19 @@ class App:
         if not mapping:
             messagebox.showwarning("提示", "请先为显示器选择图片")
             return
-        if self.mode_var.get() == "single":
-            ok = wallpaper.apply_single(self.single_var.get(), position)
-        else:
-            ok = wallpaper.apply_per_monitor(mapping, position)
-        messagebox.showinfo("完成", "壁纸已应用" if ok else "已用回退方式应用(单屏)")
+        # 校验图片路径存在
+        for dev, img in list(mapping.items()):
+            if img and not os.path.exists(img):
+                messagebox.showwarning("提示", f"图片文件不存在:\n{img}")
+                return
+        try:
+            if self.mode_var.get() == "single":
+                ok = wallpaper.apply_single(self.single_var.get(), position)
+            else:
+                ok = wallpaper.apply_per_monitor(mapping, position)
+            messagebox.showinfo("完成", "壁纸已应用" if ok else "已用回退方式应用(单屏)")
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("错误", f"应用壁纸失败:\n{e}")
 
     def _refresh_profile_list(self):
         self.profile_combo["values"] = list(profiles.load_profiles().keys())
@@ -226,23 +232,28 @@ class App:
     def _toggle_hk(self):
         if self.hk_enabled.get():
             if self.hk is None:
-                self.hk = hotkeys_mod.HotkeyManager()
-                self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, VK_RIGHT,
-                                 lambda: windows.move_active_to_next_monitor(1))
-                self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, VK_LEFT,
-                                 lambda: windows.move_active_to_next_monitor(-1))
-                self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("1"),
-                                 lambda: windows.snap_active("left"))
-                self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("2"),
-                                 lambda: windows.snap_active("right"))
-                self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("3"),
-                                 lambda: windows.snap_active("top"))
-                self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("4"),
-                                 lambda: windows.snap_active("bottom"))
-                self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("5"),
-                                 lambda: windows.snap_active("maximize"))
-                self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("6"),
-                                 lambda: windows.snap_active("center"))
+                try:
+                    self.hk = hotkeys_mod.HotkeyManager()
+                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, VK_RIGHT,
+                                     lambda: windows.move_active_to_next_monitor(1))
+                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, VK_LEFT,
+                                     lambda: windows.move_active_to_next_monitor(-1))
+                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("1"),
+                                     lambda: windows.snap_active("left"))
+                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("2"),
+                                     lambda: windows.snap_active("right"))
+                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("3"),
+                                     lambda: windows.snap_active("top"))
+                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("4"),
+                                     lambda: windows.snap_active("bottom"))
+                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("5"),
+                                     lambda: windows.snap_active("maximize"))
+                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("6"),
+                                     lambda: windows.snap_active("center"))
+                except Exception as e:  # noqa: BLE001
+                    messagebox.showerror("错误", f"快捷键初始化失败:\n{e}")
+                    self.hk_enabled.set(False)
+                    return
             self.hk.start()
         else:
             if self.hk:

@@ -139,10 +139,13 @@ class TrayIcon:
         try:
             user32.RegisterClassExW(ctypes.byref(wc))
         except Exception:  # noqa: BLE001
-            pass
+            print("[tray] RegisterClassExW 异常")
         self.hwnd = user32.CreateWindowExW(
             0, self._clsname, "tray", 0, 0, 0, 0, 0, wintypes.HWND(-3), None, None, None
         )
+        if not self.hwnd:
+            print("[tray] CreateWindowExW 失败，托盘不可用")
+            return
 
         nid = NOTIFYICONDATA()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
@@ -184,10 +187,16 @@ class TrayIcon:
             except Exception:  # noqa: BLE001
                 pass
             try:
+                user32.PostMessageW(self.hwnd, 0x0010, 0, 0)  # WM_DESTROY
+            except Exception:  # noqa: BLE001
+                pass
+            try:
                 user32.DestroyWindow(self.hwnd)
             except Exception:  # noqa: BLE001
                 pass
             self.hwnd = None
+        self.on_open = None
+        self.on_exit = None
 
 
 if __name__ == "__main__":

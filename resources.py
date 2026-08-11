@@ -5,6 +5,12 @@ import os
 
 def create_ico(path, size=32):
     """生成一个纯色渐变方块图标，返回路径。失败返回 None。"""
+    if not path:
+        return None
+    # 确保父目录存在
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     try:
         xor = bytearray()
         for y in range(size - 1, -1, -1):
