@@ -3,6 +3,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+import autostart
 import backend
 from backend import monitors, wallpaper, windows, hotkeys as hotkeys_mod
 import profiles
@@ -25,6 +26,7 @@ class App:
         self.single_var = tk.StringVar()
         self.hk_enabled = tk.BooleanVar(value=False)
         self.hk = None
+        self.autostart_var = tk.BooleanVar(value=autostart.is_enabled())
         self._build()
         self.refresh_monitors()
 
@@ -49,6 +51,7 @@ class App:
         self._build_window_tools()
         self._build_profiles()
         self._build_hotkeys()
+        self._build_autostart()
 
     def _build_wallpaper(self):
         f = ttk.LabelFrame(self.content, text="壁纸")
@@ -135,6 +138,12 @@ class App:
         ttk.Checkbutton(f, text="启用全局快捷键", variable=self.hk_enabled,
                         command=self._toggle_hk).pack(anchor="w", padx=4, pady=4)
 
+    def _build_autostart(self):
+        f = ttk.LabelFrame(self.content, text="启动选项")
+        f.pack(fill="x", padx=8, pady=6)
+        ttk.Checkbutton(f, text="开机自动启动", variable=self.autostart_var,
+                        command=self._toggle_autostart).pack(anchor="w", padx=4, pady=4)
+
     # ---------- 逻辑 ----------
     def refresh_monitors(self):
         self.monitors = monitors.enum_monitors()
@@ -208,19 +217,23 @@ class App:
         mapping = p.get("mapping", {})
         position = p.get("position", "fill")
         self.fit_var.set(position)
-        if mapping and len(set(mapping.values())) <= 1:
-            self.mode_var.set("single")
-            self._on_mode()
-            self.single_var.set(next(iter(mapping.values())))
-            wallpaper.apply_single(self.single_var.get(), position)
-        else:
-            self.mode_var.set("per")
-            self._on_mode()
-            for r in self.mon_rows:
-                r["var"].set(mapping.get(r["device_path"], ""))
-            wallpaper.apply_per_monitor(mapping, position)
+        try:
+            if mapping and len(set(mapping.values())) <= 1:
+                self.mode_var.set("single")
+                self._on_mode()
+                self.single_var.set(next(iter(mapping.values())))
+                ok = wallpaper.apply_single(self.single_var.get(), position)
+            else:
+                self.mode_var.set("per")
+                self._on_mode()
+                for r in self.mon_rows:
+                    r["var"].set(mapping.get(r["device_path"], ""))
+                ok = wallpaper.apply_per_monitor(mapping, position)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("错误", f"应用方案失败:\n{e}")
+            return
         self._refresh_profile_list()
-        messagebox.showinfo("完成", f"已应用方案「{name}」")
+        messagebox.showinfo("完成", f"已应用方案「{name}」" + ("" if ok else "（已用回退方式应用）"))
 
     def delete_profile(self):
         name = self.profile_var.get()
@@ -258,6 +271,13 @@ class App:
         else:
             if self.hk:
                 self.hk.stop()
+
+    def _toggle_autostart(self):
+        try:
+            autostart.set_enabled(self.autostart_var.get())
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("错误", f"设置开机自启失败:\n{e}")
+            self.autostart_var.set(autostart.is_enabled())
 
     # ---------- 窗口管理 ----------
     def show(self):

@@ -102,12 +102,14 @@ class TrayIcon:
         self.hicon = None
         self.on_open = None
         self.on_exit = None
+        self.on_refresh = None
         self._wndproc = None
         self._clsname = "MultiMonTrayWnd"
 
-    def create(self, icon_path, tip="多屏管理器", on_open=None, on_exit=None):
+    def create(self, icon_path, tip="多屏管理器", on_open=None, on_exit=None, on_refresh=None):
         self.on_open = on_open
         self.on_exit = on_exit
+        self.on_refresh = on_refresh
         if icon_path and os.path.exists(icon_path):
             self.hicon = user32.LoadImageW(
                 0, icon_path, 1, 0, 0, 0x00000010 | 0x00000080  # LR_DEFAULTSIZE | LR_LOADFROMFILE
@@ -127,6 +129,8 @@ class TrayIcon:
                     self.on_open()
                 elif cmd == 1002 and self.on_exit:
                     self.on_exit()
+                elif cmd == 1003 and self.on_refresh:
+                    self.on_refresh()
                 return 0
             return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
@@ -169,6 +173,8 @@ class TrayIcon:
     def _show_menu(self):
         hmenu = user32.CreatePopupMenu()
         user32.AppendMenuW(hmenu, 0x0000, 1001, "打开主界面")
+        user32.AppendMenuW(hmenu, 0x0000, 1003, "刷新显示器")
+        user32.AppendMenuW(hmenu, 0x0000 | 0x0800, 0, None)  # MF_SEPARATOR
         user32.AppendMenuW(hmenu, 0x0000, 1002, "退出")
         pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
@@ -197,6 +203,7 @@ class TrayIcon:
             self.hwnd = None
         self.on_open = None
         self.on_exit = None
+        self.on_refresh = None
 
 
 if __name__ == "__main__":

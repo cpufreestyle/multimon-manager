@@ -4,9 +4,14 @@ import os
 
 
 def create_ico(path, size=32):
-    """生成一个纯色渐变方块图标，返回路径。失败返回 None。"""
+    """生成一个纯色渐变方块图标，返回路径。失败返回 None。
+
+    若 path 已存在且为打包内置的丰富图标（体积较大），直接复用不覆盖。
+    """
     if not path:
         return None
+    if os.path.exists(path) and os.path.getsize(path) > 8192:
+        return path
     # 确保父目录存在
     parent = os.path.dirname(os.path.abspath(path))
     if parent:

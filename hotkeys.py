@@ -31,6 +31,12 @@ MOD_CONTROL = 2
 MOD_SHIFT = 4
 MOD_WIN = 8
 
+# 方向键虚拟键码（backend.py 依赖这些常量，缺失会导致注册失败）
+VK_LEFT = 0x25
+VK_UP = 0x26
+VK_RIGHT = 0x27
+VK_DOWN = 0x28
+
 WM_HOTKEY = 0x0312
 WM_DESTROY = 0x0010
 
@@ -132,10 +138,9 @@ class HotkeyManager:
         self._running = False
         # 复制一份再遍历，防止字典在迭代中修改
         hks = dict(self.hotkeys)
-        for hid in hks:
-            if self.hwnd:
-                user32.UnregisterHotKey(self.hwnd, hid)
         if self.hwnd:
+            for hid in hks:
+                user32.UnregisterHotKey(self.hwnd, hid)
             try:
                 user32.PostMessageW(self.hwnd, WM_DESTROY, 0, 0)
             except Exception:  # noqa: BLE001
@@ -145,7 +150,7 @@ class HotkeyManager:
             except Exception:  # noqa: BLE001
                 pass
             self.hwnd = None
-        self.hotkeys.clear()
+        # 注意：不清理 self.hotkeys，以便 stop() 之后可以再次 start() 重新注册
 
 
 if __name__ == "__main__":

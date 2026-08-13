@@ -53,10 +53,14 @@ def _monitor_by_relative(monitors_list, src_hwnd):
     return 0
 
 
-def move_to_monitor(hwnd, monitor):
-    """将窗口移动到目标显示器，保持相对位置比例。"""
+def move_to_monitor(hwnd, monitor, src=None):
+    """将窗口移动到目标显示器，保持相对位置比例。
+
+    src 为显示器列表快照；缺省时自动枚举（已有列表时应传入避免重复调用）。
+    """
     x, y, w, h = get_window_rect(hwnd)
-    src = monitors_list_snapshot()
+    if src is None:
+        src = monitors_list_snapshot()
     idx = _monitor_by_relative(src, hwnd)
     src_m = src[idx] if idx < len(src) else src[0]
     rel_x = (x - src_m.left) / max(src_m.width, 1)
@@ -99,7 +103,7 @@ def move_active_to_next_monitor(direction=1):
     idx = _monitor_by_relative(ms, hwnd)
     n = len(ms)
     nxt = (idx + direction) % n
-    move_to_monitor(hwnd, ms[nxt])
+    move_to_monitor(hwnd, ms[nxt], src=ms)
 
 
 def snap_active(zone):

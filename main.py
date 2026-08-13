@@ -9,6 +9,32 @@ import resources
 import ui
 
 
+def _single_instance():
+    """防止多开。返回 True 表示当前是唯一实例。"""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.GetLastError.restype = ctypes.c_ulong
+        kernel32.CreateMutexW(None, False, "Local\\MultiMonManager")
+        return kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+    # macOS：fcntl 文件锁
+    import tempfile
+    try:
+        import fcntl
+        global _lock_fd
+        _lock_fd = open(os.path.join(tempfile.gettempdir(), "multimon_manager.lock"), "w")
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (OSError, ImportError):
+        return False
+
+
+_lock_fd = None
+
+
 def _cleanup():
     """进程退出时释放 COM 资源。"""
     if sys.platform == "win32":
@@ -24,6 +50,14 @@ atexit.register(_cleanup)
 
 
 def main():
+    if not _single_instance():
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, "多屏管理器已在运行。", "多屏管理器", 0x40)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
     root = tk.Tk()
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +76,7 @@ def main():
         "多屏管理器",
         on_open=app.show,
         on_exit=app.quit,
+        on_refresh=app.refresh_monitors,
     )
 
     root.protocol("WM_DELETE_WINDOW", app.on_close)

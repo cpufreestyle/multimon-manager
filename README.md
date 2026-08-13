@@ -43,7 +43,9 @@ python3 main.py
 - **分屏吸附**：左/右/上/下半屏、最大化、居中
 - **壁纸方案**：保存/加载多套配置（JSON）
 - **全局快捷键**：`Ctrl+Alt+←/→` 移屏，`Ctrl+Alt+1~6` 分屏
-- **托盘 / 菜单栏**：打开主界面、退出
+- **托盘 / 菜单栏**：打开主界面、刷新显示器、退出
+- **开机自启**：主界面一键开关（Windows 注册表 / macOS LaunchAgent）
+- **单实例**：重复启动自动提示并退出
 
 ## 文件结构
 | 文件 | 职责 |
@@ -55,6 +57,7 @@ python3 main.py
 | `hotkeys.py` / `hotkeys_mac.py` | 全局快捷键（Windows / macOS） |
 | `tray.py` / `tray_mac.py` | 托盘/菜单（Windows / macOS） |
 | `profiles.py` | 壁纸方案保存/加载（跨平台） |
+| `autostart.py` | 开机自启（Windows / macOS） |
 | `resources.py` | 纯 Python 生成程序图标 |
 | `ui.py` | tkinter 主界面（跨平台） |
 | `main.py` | 入口（跨平台） |
