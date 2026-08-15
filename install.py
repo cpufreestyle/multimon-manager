@@ -13,7 +13,7 @@ import sys
 import tempfile
 
 APP_NAME = "MultiMonManager"
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 
 def _meipass_or_here(name):

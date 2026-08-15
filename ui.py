@@ -190,8 +190,10 @@ class App:
             else:
                 ok = wallpaper.apply_per_monitor(mapping, position)
             messagebox.showinfo("完成", "壁纸已应用" if ok else "已用回退方式应用(单屏)")
+            self.status_var.set("壁纸已应用" if ok else "壁纸已应用(回退单屏)")
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("错误", f"应用壁纸失败:\n{e}")
+            self.status_var.set("应用壁纸失败")
 
     def _refresh_profile_list(self):
         self.profile_combo["values"] = list(profiles.load_profiles().keys())
@@ -234,6 +236,7 @@ class App:
             return
         self._refresh_profile_list()
         messagebox.showinfo("完成", f"已应用方案「{name}」" + ("" if ok else "（已用回退方式应用）"))
+        self.status_var.set(f"已应用方案「{name}」")
 
     def delete_profile(self):
         name = self.profile_var.get()
@@ -268,9 +271,11 @@ class App:
                     self.hk_enabled.set(False)
                     return
             self.hk.start()
+            self.status_var.set("全局快捷键已启用")
         else:
             if self.hk:
                 self.hk.stop()
+                self.status_var.set("全局快捷键已禁用")
 
     def _toggle_autostart(self):
         try:

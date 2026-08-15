@@ -130,6 +130,8 @@ class HotkeyManager:
 
     def _wndproc_cb(self, hwnd, msg, wparam, lparam):
         if msg == WM_DESTROY:
+            # 在消息线程内销毁窗口（跨线程 DestroyWindow 不安全），再结束循环
+            user32.DestroyWindow(hwnd)
             user32.PostQuitMessage(0)
             return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -138,18 +140,19 @@ class HotkeyManager:
         self._running = False
         # 复制一份再遍历，防止字典在迭代中修改
         hks = dict(self.hotkeys)
-        if self.hwnd:
+        hwnd = self.hwnd
+        if hwnd:
             for hid in hks:
-                user32.UnregisterHotKey(self.hwnd, hid)
+                user32.UnregisterHotKey(hwnd, hid)
             try:
-                user32.PostMessageW(self.hwnd, WM_DESTROY, 0, 0)
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                user32.DestroyWindow(self.hwnd)
+                user32.PostMessageW(hwnd, WM_DESTROY, 0, 0)
             except Exception:  # noqa: BLE001
                 pass
             self.hwnd = None
+        # 等待消息线程真正退出（2s 超时），避免与后续 start() 竞态
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(timeout=2.0)
+            self.thread = None
         # 注意：不清理 self.hotkeys，以便 stop() 之后可以再次 start() 重新注册
 
 

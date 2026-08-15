@@ -18,10 +18,15 @@ user32.SetWindowPos.argtypes = [
 user32.SetWindowPos.restype = ctypes.c_bool
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = ctypes.c_bool
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindow.restype = ctypes.c_bool
 
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
+
+SW_RESTORE = 0x09
+SW_MAXIMIZE = 0x03
 
 
 def get_foreground_window():
@@ -75,6 +80,12 @@ def snap(hwnd, monitor, zone):
     left/right/top/bottom/maximize/center。"""
     wl, wt, ww, wh = monitor.work_rect
     x, y, w, h = get_window_rect(hwnd)
+    if zone == "maximize":
+        # 真正最大化（含任务栏避让、动画与双击标题栏还原行为）
+        user32.ShowWindow(hwnd, SW_MAXIMIZE)
+        return
+    # 非最大化区域前先还原窗口，否则已最大化的窗口不会被正确缩放/移动
+    user32.ShowWindow(hwnd, SW_RESTORE)
     if zone == "left":
         set_window_rect(hwnd, wl, wt, ww // 2, wh)
     elif zone == "right":
@@ -83,8 +94,6 @@ def snap(hwnd, monitor, zone):
         set_window_rect(hwnd, wl, wt, ww, wh // 2)
     elif zone == "bottom":
         set_window_rect(hwnd, wl, wt + wh // 2, ww, wh - wh // 2)
-    elif zone == "maximize":
-        set_window_rect(hwnd, wl, wt, ww, wh)
     elif zone == "center":
         set_window_rect(hwnd, wl + (ww - w) // 2, wt + (wh - h) // 2, w, h)
 
