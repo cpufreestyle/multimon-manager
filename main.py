@@ -91,13 +91,13 @@ def main():
             pass
 
     app = ui.App(root)
+    app.tray = backend.tray.TrayIcon()
 
-    t = backend.tray.TrayIcon()
-    t.create(
+    app.tray.create(
         icon_path,
         "多屏管理器",
         on_open=app.show,
-        on_exit=app.quit,
+        on_exit=app.on_exit,
         on_refresh=app.refresh_monitors,
     )
 
@@ -106,7 +106,10 @@ def main():
     try:
         root.mainloop()
     finally:
-        t.destroy()
+        try:
+            app.tray.destroy()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == "__main__":

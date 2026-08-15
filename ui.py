@@ -26,6 +26,7 @@ class App:
         self.single_var = tk.StringVar()
         self.hk_enabled = tk.BooleanVar(value=False)
         self.hk = None
+        self.tray = None
         self.autostart_var = tk.BooleanVar(value=autostart.is_enabled())
         self._build()
         self.refresh_monitors()
@@ -138,6 +139,18 @@ class App:
         ttk.Checkbutton(f, text="启用全局快捷键", variable=self.hk_enabled,
                         command=self._toggle_hk).pack(anchor="w", padx=4, pady=4)
 
+    # 全局快捷键注册表（首次启用时构建一次，start/stop 可反复调用）
+    _HOTKEY_DEFS = [
+        (hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, VK_RIGHT, lambda: windows.move_active_to_next_monitor(1)),
+        (hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, VK_LEFT, lambda: windows.move_active_to_next_monitor(-1)),
+        (hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("1"), lambda: windows.snap_active("left")),
+        (hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("2"), lambda: windows.snap_active("right")),
+        (hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("3"), lambda: windows.snap_active("top")),
+        (hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("4"), lambda: windows.snap_active("bottom")),
+        (hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("5"), lambda: windows.snap_active("maximize")),
+        (hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("6"), lambda: windows.snap_active("center")),
+    ]
+
     def _build_autostart(self):
         f = ttk.LabelFrame(self.content, text="启动选项")
         f.pack(fill="x", padx=8, pady=6)
@@ -248,30 +261,14 @@ class App:
     def _toggle_hk(self):
         if self.hk_enabled.get():
             if self.hk is None:
-                try:
-                    self.hk = hotkeys_mod.HotkeyManager()
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, VK_RIGHT,
-                                     lambda: windows.move_active_to_next_monitor(1))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, VK_LEFT,
-                                     lambda: windows.move_active_to_next_monitor(-1))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("1"),
-                                     lambda: windows.snap_active("left"))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("2"),
-                                     lambda: windows.snap_active("right"))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("3"),
-                                     lambda: windows.snap_active("top"))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("4"),
-                                     lambda: windows.snap_active("bottom"))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("5"),
-                                     lambda: windows.snap_active("maximize"))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("6"),
-                                     lambda: windows.snap_active("center"))
-                except Exception as e:  # noqa: BLE001
-                    messagebox.showerror("错误", f"快捷键初始化失败:\n{e}")
-                    self.hk_enabled.set(False)
-                    return
-            self.hk.start()
-            self.status_var.set("全局快捷键已启用")
+                self.hk = hotkeys_mod.HotkeyManager(self._HOTKEY_DEFS)
+            try:
+                self.hk.start()
+                self.status_var.set("全局快捷键已启用")
+            except Exception as e:  # noqa: BLE001
+                self.hk_enabled.set(False)
+                messagebox.showerror("错误", f"注册全局快捷键失败:\n{e}")
+                self.status_var.set("全局快捷键启用失败")
         else:
             if self.hk:
                 self.hk.stop()
@@ -296,4 +293,18 @@ class App:
     def quit(self):
         if self.hk:
             self.hk.stop()
+        self.root.destroy()
+
+    def on_exit(self):
+        """托盘退出：释放快捷键与托盘窗口资源后再销毁主窗口。"""
+        try:
+            if self.hk:
+                self.hk.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self.tray:
+                self.tray.close()
+        except Exception:  # noqa: BLE001
+            pass
         self.root.destroy()

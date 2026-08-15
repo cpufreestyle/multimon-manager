@@ -111,9 +111,13 @@ class TrayIcon:
         self.on_exit = on_exit
         self.on_refresh = on_refresh
         if icon_path and os.path.exists(icon_path):
-            self.hicon = user32.LoadImageW(
-                0, icon_path, 1, 0, 0, 0x00000010 | 0x00000080  # LR_DEFAULTSIZE | LR_LOADFROMFILE
-            )
+            try:
+                self.hicon = user32.LoadImageW(
+                    0, icon_path, 1, 0, 0, 0x00000010 | 0x00000080  # LR_DEFAULTSIZE | LR_LOADFROMFILE
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[tray] 加载图标失败: {e}")
+                self.hicon = None
 
         def wndproc(hwnd, msg, wparam, lparam):
             if msg == WM_TRAY:
@@ -201,9 +205,19 @@ class TrayIcon:
             except Exception:  # noqa: BLE001
                 pass
             self.hwnd = None
+        # 释放图标句柄，避免 GDI 对象泄漏
+        if self.hicon:
+            try:
+                user32.DestroyIcon(self.hicon)
+            except Exception:  # noqa: BLE001
+                pass
+            self.hicon = None
         self.on_open = None
         self.on_exit = None
         self.on_refresh = None
+
+    # close 与 destroy 等价，供 App.on_exit 调用
+    close = destroy
 
 
 if __name__ == "__main__":
