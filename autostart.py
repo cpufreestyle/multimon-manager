@@ -1,4 +1,4 @@
-"""开机自启管理（跨平台）。
+r"""开机自启管理（跨平台）。
 
 Windows: 写 HKCU\Software\Microsoft\Windows\CurrentVersion\Run 注册表
 macOS:   写 ~/Library/LaunchAgents/com.multimonmanager.plist

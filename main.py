@@ -1,6 +1,8 @@
 """入口：启动多屏管理器（GUI + 系统托盘），跨 Windows / macOS。"""
 import atexit
+import logging
 import os
+import subprocess
 import sys
 import tkinter as tk
 
@@ -49,7 +51,58 @@ def _cleanup():
 atexit.register(_cleanup)
 
 
+def _activate_frontmost(root, delay_ms=400):
+    """启动后把主窗口置顶显示。
+
+    macOS 下从后台上下文（nohup / 脚本）启动时，Tk 窗口会被创建但不会自动
+    前置——它被压在其它窗口后面，且进程不是 frontmost 应用，所以看起来像
+    "没打开主界面"。这里延迟一拍后唤醒窗口，并按**自身 PID** 精确把本进程
+    设为 frontmost（按进程名 "Python" 匹配会误激活其它 Python 进程）。
+    """
+    def _do():
+        try:
+            root.deiconify()
+            root.lift()
+            root.focus_force()
+        except Exception:  # noqa: BLE001
+            pass
+
+        if not sys.platform.startswith("darwin"):
+            return
+        try:
+            subprocess.run(
+                ['osascript', '-e',
+                 'tell application "System Events" to set frontmost of '
+                 f'(first process whose unix id is {os.getpid()}) to true'],
+                check=False,
+                timeout=5,
+            )
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger(__name__).warning("启动时置顶失败: %s", e)
+
+    root.after(delay_ms, _do)
+
+
+LOG_PATH = "/tmp/multimon-manager.log"
+
+
+def _setup_logging():
+    """日志同时输出到终端和固定文件，便于在没有终端时回溯问题。"""
+    handlers = [logging.StreamHandler()]
+    try:
+        handlers.append(logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+
+
 def main():
+    _setup_logging()
     if not _single_instance():
         try:
             import ctypes
@@ -62,7 +115,8 @@ def main():
 
     here = os.path.dirname(os.path.abspath(__file__))
     icon_path = resources.create_ico(os.path.join(here, "app.ico"))
-    if icon_path:
+    # macOS 上 iconbitmap 会导致 tkinter 窗口黑屏，仅 Windows 使用
+    if icon_path and sys.platform.startswith("win"):
         try:
             root.iconbitmap(icon_path)
         except Exception:  # noqa: BLE001
@@ -70,6 +124,13 @@ def main():
 
     app = ui.App(root)
 
+    # 启动即显示主界面（否则后台启动的窗口会被压在其它窗口后面）
+    _activate_frontmost(root)
+
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
+
+    # 托盘运行在独立 Tk 子进程，避免与主窗口共用事件循环导致 macOS 黑屏
+    os.environ["MAIN_PID"] = str(os.getpid())
     t = backend.tray.TrayIcon()
     t.create(
         icon_path,
@@ -78,8 +139,9 @@ def main():
         on_exit=app.quit,
         on_refresh=app.refresh_monitors,
     )
-
-    root.protocol("WM_DELETE_WINDOW", app.on_close)
+    # 托盘面板也是本应用的窗口，登记后窗口工具会跳过它，避免误操作自己
+    if getattr(t, "proc", None) is not None:
+        backend.windows.register_own_pid(t.proc.pid)
 
     try:
         root.mainloop()

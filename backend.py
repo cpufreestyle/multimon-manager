@@ -39,3 +39,17 @@ except Exception:  # noqa: BLE001
 
 MOD_ALT = getattr(hotkeys, "MOD_ALT", 1)
 MOD_CONTROL = getattr(hotkeys, "MOD_CONTROL", 2)
+
+# 重新导出子模块的关键属性，供 ui.py 通过 backend 直接访问
+# （ui.py 使用 `import backend as wallpaper` 等别名，需要这些属性在 backend 根空间）
+POSITION = wallpaper.POSITION
+apply_single = wallpaper.apply_single
+apply_per_monitor = wallpaper.apply_per_monitor
+enum_monitors = monitors.enum_monitors
+stage_manager_enabled = monitors.stage_manager_enabled
+move_active_to_next_monitor = windows.move_active_to_next_monitor
+snap_active = windows.snap_active
+list_target_windows = windows.list_target_windows
+set_target = windows.set_target
+snap_two_side_by_side = windows.snap_two_side_by_side
+HotkeyManager = hotkeys.HotkeyManager

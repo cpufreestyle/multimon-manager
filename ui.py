@@ -4,14 +4,16 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import autostart
-import backend
-from backend import monitors, wallpaper, windows, hotkeys as hotkeys_mod
+import backend as b
 import profiles
 
-VK_LEFT = backend.VK_LEFT
-VK_UP = backend.VK_UP
-VK_RIGHT = backend.VK_RIGHT
-VK_DOWN = backend.VK_DOWN
+VK_LEFT = b.VK_LEFT
+VK_UP = b.VK_UP
+VK_RIGHT = b.VK_RIGHT
+VK_DOWN = b.VK_DOWN
+
+# 目标窗口下拉框的"自动"选项：由程序判断最前面的非本程序窗口
+AUTO_TARGET = "自动（上次活动窗口）"
 
 
 class App:
@@ -25,21 +27,20 @@ class App:
         self.mode_var = tk.StringVar(value="per")
         self.single_var = tk.StringVar()
         self.hk_enabled = tk.BooleanVar(value=False)
-        self.hk = None
+        # 开机自动启动（v0.2.1）
         self.autostart_var = tk.BooleanVar(value=autostart.is_enabled())
+        # 常驻置顶：默认关闭。按钮已改为不激活目标窗口，管理器不会被挤走，
+        # 无需常驻置顶；需要始终压住其它窗口时可手动勾选。
+        self.topmost = tk.BooleanVar(value=False)
+        self.hk = None
         self._build()
         self.refresh_monitors()
 
     # ---------- 构建 ----------
     def _build(self):
-        canvas = tk.Canvas(self.root)
-        scroll = ttk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scroll.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-        self.content = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=self.content, anchor="nw")
-        self.content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        # macOS 上直接用普通 Frame，避免 Canvas/Scrollbar 组合的黑屏问题
+        self.content = ttk.Frame(self.root)
+        self.content.pack(fill="both", expand=True)
 
         top = ttk.Frame(self.content)
         top.pack(fill="x", padx=8, pady=6)
@@ -75,7 +76,7 @@ class App:
         fit = ttk.Frame(f)
         fit.pack(fill="x", pady=4)
         ttk.Label(fit, text="填充方式:").pack(side="left")
-        ttk.Combobox(fit, textvariable=self.fit_var, values=list(wallpaper.POSITION.keys()),
+        ttk.Combobox(fit, textvariable=self.fit_var, values=list(b.POSITION.keys()),
                      width=10, state="readonly").pack(side="left", padx=4)
         ttk.Button(f, text="应用壁纸", command=self.apply_wallpaper).pack(anchor="e", pady=4)
 
@@ -95,22 +96,112 @@ class App:
             var.set(p)
 
     def _build_window_tools(self):
-        f = ttk.LabelFrame(self.content, text="窗口工具 (作用于当前活动窗口)")
+        f = ttk.LabelFrame(self.content, text="窗口工具")
         f.pack(fill="x", padx=8, pady=6)
+
+        # 目标窗口显式选择：自动判断（"最前面的非本程序窗口"）常猜错，
+        # 例如停在 IDE 聊天窗口时点按钮会把 IDE 分屏，故改为可手动指定。
+        sel = ttk.Frame(f)
+        sel.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Label(sel, text="目标窗口:").pack(side="left")
+        self.target_var = tk.StringVar(value=AUTO_TARGET)
+        self.target_cb = ttk.Combobox(sel, textvariable=self.target_var,
+                                      state="readonly", width=34)
+        self.target_cb.pack(side="left", fill="x", expand=True, padx=4)
+        self.target_cb.bind("<<ComboboxSelected>>", self._on_target_selected)
+        ttk.Button(sel, text="刷新列表", command=self._refresh_targets).pack(side="left")
+        ttk.Checkbutton(sel, text="常驻置顶", variable=self.topmost,
+                        command=self._apply_topmost).pack(side="left", padx=(8, 0))
+
+        # activate=False：只移动窗口、不激活它，管理器才不会被挤到后面
         btns = [
-            ("移到上一屏", lambda: windows.move_active_to_next_monitor(-1)),
-            ("移到下一屏", lambda: windows.move_active_to_next_monitor(1)),
-            ("左半", lambda: windows.snap_active("left")),
-            ("右半", lambda: windows.snap_active("right")),
-            ("上半", lambda: windows.snap_active("top")),
-            ("下半", lambda: windows.snap_active("bottom")),
-            ("最大化", lambda: windows.snap_active("maximize")),
-            ("居中", lambda: windows.snap_active("center")),
+            ("移到上一屏", lambda: b.move_active_to_next_monitor(-1, activate=False)),
+            ("移到下一屏", lambda: b.move_active_to_next_monitor(1, activate=False)),
+            ("左半", lambda: b.snap_active("left", activate=False)),
+            ("右半", lambda: b.snap_active("right", activate=False)),
+            ("上半", lambda: b.snap_active("top", activate=False)),
+            ("下半", lambda: b.snap_active("bottom", activate=False)),
+            ("最大化", lambda: b.snap_active("maximize", activate=False)),
+            ("居中", lambda: b.snap_active("center", activate=False)),
+            ("并排左右", lambda: b.snap_two_side_by_side()),
         ]
         row = ttk.Frame(f)
         row.pack(fill="x", pady=4)
         for text, cmd in btns:
-            ttk.Button(row, text=text, command=cmd).pack(side="left", padx=3)
+            ttk.Button(row, text=text,
+                       command=self._keep_front_after(cmd)).pack(side="left", padx=3)
+
+        # 台前调度开启时，两个不同 App 的窗口必须处于同一个"台前组"才会同时显示，
+        # 而 macOS 无公开 API 建组，只能用户先手动拖到一起。
+        if b.stage_manager_enabled():
+            ttk.Label(
+                f,
+                text="提示：已开启「台前调度」。两个窗口需先手动拖到同一个组，"
+                     "再用「并排左右」，否则另一个会被收进侧边。",
+                foreground="#a15c00",
+                wraplength=620,
+                justify="left",
+            ).pack(fill="x", padx=6, pady=(0, 6))
+
+        self._target_map = {AUTO_TARGET: None}
+        self._refresh_targets()
+        self._apply_topmost()
+
+    # ---------- 目标窗口 ----------
+    def _refresh_targets(self):
+        """刷新可选窗口列表，尽量保留当前选择。"""
+        try:
+            wins = b.list_target_windows()
+        except Exception:  # noqa: BLE001
+            wins = []
+        labels = [AUTO_TARGET]
+        self._target_map = {AUTO_TARGET: None}
+        for w in wins:
+            if w["label"] in self._target_map:
+                continue
+            labels.append(w["label"])
+            self._target_map[w["label"]] = w["hwnd"]
+        self.target_cb["values"] = labels
+        if self.target_var.get() not in self._target_map:
+            self.target_var.set(AUTO_TARGET)
+            b.set_target(None)
+
+    def _on_target_selected(self, _event=None):
+        label = self.target_var.get()
+        b.set_target(self._target_map.get(label))
+        self.status_var.set(f"目标窗口: {label}")
+
+    # ---------- 置顶 ----------
+    def _apply_topmost(self):
+        """应用/取消主窗口置顶。"""
+        try:
+            self.root.attributes("-topmost", bool(self.topmost.get()))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _keep_front_after(self, cmd):
+        """包装窗口操作：执行后重新置顶，避免被激活的目标窗口盖住。"""
+        def run():
+            try:
+                cmd()
+            finally:
+                self._keep_front()
+        return run
+
+    def _keep_front(self):
+        """操作后保持主窗口可见。
+
+        按钮已改用 activate=False，目标窗口不会被激活到最前，本窗口自然保持在
+        前面；因此默认无需常驻置顶，仅勾选时才强制浮动。
+        """
+        try:
+            if self.topmost.get():
+                self.root.attributes("-topmost", True)
+            else:
+                self.root.attributes("-topmost", False)
+                self.root.lift()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _build_profiles(self):
         f = ttk.LabelFrame(self.content, text="壁纸方案")
@@ -144,9 +235,16 @@ class App:
         ttk.Checkbutton(f, text="开机自动启动", variable=self.autostart_var,
                         command=self._toggle_autostart).pack(anchor="w", padx=4, pady=4)
 
+    def _toggle_autostart(self):
+        try:
+            autostart.set_enabled(self.autostart_var.get())
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("错误", f"设置开机自启失败:\n{e}")
+            self.autostart_var.set(autostart.is_enabled())
+
     # ---------- 逻辑 ----------
     def refresh_monitors(self):
-        self.monitors = monitors.enum_monitors()
+        self.monitors = b.enum_monitors(force=True)
         for w in self.mon_frame.winfo_children():
             w.destroy()
         self.mon_rows = []
@@ -186,9 +284,9 @@ class App:
                 return
         try:
             if self.mode_var.get() == "single":
-                ok = wallpaper.apply_single(self.single_var.get(), position)
+                ok = b.apply_single(self.single_var.get(), position)
             else:
-                ok = wallpaper.apply_per_monitor(mapping, position)
+                ok = b.apply_per_monitor(mapping, position)
             messagebox.showinfo("完成", "壁纸已应用" if ok else "已用回退方式应用(单屏)")
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("错误", f"应用壁纸失败:\n{e}")
@@ -217,23 +315,19 @@ class App:
         mapping = p.get("mapping", {})
         position = p.get("position", "fill")
         self.fit_var.set(position)
-        try:
-            if mapping and len(set(mapping.values())) <= 1:
-                self.mode_var.set("single")
-                self._on_mode()
-                self.single_var.set(next(iter(mapping.values())))
-                ok = wallpaper.apply_single(self.single_var.get(), position)
-            else:
-                self.mode_var.set("per")
-                self._on_mode()
-                for r in self.mon_rows:
-                    r["var"].set(mapping.get(r["device_path"], ""))
-                ok = wallpaper.apply_per_monitor(mapping, position)
-        except Exception as e:  # noqa: BLE001
-            messagebox.showerror("错误", f"应用方案失败:\n{e}")
-            return
+        if mapping and len(set(mapping.values())) <= 1:
+            self.mode_var.set("single")
+            self._on_mode()
+            self.single_var.set(next(iter(mapping.values())))
+            b.apply_single(self.single_var.get(), position)
+        else:
+            self.mode_var.set("per")
+            self._on_mode()
+            for r in self.mon_rows:
+                r["var"].set(mapping.get(r["device_path"], ""))
+            b.apply_per_monitor(mapping, position)
         self._refresh_profile_list()
-        messagebox.showinfo("完成", f"已应用方案「{name}」" + ("" if ok else "（已用回退方式应用）"))
+        messagebox.showinfo("完成", f"已应用方案「{name}」")
 
     def delete_profile(self):
         name = self.profile_var.get()
@@ -246,44 +340,41 @@ class App:
         if self.hk_enabled.get():
             if self.hk is None:
                 try:
-                    self.hk = hotkeys_mod.HotkeyManager()
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, VK_RIGHT,
-                                     lambda: windows.move_active_to_next_monitor(1))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, VK_LEFT,
-                                     lambda: windows.move_active_to_next_monitor(-1))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("1"),
-                                     lambda: windows.snap_active("left"))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("2"),
-                                     lambda: windows.snap_active("right"))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("3"),
-                                     lambda: windows.snap_active("top"))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("4"),
-                                     lambda: windows.snap_active("bottom"))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("5"),
-                                     lambda: windows.snap_active("maximize"))
-                    self.hk.register(hotkeys_mod.MOD_CONTROL | hotkeys_mod.MOD_ALT, ord("6"),
-                                     lambda: windows.snap_active("center"))
+                    self.hk = b.HotkeyManager()
                 except Exception as e:  # noqa: BLE001
                     messagebox.showerror("错误", f"快捷键初始化失败:\n{e}")
                     self.hk_enabled.set(False)
                     return
+                # 快捷键语义是"作用于当前活动窗口"，故忽略界面固定的目标
+                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, VK_RIGHT,
+                                 lambda: b.move_active_to_next_monitor(1, use_pinned=False))
+                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, VK_LEFT,
+                                 lambda: b.move_active_to_next_monitor(-1, use_pinned=False))
+                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, ord("1"),
+                                 lambda: b.snap_active("left", use_pinned=False))
+                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, ord("2"),
+                                 lambda: b.snap_active("right", use_pinned=False))
+                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, ord("3"),
+                                 lambda: b.snap_active("top", use_pinned=False))
+                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, ord("4"),
+                                 lambda: b.snap_active("bottom", use_pinned=False))
+                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, ord("5"),
+                                 lambda: b.snap_active("maximize", use_pinned=False))
+                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, ord("6"),
+                                 lambda: b.snap_active("center", use_pinned=False))
             self.hk.start()
         else:
             if self.hk:
                 self.hk.stop()
-
-    def _toggle_autostart(self):
-        try:
-            autostart.set_enabled(self.autostart_var.get())
-        except Exception as e:  # noqa: BLE001
-            messagebox.showerror("错误", f"设置开机自启失败:\n{e}")
-            self.autostart_var.set(autostart.is_enabled())
 
     # ---------- 窗口管理 ----------
     def show(self):
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+        # 从托盘唤醒时刷新一次窗口列表，避免操作已关闭的窗口
+        self._refresh_targets()
+        self._apply_topmost()
 
     def on_close(self):
         self.root.withdraw()

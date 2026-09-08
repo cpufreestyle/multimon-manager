@@ -1,18 +1,27 @@
 """多显示器壁纸控制（macOS 实现，零第三方依赖）。
 
-macOS 的桌面壁纸由每个显示器的 SQLite 数据库管理：
-  ~/Library/Application Support/Dock/desktoppicture.db
-通过 osascript 设置单屏/所有屏壁纸，并通过直接写库实现"每屏不同"。
+macOS 桌面壁纸通过 System Events 的 AppleScript 设置：
+  tell application "System Events" to tell desktop N to set picture to POSIX file "..."
 
-注意：写 desktoppicture.db 后需 killall Dock 使其生效。
-填充方式 macOS 仅支持 fill / fit / stretch / center / tile；
-API 统一用 Windows 那套 name，映射到 macOS 的 0/1/2/3。
+- 统一单图：遍历 every desktop 设同一张图。
+- 每屏不同：按 enum_monitors() 的顺序给 desktop 1..N 分别设图（顺序与界面列表一致）。
+
+不再用 desktoppicture.db 写"图片路径"：其表结构与显示器顺序并非简单对应，
+按行写入极易把图片错配到错误的屏（旧实现即此 bug）。图片统一由 AppleScript 设置。
+
+填充方式（fill/fit/stretch/center/tile）AppleScript 无法设置，仅写入
+desktoppicture.db 的 Placement 键，采用自适应探测：仅当表结构与预期一致时才写，
+否则记录告警并跳过，绝不破坏原有数据。写入后 killall Dock 使设置生效。
 """
+import logging
 import os
-import subprocess
 import sqlite3
+import subprocess
+import time
 
 import monitors_mac as monitors
+
+logger = logging.getLogger(__name__)
 
 # 与 Windows 端保持同名，便于上层复用
 POSITION = {
@@ -24,23 +33,98 @@ POSITION = {
     "span": 5,
 }
 
-# macOS 仅支持这几种，fill=覆盖式拉伸，fit=保持比例
-_MAC_POS = {
-    "center": "center",
-    "tile": "tile",
-    "stretch": "stretch",
-    "fit": "fit",
-    "fill": "fill",
-    "span": "fill",
+_DB_PATH = os.path.expanduser("~/Library/Application Support/Dock/desktoppicture.db")
+
+# macOS desktoppicture.db 中 Placement 键的取值
+_PLACEMENT = {
+    "fill": "FillScreen",
+    "fit": "FitToScreen",
+    "stretch": "StretchToFillScreen",
+    "center": "Centered",
+    "tile": "Tiled",
+    "span": "FillScreen",
 }
 
-_DB_PATH = os.path.expanduser("~/Library/Application Support/Dock/desktoppicture.db")
+
+def _table_columns(con, table):
+    """返回表的列名列表；表不存在时返回空列表。"""
+    try:
+        return [r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _apply_placement(position="fill"):
+    """best-effort 设置填充方式：写 desktoppicture.db 的 Placement 键。
+
+    自适应探测：不同 macOS 版本表结构有差异，仅当 data 表含 key/value 列时才写；
+    若支持 picture_id 则逐显示器写入，否则写全局。任何异常都只告警不抛出。
+    """
+    placement = _PLACEMENT.get(position)
+    if not placement:
+        return False
+    if not os.path.exists(_DB_PATH):
+        logger.info("desktoppicture.db 尚不存在，跳过填充方式设置")
+        return False
+
+    con = None
+    try:
+        con = sqlite3.connect(_DB_PATH)
+        cols = _table_columns(con, "data")
+        if not {"key", "value"}.issubset(cols):
+            logger.warning("desktoppicture.db 结构非预期（data 列：%s），跳过填充方式设置", cols)
+            return False
+
+        if "picture_id" in cols:
+            rows = con.execute("SELECT DISTINCT picture_id FROM data").fetchall()
+            picture_ids = [r[0] for r in rows] or [0]
+        else:
+            picture_ids = [None]
+
+        for pid in picture_ids:
+            if pid is None:
+                cur = con.execute("UPDATE data SET value=? WHERE key=?", (placement, "Placement"))
+                if cur.rowcount == 0:
+                    con.execute("INSERT INTO data (key, value) VALUES (?,?)",
+                                ("Placement", placement))
+            else:
+                cur = con.execute(
+                    "UPDATE data SET value=? WHERE key=? AND picture_id=?",
+                    (placement, "Placement", pid),
+                )
+                if cur.rowcount == 0:
+                    con.execute(
+                        "INSERT INTO data (key, value, picture_id) VALUES (?,?,?)",
+                        ("Placement", placement, pid),
+                    )
+        con.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("设置填充方式失败: %s", e)
+        return False
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _finish(position="fill"):
+    """收尾：确保数据库存在 → 写填充方式 → 重启 Dock 统一生效。"""
+    if not os.path.exists(_DB_PATH):
+        # 首次运行时 Dock 可能尚未建库，先重启一次让其创建，再写 Placement
+        _kill_dock()
+        time.sleep(1.5)
+    _apply_placement(position)
+    _kill_dock()
 
 
 def _run(cmd):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        logger.warning("执行命令失败 %s: %s", cmd, e)
         return None
 
 
@@ -48,94 +132,70 @@ def available():
     return True
 
 
-def _position_macos(name):
-    return _MAC_POS.get(name, "fill")
-
-
-def set_single_all(image_path, position="fill"):
-    """设置所有显示器的壁纸（AppleScript）。"""
-    pos = _position_macos(position)
-    script = (
-        'tell application "System Events" to tell every desktop to '
-        f'set picture to POSIX file "{image_path}"\n'
-        f'tell application "System Events" to tell every desktop to set picture rotation to 0\n'
-    )
-    # AppleScript 不直接支持填充方式设置；通过数据库的 defaults 设置
-    _run(["osascript", "-e", script])
-    # 用 sqlite 写入填充方式（可选）
-    _set_picture_for_all_displays(image_path)
-    _kill_dock()
-    return True
-
-
-def _set_picture_for_all_displays(image_path):
-    """通过直接写 desktoppicture.db 把每个显示器都设为同一张图。"""
-    try:
-        if not os.path.exists(_DB_PATH):
-            return
-        con = sqlite3.connect(_DB_PATH)
-        cur = con.cursor()
-        # 备份表结构：data 表存图片路径，value 为显示序号
-        cur.execute("SELECT rowid, value FROM pictures")
-        rows = cur.fetchall()
-        for rowid, _ in rows:
-            cur.execute("UPDATE pictures SET value=? WHERE rowid=?", (image_path, rowid))
-        if not rows:
-            cur.execute("INSERT INTO pictures (value) VALUES (?)", (image_path,))
-        con.commit()
-        con.close()
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def set_per_monitor(mapping, position="fill"):
-    """mapping: {device_index(str): image_path}。
-
-    macOS 按显示器的 display 排列写入 desktoppicture.db 的 pictures 表。
-    数据库里每个 display 对应若干行，按顺序映射。
-    """
-    if not mapping:
-        return False
-    try:
-        if not os.path.exists(_DB_PATH):
-            # 触发 Dock 创建数据库
-            _run(["killall", "Dock"])
-        con = sqlite3.connect(_DB_PATH)
-        cur = con.cursor()
-        try:
-            cur.execute("SELECT rowid FROM pictures ORDER BY rowid")
-            pic_ids = [r[0] for r in cur.fetchall()]
-        except Exception:
-            pic_ids = []
-        # 若数据库为空，先让 osascript 初始化
-        if not pic_ids:
-            set_single_all(next(iter(mapping.values())), position)
-            con = sqlite3.connect(_DB_PATH)
-            cur = con.cursor()
-            cur.execute("SELECT rowid FROM pictures ORDER BY rowid")
-            pic_ids = [r[0] for r in cur.fetchall()]
-
-        # 把 mapping 的 device_index 排序后依次写入 pictures 行
-        ordered = sorted(mapping.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0)
-        for idx, (dev, path) in enumerate(ordered):
-            if idx < len(pic_ids):
-                cur.execute("UPDATE pictures SET value=? WHERE rowid=?", (path, pic_ids[idx]))
-        con.commit()
-        con.close()
-        _kill_dock()
-        return True
-    except Exception as e:  # noqa: BLE001
-        print("[wallpaper_mac] 每屏设置失败:", e)
-        return False
+def _esc(path):
+    """转义 AppleScript 双引号字符串中的反斜杠与双引号，避免路径断句。"""
+    return path.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _kill_dock():
     _run(["killall", "Dock"])
 
 
+def set_single_all(image_path, position="fill"):
+    """设置所有显示器的壁纸为同一张图。"""
+    script = (
+        'tell application "System Events"\n'
+        '  repeat with d in every desktop\n'
+        f'    set picture of d to POSIX file "{_esc(image_path)}"\n'
+        '  end repeat\n'
+        '  repeat with d in every desktop\n'
+        '    set picture rotation of d to 0\n'
+        '  end repeat\n'
+        'end tell\n'
+    )
+    r = _run(["osascript", "-e", script])
+    if r is None or r.returncode != 0:
+        logger.warning("设置统一壁纸失败: %s", (r.stderr if r else "无返回"))
+        return False
+    _finish(position)
+    return True
+
+
+def set_per_monitor(mapping, position="fill"):
+    """mapping: {device_path(str CG id): image_path}。
+
+    按 enum_monitors() 的顺序，把每张显示器对应的图片写入 desktop 1..N，
+    保证界面里第 N 个显示器拿到第 N 张图，避免错配。
+    """
+    if not mapping:
+        return False
+    mons = monitors.enum_monitors()
+    if not mons:
+        logger.warning("未检测到显示器，无法设置每屏壁纸")
+        return False
+
+    lines = []
+    for i, m in enumerate(mons):
+        p = mapping.get(m.device_path)
+        if p:
+            lines.append(f'  set picture of desktop {i + 1} to POSIX file "{_esc(p)}"')
+    if not lines:
+        return False
+
+    script = 'tell application "System Events"\n' + "\n".join(lines) + '\nend tell\n'
+    r = _run(["osascript", "-e", script])
+    if r is None or r.returncode != 0:
+        logger.warning("设置每屏壁纸失败: %s", (r.stderr if r else "无返回"))
+        # 回退：退而求其次，统一用第一张图
+        first = next(iter(mapping.values()))
+        set_single_all(first, position)
+        return False
+    _finish(position)
+    return True
+
+
 def apply_per_monitor(mapping, position="fill"):
     """统一入口：mapping: {device_path: image_path}。"""
-    # device_path 在 macOS 上是序号字符串，直接复用
     return set_per_monitor(mapping, position)
 
 
