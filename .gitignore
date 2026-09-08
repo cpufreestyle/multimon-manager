@@ -13,3 +13,11 @@ app.ico
 # 调试/临时产物
 *.txt
 _out_*
+
+# macOS
+.DS_Store
+.AppleDouble
+.DS_Store?
+.Spotlight-V100
+.Trashes
+
