@@ -1,11 +1,13 @@
 """多屏管理器 GUI（tkinter，零第三方依赖）。"""
 import os
+import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import autostart
 import backend as b
 import profiles
+import settings
 
 VK_LEFT = b.VK_LEFT
 VK_UP = b.VK_UP
@@ -27,6 +29,8 @@ class App:
         self.mode_var = tk.StringVar(value="per")
         self.single_var = tk.StringVar()
         self.hk_enabled = tk.BooleanVar(value=False)
+        # 全局快捷键修饰键：按平台默认（macOS ⌘⌥，Windows Ctrl+Alt），用户可改并持久化
+        self.hk_mods_var = tk.StringVar(value=self._default_hk_mods())
         # 开机自动启动（v0.2.1）
         self.autostart_var = tk.BooleanVar(value=autostart.is_enabled())
         # 常驻置顶：默认关闭。按钮已改为不激活目标窗口，管理器不会被挤走，
@@ -230,12 +234,39 @@ class App:
     def _build_hotkeys(self):
         f = ttk.LabelFrame(self.content, text="全局快捷键")
         f.pack(fill="x", padx=8, pady=6)
-        info = ("Ctrl+Alt+←/→ : 活动窗口移到上一/下一屏\n"
-                "Ctrl+Alt+1/2/3/4 : 左/右/上/下半屏\n"
-                "Ctrl+Alt+5/6 : 最大化 / 居中")
-        ttk.Label(f, text=info, justify="left").pack(anchor="w", padx=4)
-        ttk.Checkbutton(f, text="启用全局快捷键", variable=self.hk_enabled,
-                        command=self._toggle_hk).pack(anchor="w", padx=4, pady=4)
+        # 修饰键按平台可选：macOS 习惯 ⌘⌥，Windows 习惯 Ctrl+Alt
+        is_mac = sys.platform.startswith("darwin")
+        self._mod_options = (
+            ["⌘⌥ (Cmd+Option)", "⌃⌥ (Ctrl+Option)"] if is_mac
+            else ["Ctrl+Alt", "Ctrl+Win"]
+        )
+        self._mod_value_map = {
+            "⌘⌥ (Cmd+Option)": "cmd+alt",
+            "⌃⌥ (Ctrl+Option)": "ctrl+alt",
+            "Ctrl+Alt": "ctrl+alt",
+            "Ctrl+Win": "ctrl+win",
+        }
+        self._mod_symbol = {
+            "⌘⌥ (Cmd+Option)": "⌘⌥",
+            "⌃⌥ (Ctrl+Option)": "⌃⌥",
+            "Ctrl+Alt": "Ctrl+Alt",
+            "Ctrl+Win": "Ctrl+Win",
+        }
+        cur_val = self.hk_mods_var.get()
+        cur_label = next((k for k, v in self._mod_value_map.items() if v == cur_val),
+                         self._mod_options[0])
+        self.hk_mod_label = tk.StringVar(value=cur_label)
+        self.hk_info = ttk.Label(f, text=self._hk_help_text(cur_label), justify="left")
+        self.hk_info.pack(anchor="w", padx=4)
+        hk_row = ttk.Frame(f)
+        hk_row.pack(anchor="w", padx=4, pady=4)
+        ttk.Label(hk_row, text="修饰键:").pack(side="left")
+        ttk.OptionMenu(
+            hk_row, self.hk_mod_label, cur_label, *self._mod_options,
+            command=self._on_hk_mod_change,
+        ).pack(side="left", padx=(4, 8))
+        ttk.Checkbutton(hk_row, text="启用全局快捷键", variable=self.hk_enabled,
+                        command=self._toggle_hk).pack(side="left")
 
     def _build_autostart(self):
         f = ttk.LabelFrame(self.content, text="启动选项")
@@ -407,6 +438,48 @@ class App:
         profiles.delete_profile(name)
         self._refresh_profile_list()
 
+    # ---------- 快捷键修饰键 ----------
+    def _default_hk_mods(self):
+        """读取已保存的修饰键选择，否则按平台返回默认值。"""
+        saved = settings.load().get("hk_mods")
+        if saved:
+            return saved
+        return "cmd+alt" if sys.platform.startswith("darwin") else "ctrl+alt"
+
+    def _hk_help_text(self, label):
+        sym = self._mod_symbol.get(label, label)
+        return (f"{sym}+←/→ : 活动窗口移到上一/下一屏\n"
+                f"{sym}+1/2/3/4 : 左/右/上/下半屏\n"
+                f"{sym}+5/6 : 最大化 / 居中")
+
+    def _current_hk_mods(self):
+        """把用户选择的修饰键组合映射为 backend 的 MOD_* 位掩码。"""
+        v = self.hk_mods_var.get()
+        if v == "cmd+alt":
+            return b.MOD_WIN | b.MOD_ALT        # macOS 上 MOD_WIN 即 ⌘
+        if v == "ctrl+alt":
+            return b.MOD_CONTROL | b.MOD_ALT
+        if v == "ctrl+win":
+            return b.MOD_CONTROL | b.MOD_WIN
+        return b.MOD_CONTROL | b.MOD_ALT       # 兜底
+
+    def _on_hk_mod_change(self, label):
+        """用户切换修饰键：持久化并（若已启用）热重载快捷键。"""
+        value = self._mod_value_map.get(
+            label, "cmd+alt" if sys.platform.startswith("darwin") else "ctrl+alt")
+        self.hk_mods_var.set(value)
+        s = settings.load()
+        s["hk_mods"] = value
+        settings.save(s)
+        self.hk_info["text"] = self._hk_help_text(label)
+        if self.hk_enabled.get() and self.hk is not None:
+            try:
+                self.hk.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self.hk = None
+            self._toggle_hk()
+
     def _toggle_hk(self):
         if self.hk_enabled.get():
             if self.hk is None:
@@ -417,21 +490,22 @@ class App:
                     self.hk_enabled.set(False)
                     return
                 # 快捷键语义是"作用于当前活动窗口"，故忽略界面固定的目标
-                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, VK_RIGHT,
+                mods = self._current_hk_mods()
+                self.hk.register(mods, VK_RIGHT,
                                  lambda: b.move_active_to_next_monitor(1, use_pinned=False))
-                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, VK_LEFT,
+                self.hk.register(mods, VK_LEFT,
                                  lambda: b.move_active_to_next_monitor(-1, use_pinned=False))
-                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, ord("1"),
+                self.hk.register(mods, ord("1"),
                                  lambda: b.snap_active("left", use_pinned=False))
-                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, ord("2"),
+                self.hk.register(mods, ord("2"),
                                  lambda: b.snap_active("right", use_pinned=False))
-                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, ord("3"),
+                self.hk.register(mods, ord("3"),
                                  lambda: b.snap_active("top", use_pinned=False))
-                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, ord("4"),
+                self.hk.register(mods, ord("4"),
                                  lambda: b.snap_active("bottom", use_pinned=False))
-                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, ord("5"),
+                self.hk.register(mods, ord("5"),
                                  lambda: b.snap_active("maximize", use_pinned=False))
-                self.hk.register(b.MOD_CONTROL | b.MOD_ALT, ord("6"),
+                self.hk.register(mods, ord("6"),
                                  lambda: b.snap_active("center", use_pinned=False))
             self.hk.start()
         else:
