@@ -4,7 +4,30 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import tkinter as tk
+
+# 日志必须在 import backend 之前配置：backend 导入期（如 Quartz 框架加载结果）
+# 会打印 INFO/WARNING，若此时 root logger 尚未设置，这些日志会丢失。
+LOG_PATH = os.path.join(tempfile.gettempdir(), "multimon-manager.log")
+
+
+def _setup_logging():
+    """日志同时输出到终端和固定文件，便于在没有终端时回溯问题。"""
+    handlers = [logging.StreamHandler()]
+    try:
+        handlers.append(logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+
+
+_setup_logging()
 
 import backend
 import resources
@@ -83,26 +106,7 @@ def _activate_frontmost(root, delay_ms=400):
     root.after(delay_ms, _do)
 
 
-LOG_PATH = "/tmp/multimon-manager.log"
-
-
-def _setup_logging():
-    """日志同时输出到终端和固定文件，便于在没有终端时回溯问题。"""
-    handlers = [logging.StreamHandler()]
-    try:
-        handlers.append(logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        pass
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=handlers,
-        force=True,
-    )
-
-
 def main():
-    _setup_logging()
     if not _single_instance():
         try:
             import ctypes
