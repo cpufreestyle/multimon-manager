@@ -361,23 +361,36 @@ class App:
         allp = profiles.load_profiles()
         p = allp.get(name)
         if not p:
+            messagebox.showwarning("提示", f"方案「{name}」不存在，可能已被删除。")
+            self._refresh_profile_list()
             return
         mapping = p.get("mapping", {})
         position = p.get("position", "fill")
+        # profile 保存后原图可能被移动/删除，应用前先校验路径（与 apply_wallpaper 一致）
+        missing = [img for img in mapping.values() if img and not os.path.exists(img)]
+        if missing:
+            messagebox.showwarning(
+                "提示",
+                f"方案「{name}」中有 {len(missing)} 张图片已不存在，已取消应用。\n"
+                "请重新选择图片后再次保存方案。")
+            return
         self.fit_var.set(position)
-        if mapping and len(set(mapping.values())) <= 1:
-            self.mode_var.set("single")
-            self._on_mode()
-            self.single_var.set(next(iter(mapping.values())))
-            b.apply_single(self.single_var.get(), position)
-        else:
-            self.mode_var.set("per")
-            self._on_mode()
-            for r in self.mon_rows:
-                r["var"].set(mapping.get(r["device_path"], ""))
-            b.apply_per_monitor(mapping, position)
-        self._refresh_profile_list()
-        messagebox.showinfo("完成", f"已应用方案「{name}」")
+        try:
+            if mapping and len(set(mapping.values())) <= 1:
+                self.mode_var.set("single")
+                self._on_mode()
+                self.single_var.set(next(iter(mapping.values())))
+                ok = b.apply_single(self.single_var.get(), position)
+            else:
+                self.mode_var.set("per")
+                self._on_mode()
+                for r in self.mon_rows:
+                    r["var"].set(mapping.get(r["device_path"], ""))
+                ok = b.apply_per_monitor(mapping, position)
+            self._refresh_profile_list()
+            messagebox.showinfo("完成", "壁纸已应用" if ok else "已用回退方式应用(单屏)")
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("错误", f"应用方案「{name}」失败:\n{e}")
 
     def delete_profile(self):
         name = self.profile_var.get()
