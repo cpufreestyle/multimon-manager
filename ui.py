@@ -38,6 +38,8 @@ class App:
         # 无需常驻置顶；需要始终压住其它窗口时可手动勾选。
         self.topmost = tk.BooleanVar(value=False)
         self.hk = None
+        # 显示器热插拔监听的取消注册句柄（None 表示未启用）
+        self.monitor_watch = None
         self._build()
         self.refresh_monitors()
 
@@ -59,6 +61,7 @@ class App:
         self._build_profiles()
         self._build_hotkeys()
         self._build_autostart()
+        self._build_display_watch()
 
     def _build_wallpaper(self):
         f = ttk.LabelFrame(self.content, text="壁纸")
@@ -374,6 +377,62 @@ class App:
             messagebox.showerror("错误", f"设置开机自启失败:\n{e}")
             self.autostart_var.set(autostart.is_enabled())
 
+    # ---------- 显示器热插拔 ----------
+    def _build_display_watch(self):
+        f = ttk.LabelFrame(self.content, text="显示器热插拔")
+        f.pack(fill="x", padx=8, pady=6)
+        self.watch_enabled = tk.BooleanVar(
+            value=bool(settings.load().get("watch_displays", True)))
+        self.auto_apply_watch = tk.BooleanVar(
+            value=bool(settings.load().get("watch_auto_apply", False)))
+        ttk.Checkbutton(f, text="显示器增减/重排时自动刷新列表",
+                        variable=self.watch_enabled,
+                        command=self._toggle_display_watch).pack(anchor="w", padx=4, pady=2)
+        ttk.Checkbutton(f, text="并自动重应用上次使用的壁纸方案",
+                        variable=self.auto_apply_watch,
+                        command=self._save_watch_prefs).pack(anchor="w", padx=4, pady=2)
+        self._toggle_display_watch()
+
+    def _save_watch_prefs(self):
+        s = settings.load()
+        s["watch_displays"] = self.watch_enabled.get()
+        s["watch_auto_apply"] = self.auto_apply_watch.get()
+        settings.save(s)
+
+    def _toggle_display_watch(self):
+        self._save_watch_prefs()
+        if self.watch_enabled.get():
+            if self.monitor_watch is None:
+                self.monitor_watch = b.register_display_callback(self._on_display_change)
+                if self.monitor_watch is None:
+                    self.status_var.set("当前平台不支持显示器变化监听")
+        elif self.monitor_watch is not None:
+            try:
+                self.monitor_watch()
+            except Exception:  # noqa: BLE001
+                pass
+            self.monitor_watch = None
+
+    def _on_display_change(self):
+        """系统后台线程回调：切回 Tk 主线程处理。"""
+        try:
+            self.root.after(0, self._handle_display_change)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _handle_display_change(self):
+        """显示器配置变化后：刷新列表；可选自动重应用上次壁纸方案。"""
+        self.refresh_monitors()
+        name = settings.load().get("last_wallpaper_profile")
+        if self.auto_apply_watch.get() and name and profiles.load_profiles().get(name):
+            try:
+                profiles.apply_profile(name)
+                self.status_var.set(f"检测到显示器变化：已刷新并重应用方案「{name}」")
+            except Exception as e:  # noqa: BLE001
+                self.status_var.set(f"检测到显示器变化：已刷新（重应用失败：{e}）")
+        else:
+            self.status_var.set("检测到显示器变化：已刷新显示器列表")
+
     # ---------- 逻辑 ----------
     def refresh_monitors(self):
         self.monitors = b.enum_monitors(force=True)
@@ -520,6 +579,10 @@ class App:
                     r["var"].set(mapping.get(r["device_path"], ""))
                 ok = b.apply_per_monitor(mapping, position)
             self._refresh_profile_list()
+            # 记录最近应用的方案，供显示器热插拔时自动重应用
+            s = settings.load()
+            s["last_wallpaper_profile"] = name
+            settings.save(s)
             messagebox.showinfo("完成", "壁纸已应用" if ok else "已用回退方式应用(单屏)")
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("错误", f"应用方案「{name}」失败:\n{e}")

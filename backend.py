@@ -20,12 +20,14 @@ if IS_MAC:
     import windows_mac as windows
     import hotkeys_mac as hotkeys
     import tray_mac as tray
+    import display_notify_mac as display_notify
 else:
     import monitors
     import wallpaper
     import windows
     import hotkeys
     import tray
+    import display_notify
 
 
 # 统一常量（供 UI 使用）
@@ -56,3 +58,4 @@ set_target = windows.set_target
 set_window_rect = windows.set_window_rect
 snap_two_side_by_side = windows.snap_two_side_by_side
 HotkeyManager = hotkeys.HotkeyManager
+register_display_callback = display_notify.register
