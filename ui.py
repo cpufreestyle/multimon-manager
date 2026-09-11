@@ -138,10 +138,16 @@ class App:
             ("最大化", lambda: b.snap_active("maximize", activate=False)),
             ("居中", lambda: b.snap_active("center", activate=False)),
             ("并排左右", lambda: b.snap_two_side_by_side()),
+            ("左1/3", lambda: b.snap_active("left-third", activate=False)),
+            ("中1/3", lambda: b.snap_active("middle-third", activate=False)),
+            ("右1/3", lambda: b.snap_active("right-third", activate=False)),
+            ("左上", lambda: b.snap_active("quad-tl", activate=False)),
+            ("右上", lambda: b.snap_active("quad-tr", activate=False)),
+            ("左下", lambda: b.snap_active("quad-bl", activate=False)),
+            ("右下", lambda: b.snap_active("quad-br", activate=False)),
         ]
-        # 9 个按钮挤在单行总宽约 700+px，超出 660 的窗口宽度会导致右侧按钮
-        # 被截断或压扁，故分两行排列（5 + 4）。
-        for group in (btns[:5], btns[5:]):
+        # 16 个按钮单行总宽远超 660 的窗口宽度，故分三行排列（6 + 6 + 4）。
+        for group in (btns[:6], btns[6:12], btns[12:]):
             row = ttk.Frame(f)
             row.pack(fill="x", pady=2)
             for text, cmd in group:

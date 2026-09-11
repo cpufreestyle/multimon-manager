@@ -72,7 +72,8 @@ def move_to_monitor(hwnd, monitor, src=None):
 
 def snap(hwnd, monitor, zone):
     """将窗口吸附到目标显示器的某个区域。zone 取值:
-    left/right/top/bottom/maximize/center。"""
+    left/right/top/bottom/maximize/center，三分屏 left-third/middle-third/right-third，
+    四等分 quad-tl/quad-tr/quad-bl/quad-br。"""
     wl, wt, ww, wh = monitor.work_rect
     x, y, w, h = get_window_rect(hwnd)
     if zone == "left":
@@ -87,6 +88,20 @@ def snap(hwnd, monitor, zone):
         set_window_rect(hwnd, wl, wt, ww, wh)
     elif zone == "center":
         set_window_rect(hwnd, wl + (ww - w) // 2, wt + (wh - h) // 2, w, h)
+    elif zone == "left-third":
+        set_window_rect(hwnd, wl, wt, ww // 3, wh)
+    elif zone == "middle-third":
+        set_window_rect(hwnd, wl + ww // 3, wt, ww // 3, wh)
+    elif zone == "right-third":
+        set_window_rect(hwnd, wl + 2 * (ww // 3), wt, ww - 2 * (ww // 3), wh)
+    elif zone == "quad-tl":
+        set_window_rect(hwnd, wl, wt, ww // 2, wh // 2)
+    elif zone == "quad-tr":
+        set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh // 2)
+    elif zone == "quad-bl":
+        set_window_rect(hwnd, wl, wt + wh // 2, ww // 2, wh - wh // 2)
+    elif zone == "quad-br":
+        set_window_rect(hwnd, wl + ww // 2, wt + wh // 2, ww - ww // 2, wh - wh // 2)
 
 
 def monitors_list_snapshot():

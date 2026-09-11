@@ -465,6 +465,22 @@ def snap(hwnd, monitor, zone, activate=True):
     elif zone == "center":
         set_window_rect(hwnd, wl + (ww - w) // 2, wt + (wh - h) // 2, w, h,
                         activate=activate)
+    elif zone == "left-third":
+        set_window_rect(hwnd, wl, wt, ww // 3, wh, activate=activate)
+    elif zone == "middle-third":
+        set_window_rect(hwnd, wl + ww // 3, wt, ww // 3, wh, activate=activate)
+    elif zone == "right-third":
+        set_window_rect(hwnd, wl + 2 * (ww // 3), wt, ww - 2 * (ww // 3), wh,
+                        activate=activate)
+    elif zone == "quad-tl":
+        set_window_rect(hwnd, wl, wt, ww // 2, wh // 2, activate=activate)
+    elif zone == "quad-tr":
+        set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh // 2, activate=activate)
+    elif zone == "quad-bl":
+        set_window_rect(hwnd, wl, wt + wh // 2, ww // 2, wh - wh // 2, activate=activate)
+    elif zone == "quad-br":
+        set_window_rect(hwnd, wl + ww // 2, wt + wh // 2, ww - ww // 2, wh - wh // 2,
+                        activate=activate)
 
 
 def _monitor_index_by_rect(monitors_list, x, y, w, h):
