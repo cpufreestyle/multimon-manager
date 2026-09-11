@@ -9,6 +9,7 @@ import backend as b
 import profiles
 import settings
 import layouts
+import cmd_channel
 
 VK_LEFT = b.VK_LEFT
 VK_UP = b.VK_UP
@@ -42,6 +43,7 @@ class App:
         self.monitor_watch = None
         self._build()
         self.refresh_monitors()
+        self._start_command_poll()
 
     # ---------- 构建 ----------
     def _build(self):
@@ -286,6 +288,9 @@ class App:
         layouts.save_layout(name, data)
         self._refresh_layout_list()
         self.layout_var.set(name)
+        s = settings.load()
+        s["last_layout"] = name
+        settings.save(s)
         self.status_var.set(f"已保存布局：{name}（{len(data)} 个窗口）")
 
     def _apply_layout(self):
@@ -313,6 +318,9 @@ class App:
                 ok += 1
             except Exception:  # noqa: BLE001
                 miss += 1
+        s = settings.load()
+        s["last_layout"] = name
+        settings.save(s)
         self.status_var.set(f"已还原布局「{name}」：成功 {ok}，未找到 {miss}")
         if miss:
             messagebox.showinfo(
@@ -438,6 +446,33 @@ class App:
                 self.status_var.set(f"检测到显示器变化：已刷新（重应用失败：{e}）")
         else:
             self.status_var.set("检测到显示器变化：已刷新显示器列表")
+
+    # ---------- 托盘命令通道 ----------
+    def _start_command_poll(self):
+        """定时轮询托盘子进程发来的命令（每 800ms）。"""
+        self._poll_command()
+        self.root.after(800, self._start_command_poll)
+
+    def _poll_command(self):
+        cmd = cmd_channel.take()
+        if not cmd:
+            return
+        if cmd == "refresh":
+            self.refresh_monitors()
+        elif cmd == "apply_layout":
+            self._apply_last_layout()
+        elif cmd == "open":
+            self.show()
+
+    def _apply_last_layout(self):
+        """应用最近保存/使用的窗口布局（供托盘一键调用）。"""
+        name = settings.load().get("last_layout")
+        if not name or not layouts.load_layout(name):
+            self.status_var.set("托盘：尚无窗口布局方案，请先在主界面保存")
+            self.show()
+            return
+        self.layout_var.set(name)
+        self._apply_layout()
 
     # ---------- 逻辑 ----------
     def refresh_monitors(self):
