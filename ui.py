@@ -332,6 +332,14 @@ class App:
             if img and not os.path.exists(img):
                 messagebox.showwarning("提示", f"图片文件不存在:\n{img}")
                 return
+        # 部分屏幕未选图时提醒（per 模式）：已选的照常应用，未选的保持原样
+        if self.mode_var.get() == "per" and len(mapping) < len(self.monitors):
+            if not getattr(self, "_partial_hinted", False):
+                self._partial_hinted = True
+                messagebox.showwarning(
+                    "提示",
+                    f"有 {len(self.monitors) - len(mapping)} 块显示器未选择图片，"
+                    "将保持当前壁纸。")
         try:
             if self.mode_var.get() == "single":
                 ok = b.apply_single(self.single_var.get(), position)
@@ -441,6 +449,13 @@ class App:
 
     def on_close(self):
         self.root.withdraw()
+        # 首次关闭时告知用户：窗口只是最小化到托盘，而非退出程序
+        if not getattr(self, "_close_hinted", False):
+            self._close_hinted = True
+            messagebox.showinfo(
+                "提示",
+                "窗口已最小化到系统托盘。\n"
+                "双击托盘图标可重新打开，右键托盘图标可退出。")
 
     def quit(self):
         if self.hk:
