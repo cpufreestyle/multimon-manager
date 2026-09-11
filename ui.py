@@ -125,11 +125,14 @@ class App:
             ("居中", lambda: b.snap_active("center", activate=False)),
             ("并排左右", lambda: b.snap_two_side_by_side()),
         ]
-        row = ttk.Frame(f)
-        row.pack(fill="x", pady=4)
-        for text, cmd in btns:
-            ttk.Button(row, text=text,
-                       command=self._keep_front_after(cmd)).pack(side="left", padx=3)
+        # 9 个按钮挤在单行总宽约 700+px，超出 660 的窗口宽度会导致右侧按钮
+        # 被截断或压扁，故分两行排列（5 + 4）。
+        for group in (btns[:5], btns[5:]):
+            row = ttk.Frame(f)
+            row.pack(fill="x", pady=2)
+            for text, cmd in group:
+                ttk.Button(row, text=text,
+                           command=self._keep_front_after(cmd)).pack(side="left", padx=3)
 
         # 台前调度开启时，两个不同 App 的窗口必须处于同一个"台前组"才会同时显示，
         # 而 macOS 无公开 API 建组，只能用户先手动拖到一起。

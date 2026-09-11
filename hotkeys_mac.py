@@ -8,6 +8,7 @@
 """
 import ctypes
 import ctypes.util
+import queue
 import threading
 
 # ---- 加载系统框架 ----
@@ -27,6 +28,10 @@ _HAS_QUARTZ = _quartz is not None
 kCGSessionEventTap = 0
 kCGHeadInsertEventTap = 1
 kCGEventKeyDown = 10
+# tap 被系统禁用时回调会收到这两种类型：回调阻塞超时 / 被用户禁用。
+# 必须在此重新启用，否则快捷键永久失效（表现为按几次后彻底无反应）。
+kCGEventTapDisabledByTimeout = 0xFFFFFFFE
+kCGEventTapDisabledByUser = 0xFFFFFFFF
 kCGEventFlagMaskControl = 0x00040000
 kCGEventFlagMaskAlternate = 0x00080000
 kCGEventFlagMaskShift = 0x00020000
@@ -66,6 +71,8 @@ if _HAS_QUARTZ:
         _quartz.CFRunLoopRun.argtypes = []
         _quartz.CFRunLoopStop.restype = None
         _quartz.CFRunLoopStop.argtypes = [ctypes.c_void_p]
+        _quartz.CGEventTapEnable.restype = None
+        _quartz.CGEventTapEnable.argtypes = [ctypes.c_void_p, ctypes.c_bool]
     except Exception:  # noqa: BLE001
         pass
 
@@ -87,6 +94,9 @@ class HotkeyManager:
         self._tap = None
         self._rl = None
         self._cb = None
+        # 事件回调只入队，实际动作交给工作线程执行（原因见 _handler 注释）
+        self._queue = queue.Queue()
+        self._worker_thread = None
 
     def register(self, modifiers, vk, callback):
         hid = 1 + len(self.hotkeys)
@@ -99,8 +109,11 @@ class HotkeyManager:
                 print("[hotkeys_mac] 未找到 Quartz 框架，全局快捷键不可用")
             return
         self._running = True
+        self._queue = queue.Queue()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
+        self._worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self._worker_thread.start()
 
     def _run(self):
         self._cb = CGEventTapCallBack(self._handler)
@@ -119,17 +132,43 @@ class HotkeyManager:
         _quartz.CFRunLoopRun()
 
     def _handler(self, proxy, etype, event, refcon):
+        """事件回调：必须尽快返回，绝不能在此执行耗时动作。
+
+        macOS 对事件 tap 有超时保护。若回调长时间不返回（例如在此直接跑
+        osascript —— 一次分屏要启动 2 个进程、耗时数百毫秒），系统会自动
+        禁用该 tap，之后只收到 kCGEventTapDisabledByTimeout；若不重新启用，
+        快捷键将永久失效。因此这里只做两件事：自愈 tap、把动作丢进队列。
+        """
+        # etype 声明为 c_int，无符号常量会以负数形式传入，统一按 32 位比较
+        etype_u = etype & 0xFFFFFFFF
+        if etype_u in (kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUser):
+            if self._tap:
+                try:
+                    _quartz.CGEventTapEnable(self._tap, True)
+                except Exception:  # noqa: BLE001
+                    pass
+            return event
+
         if etype != kCGEventKeyDown:
             return event
         code = _quartz.CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
         flags = _quartz.CGEventGetIntegerValueField(event, kCGEventFlags)
         for _hid, (mod, vk, cb) in self.hotkeys.items():
             if vk == code and self._flags_match(flags, mod):
-                try:
-                    cb()
-                except Exception:  # noqa: BLE001
-                    pass
+                self._queue.put(cb)  # 只入队，立即返回
+                break  # 一个按键只触发一个动作
         return event
+
+    def _worker(self):
+        """工作线程：真正执行快捷键动作（osascript 等耗时操作）。"""
+        while True:
+            cb = self._queue.get()
+            if cb is None:  # 停止信号
+                break
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _flags_match(self, flags, mod):
         want = 0
@@ -145,11 +184,22 @@ class HotkeyManager:
 
     def stop(self):
         self._running = False
+        # 先禁用 tap 再停 runloop，否则系统侧监听会残留，反复启用会累积
+        if self._tap:
+            try:
+                _quartz.CGEventTapEnable(self._tap, False)
+            except Exception:  # noqa: BLE001
+                pass
         if self._rl:
             try:
                 _quartz.CFRunLoopStop(self._rl)
             except Exception:  # noqa: BLE001
                 pass
+        # 唤醒工作线程退出（否则它会一直阻塞在 get）
+        try:
+            self._queue.put(None)
+        except Exception:  # noqa: BLE001
+            pass
         self._tap = None
         self._rl = None
 
