@@ -65,6 +65,11 @@ class App:
         ttk.Radiobutton(mode, text="统一单图(所有屏)", variable=self.mode_var, value="single",
                         command=self._on_mode).pack(side="left")
 
+        # 显示器布局可视化：直观看到哪块屏在左/右/上/下（几何数据已由 monitors_mac 提供）
+        self.layout_canvas = tk.Canvas(f, height=172, bg="#fafafa",
+                                       relief="sunken", borderwidth=1)
+        self.layout_canvas.pack(fill="x", padx=6, pady=(2, 6))
+
         self.mon_frame = ttk.Frame(f)
         self.single_frame = ttk.Frame(f)
         ttk.Button(self.single_frame, text="选择图片",
@@ -261,6 +266,48 @@ class App:
             ttk.Button(row, text="选择", command=lambda v=var: self._pick(v)).pack(side="left")
             ttk.Entry(row, textvariable=var, width=32).pack(side="left", padx=4, fill="x", expand=True)
             self.mon_rows.append({"device_path": m.device_path, "var": var})
+        # 刷新后重绘布局可视化（点击屏幕可直接为该屏选壁纸）
+        self._draw_layout()
+
+    def _draw_layout(self):
+        """在 Canvas 上按比例画出各显示器相对位置。
+
+        monitors_mac 返回的是 Cocoa 全局拼接坐标（原点主屏左下、y 轴向上），
+        绘制时统一翻转 y 轴并缩放适配 Canvas 宽度。
+        """
+        cv = self.layout_canvas
+        cv.delete("all")
+        ms = self.monitors
+        if not ms:
+            return
+        min_x = min(m.left for m in ms)
+        max_y = max(m.top + m.height for m in ms)        # Cocoa 坐标系最高顶部
+        world_w = max(m.left + m.width for m in ms) - min_x
+        world_h = max_y - min(m.top for m in ms)
+        cw = max(620, cv.winfo_width())
+        ch = cv.winfo_height() or 172
+        pad = 14
+        scale = min((cw - 2 * pad) / world_w, (ch - 2 * pad) / world_h)
+        for i, m in enumerate(ms):
+            x1 = pad + (m.left - min_x) * scale
+            y1 = pad + (max_y - (m.top + m.height)) * scale   # 翻转 y 轴
+            x2 = x1 + m.width * scale
+            y2 = y1 + m.height * scale
+            fill = "#d8e6ff" if m.is_primary else "#e9e9e9"
+            rid = cv.create_rectangle(x1, y1, x2, y2, fill=fill,
+                                      outline="#5a5a5a", width=1.5)
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            txt = f"{i + 1}. {m.width}x{m.height}"
+            if m.is_primary:
+                txt += "  主屏"
+            cv.create_text(cx, cy, text=txt, font=("Helvetica", 11), fill="#222")
+            cv.tag_bind(rid, "<Button-1>",
+                        lambda e, idx=i: self._on_screen_click(idx))
+
+    def _on_screen_click(self, index):
+        """点击可视化中的屏幕，直接为该屏选择壁纸。"""
+        if 0 <= index < len(self.mon_rows):
+            self._pick(self.mon_rows[index]["var"])
 
     def _current_mapping(self):
         position = self.fit_var.get()
