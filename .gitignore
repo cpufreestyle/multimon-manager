@@ -21,7 +21,8 @@ _out_*
 .Spotlight-V100
 .Trashes
 
-# 运行时用户配置（壁纸方案、快捷键偏好等，不应入库）
+# 运行时用户配置（壁纸方案、快捷键偏好、窗口布局等，不应入库）
 settings.json
 profiles.json
+layouts.json
 

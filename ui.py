@@ -2,12 +2,13 @@
 import os
 import sys
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import autostart
 import backend as b
 import profiles
 import settings
+import layouts
 
 VK_LEFT = b.VK_LEFT
 VK_UP = b.VK_UP
@@ -54,6 +55,7 @@ class App:
 
         self._build_wallpaper()
         self._build_window_tools()
+        self._build_layouts()
         self._build_profiles()
         self._build_hotkeys()
         self._build_autostart()
@@ -230,6 +232,97 @@ class App:
         ttk.Button(top, text="应用", command=self.apply_profile).pack(side="left", padx=3)
         ttk.Button(top, text="删除", command=self.delete_profile).pack(side="left", padx=3)
         self._refresh_profile_list()
+
+    # ---------- 窗口布局方案 ----------
+    def _build_layouts(self):
+        f = ttk.LabelFrame(self.content, text="窗口布局方案")
+        f.pack(fill="x", padx=8, pady=6)
+        ttk.Label(
+            f,
+            text="保存当前所有窗口的位置/大小，之后一键还原（按「应用::窗口」匹配，"
+                 "标题变化会自动按应用名兜底）。",
+            justify="left", wraplength=620,
+        ).pack(anchor="w", padx=4, pady=(0, 4))
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=4, pady=4)
+        ttk.Label(row, text="方案:").pack(side="left")
+        self.layout_var = tk.StringVar()
+        self.layout_cb = ttk.Combobox(row, textvariable=self.layout_var,
+                                      state="readonly", width=26)
+        self.layout_cb.pack(side="left", padx=4, fill="x", expand=True)
+        ttk.Button(row, text="保存当前…", command=self._save_layout).pack(side="left", padx=2)
+        ttk.Button(row, text="应用", command=self._apply_layout).pack(side="left", padx=2)
+        ttk.Button(row, text="删除", command=self._delete_layout).pack(side="left", padx=2)
+        self._refresh_layout_list()
+
+    def _refresh_layout_list(self):
+        names = layouts.list_layouts()
+        self.layout_cb["values"] = names
+        if names and self.layout_var.get() not in names:
+            self.layout_var.set(names[0])
+        elif not names:
+            self.layout_var.set("")
+
+    def _save_layout(self):
+        wins = b.list_target_windows()
+        if not wins:
+            messagebox.showwarning("提示", "当前没有可保存的窗口")
+            return
+        name = simpledialog.askstring("保存布局", "方案名称：", parent=self.root)
+        if not name:
+            return
+        data = [{"hwnd": w["hwnd"], "owner": w["owner"], "name": w["name"],
+                 "x": w["x"], "y": w["y"], "w": w["w"], "h": w["h"]}
+                for w in wins]
+        layouts.save_layout(name, data)
+        self._refresh_layout_list()
+        self.layout_var.set(name)
+        self.status_var.set(f"已保存布局：{name}（{len(data)} 个窗口）")
+
+    def _apply_layout(self):
+        name = self.layout_var.get()
+        if not name:
+            messagebox.showwarning("提示", "请先选择或保存一个布局方案")
+            return
+        layout = layouts.load_layout(name)
+        if not layout:
+            messagebox.showwarning("提示", f"布局方案不存在：{name}")
+            return
+        ok, miss = 0, 0
+        current = {w["hwnd"]: w["owner"] for w in b.list_target_windows()}
+        for item in layout["windows"]:
+            hwnd = item["hwnd"]
+            # 精确匹配；否则按应用名兜底（窗口标题可能已变化）
+            target = hwnd if hwnd in current else next(
+                (h for h, o in current.items() if o == item["owner"]), None)
+            if not target:
+                miss += 1
+                continue
+            try:
+                b.set_window_rect(target, item["x"], item["y"], item["w"], item["h"],
+                                 activate=False)
+                ok += 1
+            except Exception:  # noqa: BLE001
+                miss += 1
+        self.status_var.set(f"已还原布局「{name}」：成功 {ok}，未找到 {miss}")
+        if miss:
+            messagebox.showinfo(
+                "完成",
+                f"布局「{name}」还原完成：成功 {ok} 个，未找到 {miss} 个"
+                "（窗口可能已关闭或标题已变）。")
+        else:
+            messagebox.showinfo("完成", f"布局「{name}」已全部还原（{ok} 个窗口）")
+
+    def _delete_layout(self):
+        name = self.layout_var.get()
+        if not name:
+            messagebox.showwarning("提示", "请先选择要删除的布局方案")
+            return
+        if not messagebox.askyesno("确认", f"删除布局方案「{name}」？"):
+            return
+        layouts.delete_layout(name)
+        self._refresh_layout_list()
+        self.status_var.set(f"已删除布局：{name}")
 
     def _build_hotkeys(self):
         f = ttk.LabelFrame(self.content, text="全局快捷键")
