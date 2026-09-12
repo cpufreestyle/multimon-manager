@@ -496,9 +496,10 @@ class App:
     def _draw_layout(self):
         """在 Canvas 上按比例画出各显示器相对位置。
 
-        monitors_mac 返回的是 Cocoa 全局拼接坐标（原点主屏左下、y 轴向上），
-        绘制时统一翻转 y 轴并缩放适配 Canvas 宽度。标签按矩形尺寸自适应
-        （分级内容 + 动态字号 + 强制折行），避免文字溢出边界、与相邻屏幕重叠。
+        monitors_mac 返回的是 CoreGraphics 的全局拼接坐标：原点在主屏左上、
+        x 向右为正、y 向下为正（与 Canvas 方向一致，故不做 y 翻转）。这里按
+        比例缩放适配 Canvas。标签按矩形尺寸自适应（分级内容 + 动态字号 +
+        强制折行），避免文字溢出边界、与相邻屏幕重叠。
         """
         cv = self.layout_canvas
         cv.delete("all")
@@ -506,9 +507,9 @@ class App:
         if not ms:
             return
         min_x = min(m.left for m in ms)
-        max_y = max(m.top + m.height for m in ms)        # Cocoa 坐标系最高顶部
+        min_y = min(m.top for m in ms)
         world_w = max(m.left + m.width for m in ms) - min_x
-        world_h = max_y - min(m.top for m in ms)
+        world_h = max(m.top + m.height for m in ms) - min_y
         cw = max(620, cv.winfo_width())
         ch = cv.winfo_height()
         if ch < 50:            # 控件未真正渲染时 winfo_height 返回 1，用默认高度兜底
@@ -517,7 +518,7 @@ class App:
         scale = min((cw - 2 * pad) / world_w, (ch - 2 * pad) / world_h)
         for i, m in enumerate(ms):
             x1 = pad + (m.left - min_x) * scale
-            y1 = pad + (max_y - (m.top + m.height)) * scale   # 翻转 y 轴
+            y1 = pad + (m.top - min_y) * scale
             x2 = x1 + m.width * scale
             y2 = y1 + m.height * scale
             bw, bh = x2 - x1, y2 - y1
