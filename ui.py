@@ -23,8 +23,8 @@ AUTO_TARGET = "自动（上次活动窗口）"
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("多屏管理器  (DisplayFusion 风格)")
-        self.root.geometry("660x760")
+        self.root.title("多屏管理器")
+        self.root.geometry("720x880")
         self.monitors = []
         self.mon_rows = []
         self.fit_var = tk.StringVar(value="fill")
@@ -77,7 +77,7 @@ class App:
                         command=self._on_mode).pack(side="left")
 
         # 显示器布局可视化：直观看到哪块屏在左/右/上/下（几何数据已由 monitors_mac 提供）
-        self.layout_canvas = tk.Canvas(f, height=196, bg="#fafafa",
+        self.layout_canvas = tk.Canvas(f, height=272, bg="#fafafa",
                                        relief="sunken", borderwidth=1)
         self.layout_canvas.pack(fill="x", padx=6, pady=(2, 6))
 
@@ -139,7 +139,6 @@ class App:
             ("下半", lambda: b.snap_active("bottom", activate=False)),
             ("最大化", lambda: b.snap_active("maximize", activate=False)),
             ("居中", lambda: b.snap_active("center", activate=False)),
-            ("并排左右", lambda: b.snap_two_side_by_side()),
             ("左1/3", lambda: b.snap_active("left-third", activate=False)),
             ("中1/3", lambda: b.snap_active("middle-third", activate=False)),
             ("右1/3", lambda: b.snap_active("right-third", activate=False)),
@@ -148,13 +147,31 @@ class App:
             ("左下", lambda: b.snap_active("quad-bl", activate=False)),
             ("右下", lambda: b.snap_active("quad-br", activate=False)),
         ]
-        # 16 个按钮单行总宽远超 660 的窗口宽度，故分三行排列（6 + 6 + 4）。
+        # 15 个按钮分三行排列（6 + 6 + 3），避免超出窗口宽度被截断。
         for group in (btns[:6], btns[6:12], btns[12:]):
             row = ttk.Frame(f)
             row.pack(fill="x", pady=2)
             for text, cmd in group:
                 ttk.Button(row, text=text,
                            command=self._keep_front_after(cmd)).pack(side="left", padx=3)
+
+        # 并排左右：可指定左右两个窗口（留"自动"则由程序取最前面两个）
+        sbs = ttk.Frame(f)
+        sbs.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(sbs, text="并排:").pack(side="left")
+        self.sbs_left_var = tk.StringVar(value=AUTO_TARGET)
+        self.sbs_right_var = tk.StringVar(value=AUTO_TARGET)
+        ttk.Label(sbs, text="左").pack(side="left", padx=(8, 2))
+        self.sbs_left_cb = ttk.Combobox(sbs, textvariable=self.sbs_left_var,
+                                        state="readonly", width=16)
+        self.sbs_left_cb.pack(side="left")
+        ttk.Label(sbs, text="右").pack(side="left", padx=(8, 2))
+        self.sbs_right_cb = ttk.Combobox(sbs, textvariable=self.sbs_right_var,
+                                         state="readonly", width=16)
+        self.sbs_right_cb.pack(side="left")
+        ttk.Button(sbs, text="并排左右",
+                   command=self._keep_front_after(self._snap_two_side_by_side)).pack(
+            side="left", padx=(10, 0))
 
         # 台前调度开启时，两个不同 App 的窗口必须处于同一个"台前组"才会同时显示，
         # 而 macOS 无公开 API 建组，只能用户先手动拖到一起。
@@ -187,6 +204,13 @@ class App:
             labels.append(w["label"])
             self._target_map[w["label"]] = w["hwnd"]
         self.target_cb["values"] = labels
+        # 并排窗口下拉与目标窗口共用同一份列表（含"自动"）
+        if hasattr(self, "sbs_left_cb"):
+            for cb, var in ((self.sbs_left_cb, self.sbs_left_var),
+                            (self.sbs_right_cb, self.sbs_right_var)):
+                cb["values"] = labels
+                if var.get() and var.get() not in self._target_map:
+                    var.set(AUTO_TARGET)
         if self.target_var.get() not in self._target_map:
             self.target_var.set(AUTO_TARGET)
             b.set_target(None)
@@ -195,6 +219,18 @@ class App:
         label = self.target_var.get()
         b.set_target(self._target_map.get(label))
         self.status_var.set(f"目标窗口: {label}")
+
+    def _snap_two_side_by_side(self):
+        """按选择的左右窗口并排；选"自动"则由程序取最前面两个窗口。"""
+        left = self._target_map.get(self.sbs_left_var.get())
+        right = self._target_map.get(self.sbs_right_var.get())
+        if left and right and left == right:
+            messagebox.showwarning("提示", "左右窗口不能选同一个")
+            return
+        if b.snap_two_side_by_side(left_hwnd=left, right_hwnd=right):
+            self.status_var.set("已并排左右")
+        else:
+            self.status_var.set("并排失败：需要至少两个可操作窗口")
 
     # ---------- 置顶 ----------
     def _apply_topmost(self):
@@ -530,15 +566,17 @@ class App:
             # 主屏用 ★ 前缀（比"主屏"两字省宽度）；create_text 的 width 限制折行，
             # 保证文字始终落在矩形内部。
             head = f"★{i + 1}" if m.is_primary else f"{i + 1}"
-            size_line = f"{m.width}x{m.height}"
-            if bw < 46 or bh < 20:
+            name = (m.device_name or "").strip()
+            res = f"{m.width}x{m.height}"
+            # 太小的矩形只放编号；否则编号 + 屏幕名 + 分辨率（名称过长自动折行）
+            if bw < 52 or bh < 22:
                 txt, size = head, 8
-            elif bw < 92 or bh < 44:
-                txt, size = f"{head}\n{size_line}", 8
+            elif bw < 128 or bh < 66:
+                txt, size = f"{head}. {name}\n{res}", 8
             else:
-                txt, size = f"{head}. {size_line}", 10
+                txt, size = f"{head}. {name}\n{res}", 10
             cv.create_text(cx, cy, text=txt, font=("Helvetica", size), fill="#222",
-                           width=max(int(bw) - 6, 16), justify="center")
+                           width=max(int(bw) - 8, 16), justify="center")
             cv.tag_bind(rid, "<Button-1>",
                         lambda e, idx=i: self._on_screen_click(idx))
 

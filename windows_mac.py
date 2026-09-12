@@ -492,11 +492,11 @@ def _monitor_index_by_rect(monitors_list, x, y, w, h):
     return 0
 
 
-def snap_two_side_by_side(use_pinned=True):
-    """把两个窗口并排到同一屏的左右半屏（左在前、右在后）。
+def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True):
+    """把两个窗口并排到同一屏的左右半屏（左/右可显式指定）。
 
-    自动模式下单次操作后目标窗口会被激活，下次自动选中的仍是它，
-    因此无法依次把两个窗口摆到左右半屏。此接口一次完成两个窗口的排布，
+    left_hwnd / right_hwnd 为 "应用::窗口" 标识；未指定时自动取最前面的两个
+    窗口（左侧优先用界面固定的目标窗口）。以左侧窗口当前所在屏幕为准，
     且不激活任何窗口，避免互相"踢掉"。
     """
     ms = monitors.enum_monitors()
@@ -505,25 +505,33 @@ def snap_two_side_by_side(use_pinned=True):
 
     cands = [w for w in list_windows_front_to_back()
              if w["pid"] not in _OWN_PIDS and w["owner"]]
-    if not cands:
-        logger.warning("没有可用于并排的窗口")
-        return False
+    cands_by_hwnd = {f'{w["owner"]}::{w["name"]}': w for w in cands}
 
-    if use_pinned and _pinned_target:
-        left_w = _find_window(_pinned_target) or cands[0]
-    else:
+    # 解析左窗口：显式指定 > 界面固定目标 > 最前面窗口
+    left_w = None
+    if left_hwnd:
+        left_w = cands_by_hwnd.get(left_hwnd) or _find_window(left_hwnd)
+    elif use_pinned and _pinned_target:
+        left_w = _find_window(_pinned_target)
+    if left_w is None:
+        if not cands:
+            logger.warning("没有可用于并排的窗口")
+            return False
         left_w = cands[0]
-
     left_hwnd = f'{left_w["owner"]}::{left_w["name"]}'
+
+    # 解析右窗口：显式指定 > 与左窗口不同的最前面窗口
     right_w = None
-    for w in cands:
-        if f'{w["owner"]}::{w["name"]}' != left_hwnd:
-            right_w = w
-            break
+    if right_hwnd and right_hwnd != left_hwnd:
+        right_w = cands_by_hwnd.get(right_hwnd) or _find_window(right_hwnd)
+    if right_w is None:
+        for w in cands:
+            if f'{w["owner"]}::{w["name"]}' != left_hwnd:
+                right_w = w
+                break
     if right_w is None:
         logger.warning("只找到一个可用窗口，无法并排")
         return False
-
     right_hwnd = f'{right_w["owner"]}::{right_w["name"]}'
 
     # 以左侧窗口当前所在的屏幕为准

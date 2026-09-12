@@ -57,6 +57,6 @@ snap_active = windows.snap_active
 list_target_windows = windows.list_target_windows
 set_target = windows.set_target
 set_window_rect = windows.set_window_rect
-snap_two_side_by_side = windows.snap_two_side_by_side
+snap_two_side_by_side = getattr(windows, "snap_two_side_by_side", lambda *a, **k: False)
 HotkeyManager = hotkeys.HotkeyManager
 register_display_callback = display_notify.register
