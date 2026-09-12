@@ -77,7 +77,7 @@ class App:
                         command=self._on_mode).pack(side="left")
 
         # 显示器布局可视化：直观看到哪块屏在左/右/上/下（几何数据已由 monitors_mac 提供）
-        self.layout_canvas = tk.Canvas(f, height=172, bg="#fafafa",
+        self.layout_canvas = tk.Canvas(f, height=196, bg="#fafafa",
                                        relief="sunken", borderwidth=1)
         self.layout_canvas.pack(fill="x", padx=6, pady=(2, 6))
 
@@ -497,7 +497,8 @@ class App:
         """在 Canvas 上按比例画出各显示器相对位置。
 
         monitors_mac 返回的是 Cocoa 全局拼接坐标（原点主屏左下、y 轴向上），
-        绘制时统一翻转 y 轴并缩放适配 Canvas 宽度。
+        绘制时统一翻转 y 轴并缩放适配 Canvas 宽度。标签按矩形尺寸自适应
+        （分级内容 + 动态字号 + 强制折行），避免文字溢出边界、与相邻屏幕重叠。
         """
         cv = self.layout_canvas
         cv.delete("all")
@@ -509,7 +510,9 @@ class App:
         world_w = max(m.left + m.width for m in ms) - min_x
         world_h = max_y - min(m.top for m in ms)
         cw = max(620, cv.winfo_width())
-        ch = cv.winfo_height() or 172
+        ch = cv.winfo_height()
+        if ch < 50:            # 控件未真正渲染时 winfo_height 返回 1，用默认高度兜底
+            ch = 196
         pad = 14
         scale = min((cw - 2 * pad) / world_w, (ch - 2 * pad) / world_h)
         for i, m in enumerate(ms):
@@ -517,14 +520,24 @@ class App:
             y1 = pad + (max_y - (m.top + m.height)) * scale   # 翻转 y 轴
             x2 = x1 + m.width * scale
             y2 = y1 + m.height * scale
+            bw, bh = x2 - x1, y2 - y1
             fill = "#d8e6ff" if m.is_primary else "#e9e9e9"
             rid = cv.create_rectangle(x1, y1, x2, y2, fill=fill,
                                       outline="#5a5a5a", width=1.5)
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-            txt = f"{i + 1}. {m.width}x{m.height}"
-            if m.is_primary:
-                txt += "  主屏"
-            cv.create_text(cx, cy, text=txt, font=("Helvetica", 11), fill="#222")
+            # 按矩形大小分级：太小只显示编号，中等显示两行，够大才显示完整信息。
+            # 主屏用 ★ 前缀（比"主屏"两字省宽度）；create_text 的 width 限制折行，
+            # 保证文字始终落在矩形内部。
+            head = f"★{i + 1}" if m.is_primary else f"{i + 1}"
+            size_line = f"{m.width}x{m.height}"
+            if bw < 46 or bh < 20:
+                txt, size = head, 8
+            elif bw < 92 or bh < 44:
+                txt, size = f"{head}\n{size_line}", 8
+            else:
+                txt, size = f"{head}. {size_line}", 10
+            cv.create_text(cx, cy, text=txt, font=("Helvetica", size), fill="#222",
+                           width=max(int(bw) - 6, 16), justify="center")
             cv.tag_bind(rid, "<Button-1>",
                         lambda e, idx=i: self._on_screen_click(idx))
 
