@@ -151,6 +151,31 @@ def build_macos(icon_png):
     return app
 
 
+def build_macos_frozen(icon_png):
+    """用 PyInstaller 打成**自带 Python 运行时**的独立 .app（需先安装 pyinstaller）。
+
+    与默认的 shim 方案不同，这个 .app 不依赖系统 python3，可直接分发给别人。
+    """
+    if sys.platform != "darwin":
+        print("[macOS] 当前不是 macOS，跳过")
+        return None
+    os.makedirs(BUILD, exist_ok=True)
+    icns = _make_icns(icon_png, os.path.join(BUILD, "app.icns"))
+    cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
+           "--windowed", f"--icon={icns}", f"--name={APP_NAME}",
+           f"--osx-bundle-identifier={BUNDLE_ID}",
+           "--hidden-import=_tray_panel", "main.py"]
+    print("[macOS-frozen]", " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True, cwd=HERE)
+    except Exception as e:  # noqa: BLE001
+        print("[macOS-frozen] 构建失败（请先 `pip install pyinstaller`）:", e)
+        return None
+    app = os.path.join(DIST, APP_NAME + ".app")
+    print(f"[macOS-frozen] 已生成: {app}")
+    return app
+
+
 def _make_ico(icon_png, out_ico):
     """把 PNG 转成 .ico（优先 Pillow；否则回退 resources.create_ico）。"""
     try:
@@ -202,7 +227,10 @@ def main():
     os.makedirs(DIST, exist_ok=True)
     icon = prepare_icon()
     if sys.platform == "darwin":
-        build_macos(icon)
+        if "--frozen" in sys.argv:
+            build_macos_frozen(icon)
+        else:
+            build_macos(icon)
     elif sys.platform.startswith("win"):
         build_windows(icon)
     else:

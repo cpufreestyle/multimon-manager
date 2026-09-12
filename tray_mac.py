@@ -29,13 +29,18 @@ class TrayIcon:
         子进程面板，暂不支持"刷新显示器"回调，接收后忽略（不传会 TypeError）。
         """
         self.tip = tip
-        here = os.path.dirname(os.path.abspath(__file__))
-        tray_script = os.path.join(here, "_tray_panel.py")
-        if not os.path.exists(tray_script):
-            return
+        if getattr(sys, "frozen", False):
+            # 独立打包后没有可用的 .py 路径，改用同一可执行文件的 --tray-panel 模式
+            args = [sys.executable, "--tray-panel", tip]
+        else:
+            here = os.path.dirname(os.path.abspath(__file__))
+            tray_script = os.path.join(here, "_tray_panel.py")
+            if not os.path.exists(tray_script):
+                return
+            args = [sys.executable, tray_script, tip]
         try:
             self.proc = subprocess.Popen(
-                [sys.executable, tray_script, tip],
+                args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )

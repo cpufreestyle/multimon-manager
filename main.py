@@ -133,6 +133,15 @@ def _activate_frontmost(root, delay_ms=400):
 
 
 def main():
+    # 独立打包（PyInstaller 冻结）后，托盘面板以「同一可执行文件 + --tray-panel」
+    # 启动；必须在单实例检查之前处理，否则会被误判为重复启动而直接退出。
+    if "--tray-panel" in sys.argv:
+        idx = sys.argv.index("--tray-panel")
+        sys.argv = [sys.argv[0]] + sys.argv[idx + 1:]
+        import _tray_panel
+        _tray_panel.main()
+        return
+
     _set_dpi_aware()
     if not _single_instance():
         try:
