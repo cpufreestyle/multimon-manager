@@ -584,6 +584,78 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True):
     return True
 
 
+def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=True):
+    """把三个窗口堆叠到同一屏的上/中/下三栏（竖屏排列）。
+
+    top/mid/bot_hwnd 为 "应用::窗口" 标识；未指定时自动取最前面的三个窗口
+    （顶部优先用界面固定的目标窗口）。以顶部窗口当前所在屏幕为准，
+    排列完成后把三个窗口激活到最前，确保结果可见、不被遮挡。
+    """
+    ms = monitors.enum_monitors()
+    if not ms:
+        return False
+
+    cands = [w for w in list_windows_front_to_back()
+             if w["pid"] not in _OWN_PIDS and w["owner"]]
+    cands_by_hwnd = {f'{w["owner"]}::{w["name"]}': w for w in cands}
+
+    # 解析顶部窗口：显式指定 > 界面固定目标 > 最前面窗口
+    top_w = None
+    if top_hwnd:
+        top_w = cands_by_hwnd.get(top_hwnd) or _find_window(top_hwnd)
+    elif use_pinned and _pinned_target:
+        top_w = _find_window(_pinned_target)
+    if top_w is None:
+        if not cands:
+            logger.warning("没有可用于三栏排列的窗口")
+            return False
+        top_w = cands[0]
+    top_hwnd = f'{top_w["owner"]}::{top_w["name"]}'
+
+    # 解析中部窗口：显式指定 > 与顶部不同的最前面窗口
+    mid_w = None
+    if mid_hwnd and mid_hwnd != top_hwnd:
+        mid_w = cands_by_hwnd.get(mid_hwnd) or _find_window(mid_hwnd)
+    if mid_w is None:
+        for w in cands:
+            if f'{w["owner"]}::{w["name"]}' != top_hwnd:
+                mid_w = w
+                break
+    if mid_w is None:
+        logger.warning("只找到一个可用窗口，无法三栏排列")
+        return False
+    mid_hwnd = f'{mid_w["owner"]}::{mid_w["name"]}'
+
+    # 解析底部窗口：显式指定 > 与顶部/中部都不同的最前面窗口
+    bot_w = None
+    if bot_hwnd and bot_hwnd not in (top_hwnd, mid_hwnd):
+        bot_w = cands_by_hwnd.get(bot_hwnd) or _find_window(bot_hwnd)
+    if bot_w is None:
+        for w in cands:
+            h = f'{w["owner"]}::{w["name"]}'
+            if h != top_hwnd and h != mid_hwnd:
+                bot_w = w
+                break
+    if bot_w is None:
+        logger.warning("只找到两个可用窗口，无法三栏排列")
+        return False
+    bot_hwnd = f'{bot_w["owner"]}::{bot_w["name"]}'
+
+    # 以顶部窗口当前所在屏幕为准
+    idx = _monitor_index_by_rect(ms, top_w["x"], top_w["y"], top_w["w"], top_w["h"])
+    monitor = ms[idx]
+
+    wl, wt, ww, wh = monitor.work_rect
+    third = wh // 3
+    # 三栏排列后激活三个窗口，让它们显示到所有窗口最前面（可见、不被遮挡）
+    set_window_rect(top_hwnd, wl, wt, ww, third, activate=True)
+    set_window_rect(mid_hwnd, wl, wt + third, ww, third, activate=True)
+    set_window_rect(bot_hwnd, wl, wt + 2 * third, ww, wh - 2 * third, activate=True)
+    logger.info("三栏排列完成: 上=%s 中=%s 下=%s（屏幕 %s）", top_hwnd, mid_hwnd,
+                bot_hwnd, monitor.device_name)
+    return True
+
+
 def monitors_list_snapshot():
     return monitors.enum_monitors()
 

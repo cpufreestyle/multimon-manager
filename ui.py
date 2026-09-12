@@ -199,6 +199,29 @@ class App:
                    command=self._snap_two_side_by_side).pack(
             side="left", padx=(10, 0))
 
+        # 竖排上中下：可指定上/中/下三个窗口（留"自动"则由程序取最前面三个）
+        stack = ttk.Frame(f)
+        stack.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(stack, text="竖排:").pack(side="left")
+        self.stack_top_var = tk.StringVar(value=AUTO_TARGET)
+        self.stack_mid_var = tk.StringVar(value=AUTO_TARGET)
+        self.stack_bot_var = tk.StringVar(value=AUTO_TARGET)
+        ttk.Label(stack, text="上").pack(side="left", padx=(8, 2))
+        self.stack_top_cb = ttk.Combobox(stack, textvariable=self.stack_top_var,
+                                         state="readonly", width=14)
+        self.stack_top_cb.pack(side="left")
+        ttk.Label(stack, text="中").pack(side="left", padx=(6, 2))
+        self.stack_mid_cb = ttk.Combobox(stack, textvariable=self.stack_mid_var,
+                                         state="readonly", width=14)
+        self.stack_mid_cb.pack(side="left")
+        ttk.Label(stack, text="下").pack(side="left", padx=(6, 2))
+        self.stack_bot_cb = ttk.Combobox(stack, textvariable=self.stack_bot_var,
+                                         state="readonly", width=14)
+        self.stack_bot_cb.pack(side="left")
+        ttk.Button(stack, text="竖排上中下",
+                   command=self._snap_three_stack).pack(
+            side="left", padx=(10, 0))
+
         # 台前调度开启时，两个不同 App 的窗口必须处于同一个"台前组"才会同时显示，
         # 而 macOS 无公开 API 建组，只能用户先手动拖到一起。
         if b.stage_manager_enabled():
@@ -233,7 +256,10 @@ class App:
         # 并排窗口下拉与目标窗口共用同一份列表（含"自动"）
         if hasattr(self, "sbs_left_cb"):
             for cb, var in ((self.sbs_left_cb, self.sbs_left_var),
-                            (self.sbs_right_cb, self.sbs_right_var)):
+                            (self.sbs_right_cb, self.sbs_right_var),
+                            (self.stack_top_cb, self.stack_top_var),
+                            (self.stack_mid_cb, self.stack_mid_var),
+                            (self.stack_bot_cb, self.stack_bot_var)):
                 cb["values"] = labels
                 if var.get() and var.get() not in self._target_map:
                     var.set(AUTO_TARGET)
@@ -266,6 +292,29 @@ class App:
             self.status_var.set("已并排左右")
         else:
             self.status_var.set("并排失败：需要至少两个可操作窗口")
+
+    def _snap_three_stack(self):
+        """按选择的上/中/下窗口竖排；选"自动"则由程序取最前面三个窗口。
+
+        排列后三个窗口需要显示到最前面，故临时取消主窗口置顶（若开启），
+        让出 z 序给被排列的窗口，不再沿用其它按钮的 _keep_front_after。
+        """
+        if self.topmost.get():
+            try:
+                self.root.attributes("-topmost", False)
+            except Exception:  # noqa: BLE001
+                pass
+        top = self._target_map.get(self.stack_top_var.get())
+        mid = self._target_map.get(self.stack_mid_var.get())
+        bot = self._target_map.get(self.stack_bot_var.get())
+        chosen = [x for x in (top, mid, bot) if x]
+        if len(set(chosen)) < len(chosen):
+            messagebox.showwarning("提示", "上/中/下窗口不能重复选择")
+            return
+        if b.snap_three_stack(top_hwnd=top, mid_hwnd=mid, bot_hwnd=bot):
+            self.status_var.set("已竖排上中下")
+        else:
+            self.status_var.set("竖排失败：需要至少三个可操作窗口")
 
     # ---------- 置顶 ----------
     def _apply_topmost(self):
