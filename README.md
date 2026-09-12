@@ -1,7 +1,8 @@
 # 多屏管理器（DisplayFusion 风格仿制 · 跨平台）
 
 一个用纯 Python 实现的多显示器管理小工具，对标 DisplayFusion 的核心功能：
-**每屏不同壁纸、窗口跨屏移动、分屏吸附、壁纸方案、全局快捷键、托盘/菜单栏**。
+**每屏不同壁纸、窗口跨屏移动、分屏吸附（含三分屏/四等分）、壁纸与窗口布局方案、
+全局快捷键、显示器热插拔响应、托盘/菜单栏**。
 
 **零第三方依赖**：仅用 Python 标准库 + `ctypes` + 内置 `tkinter`，外加各系统自带命令/框架。
 运行时自动按平台选择实现，Windows 与 macOS 共用同一套 GUI 与逻辑。
@@ -10,7 +11,7 @@
 | 平台 | 显示器枚举 | 壁纸 | 窗口管理 | 快捷键 | 托盘/菜单 |
 |---|---|---|---|---|---|
 | Windows | `EnumDisplayMonitors` | `IDesktopWallpaper` COM | `SetWindowPos` | `RegisterHotKey` | Shell 托盘 |
-| macOS | `system_profiler` | `desktoppicture.db` + `osascript` | System Events AppleScript | `Quartz` CGEventTap | Dock 菜单 + 常驻面板 |
+| macOS | `CoreGraphics` + `system_profiler` | `desktoppicture.db` + `osascript` | System Events AppleScript | `Quartz` CGEventTap | Dock 菜单 + 常驻面板 |
 
 ## 运行
 无需联网安装任何依赖，仅需 Python 3.8+（macOS 用系统自带 `/usr/bin/python3` 或任意 venv 均可）。
@@ -36,14 +37,21 @@ python3 main.py
 - 托盘在 macOS 上表现为 **Dock 右键菜单 + 一个常驻右上角的快速面板**（原生菜单栏
   extra 是私有 API，标准库无法零依赖实现）。
 - 窗口管理基于 System Events，对多数 App 有效；部分沙盒 App（如某些全屏游戏）可能受限。
+- **显示器热插拔**：通过 `CGDisplayRegisterReconfigurationCallback` 监听显示器增减/重排，
+  可在「显示器热插拔」面板开关"自动刷新列表"与"自动重应用上次壁纸方案"。
+- **全局快捷键**：修饰键默认 `⌘⌥`（也可切换为 `⌃⌥`），数字键 1–9 对应各分屏动作（见下）。
 
 ## 功能
-- **每屏不同壁纸 / 统一单图**
+- **每屏不同壁纸 / 统一单图**：壁纸区顶部会**可视化显示器布局**，点击某块屏可直接为它选图
 - **窗口跨屏移动**：当前活动窗口移到上一/下一屏（保持相对位置）
-- **分屏吸附**：左/右/上/下半屏、最大化、居中
+- **分屏吸附**：左/右/上/下半屏、最大化、居中，以及**三分屏（左/中/右）**与**四等分（2×2）**
 - **壁纸方案**：保存/加载多套配置（JSON）
-- **全局快捷键**：`Ctrl+Alt+←/→` 移屏，`Ctrl+Alt+1~6` 分屏
-- **托盘 / 菜单栏**：打开主界面、刷新显示器、退出
+- **窗口布局方案**：一键保存当前所有窗口的位置/大小，之后整体还原（按「应用::窗口」匹配，标题变化自动按应用名兜底）
+- **显示器热插拔**：显示器增减/重排时自动刷新列表，可选自动重应用上次壁纸方案
+- **全局快捷键**（修饰键默认 macOS `⌘⌥`、Windows `Ctrl+Alt`，可切换）：
+  - `←/→`：活动窗口移到上一/下一屏
+  - `1/2/3/4`：左/右/上/下半屏；`5/6`：最大化 / 居中；`7/8/9`：三分屏（左/中/右）
+- **托盘 / 菜单栏**：打开主界面、**应用窗口布局**、刷新显示器、退出
 - **开机自启**：主界面一键开关（Windows 注册表 / macOS LaunchAgent）
 - **单实例**：重复启动自动提示并退出
 
@@ -56,7 +64,12 @@ python3 main.py
 | `windows.py` / `windows_mac.py` | 窗口跨屏移动与分屏（Windows / macOS） |
 | `hotkeys.py` / `hotkeys_mac.py` | 全局快捷键（Windows / macOS） |
 | `tray.py` / `tray_mac.py` | 托盘/菜单（Windows / macOS） |
+| `display_notify.py` / `display_notify_mac.py` | 显示器热插拔监听（macOS 用 CoreGraphics 回调，其他平台占位） |
 | `profiles.py` | 壁纸方案保存/加载（跨平台） |
+| `layouts.py` | 窗口布局方案保存/加载（跨平台） |
+| `settings.py` | 轻量偏好存储（快捷键修饰键、热插拔开关等） |
+| `cmd_channel.py` | 托盘子进程 ↔ 主进程的命令通道（临时文件） |
+| `_tray_panel.py` | 托盘快速面板（独立子进程运行） |
 | `autostart.py` | 开机自启（Windows / macOS） |
 | `resources.py` | 纯 Python 生成程序图标 |
 | `ui.py` | tkinter 主界面（跨平台） |
@@ -64,6 +77,7 @@ python3 main.py
 
 ## 与 DisplayFusion 的差距（可作练手扩展）
 - 多屏任务栏、窗口标题栏按钮
-- 显示器配置/分辨率切换方案
+- 显示器配置/分辨率切换方案（分辨率、主屏切换）
+- 窗口布局按显示器配置自动匹配（当前按窗口标识匹配）
 - 触发器（窗口移动自动触发动作）、壁纸幻灯片
 - 更多平台（Linux 可加 `monitors_linux.py` 等，在 `backend.py` 注册分支即可）
