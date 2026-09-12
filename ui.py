@@ -62,15 +62,29 @@ class App:
         self.status_var = tk.StringVar(value="")
         ttk.Label(top, textvariable=self.status_var).pack(side="left", padx=10)
 
+        # 辅助功能授权提示（默认隐藏，未授权时由 main 调用 show 显示）
+        self._perm_frame = ttk.Frame(self.content)
+        ttk.Label(
+            self._perm_frame,
+            text="未授权「辅助功能」：窗口控制与全局快捷键不可用。\n"
+                 "请到 系统设置 → 隐私与安全性 → 辅助功能，开启本程序"
+                 "（打包版为『多屏管理器』，源码运行版为『python3』）。",
+            foreground="#a15c00", wraplength=700, justify="left",
+        ).pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Button(self._perm_frame, text="打开系统设置",
+                   command=self._open_accessibility_settings).pack(side="left", padx=4)
+        ttk.Button(self._perm_frame, text="已授权/知道了",
+                   command=self.hide_accessibility_hint).pack(side="left", padx=4)
+
         self.nb = ttk.Notebook(self.content)
         self.nb.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.tab_display = ttk.Frame(self.nb)
         self.tab_settings = ttk.Frame(self.nb)
-        self.nb.add(self.tab_display, text=" 壁纸与窗口 ")
-        self.nb.add(self.tab_settings, text=" 布局与设置 ")
+        self.nb.add(self.tab_display, text=" 窗口操作 ")
+        self.nb.add(self.tab_settings, text=" 壁纸与设置 ")
 
-        self._build_wallpaper(self.tab_display)
         self._build_window_tools(self.tab_display)
+        self._build_wallpaper(self.tab_settings)
         self._build_profiles(self.tab_settings)
         self._build_layouts(self.tab_settings)
         self._build_hotkeys(self.tab_settings)
@@ -182,7 +196,7 @@ class App:
                                          state="readonly", width=16)
         self.sbs_right_cb.pack(side="left")
         ttk.Button(sbs, text="并排左右",
-                   command=self._keep_front_after(self._snap_two_side_by_side)).pack(
+                   command=self._snap_two_side_by_side).pack(
             side="left", padx=(10, 0))
 
         # 台前调度开启时，两个不同 App 的窗口必须处于同一个"台前组"才会同时显示，
@@ -233,7 +247,16 @@ class App:
         self.status_var.set(f"目标窗口: {label}")
 
     def _snap_two_side_by_side(self):
-        """按选择的左右窗口并排；选"自动"则由程序取最前面两个窗口。"""
+        """按选择的左右窗口并排；选"自动"则由程序取最前面两个窗口。
+
+        并排后两个窗口需要显示到最前面，故临时取消主窗口置顶（若开启），
+        让出 z 序给被并排的窗口，不再沿用其它按钮的 _keep_front_after。
+        """
+        if self.topmost.get():
+            try:
+                self.root.attributes("-topmost", False)
+            except Exception:  # noqa: BLE001
+                pass
         left = self._target_map.get(self.sbs_left_var.get())
         right = self._target_map.get(self.sbs_right_var.get())
         if left and right and left == right:
@@ -249,6 +272,28 @@ class App:
         """应用/取消主窗口置顶。"""
         try:
             self.root.attributes("-topmost", bool(self.topmost.get()))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------- 辅助功能授权提示 ----------
+    def show_accessibility_hint(self):
+        """未获得辅助功能授权时，在界面顶部显示引导提示。"""
+        try:
+            self._perm_frame.pack(fill="x", padx=4, pady=(0, 4), before=self.nb)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def hide_accessibility_hint(self):
+        """关闭授权提示条。"""
+        try:
+            self._perm_frame.pack_forget()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _open_accessibility_settings(self):
+        """跳转到系统设置的辅助功能页面。"""
+        try:
+            b.open_accessibility_settings()
         except Exception:  # noqa: BLE001
             pass
 

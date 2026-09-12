@@ -49,10 +49,16 @@ def set_dock_icon(path):
         img = objc.objc_msgSend(cls(b"NSImage"), sel(b"alloc"))
         if not img:
             return False
-        # initWithContentsOfFile:（1 个 const char*）
+        # 关键：initWithContentsOfFile: 需要 NSString*，不能直接传 C 字符串，
+        # 否则在新版 macOS（如 27）上会把 C 字符串当对象去读 -> 段错误。
         objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
-        img = objc.objc_msgSend(img, sel(b"initWithContentsOfFile:"),
-                                path.encode("utf-8"))
+        ns_path = objc.objc_msgSend(cls(b"NSString"), sel(b"stringWithUTF8String:"),
+                                    path.encode("utf-8"))
+        if not ns_path:
+            return False
+        # initWithContentsOfFile:（1 个 NSString*）
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        img = objc.objc_msgSend(img, sel(b"initWithContentsOfFile:"), ns_path)
         if not img:
             return False
         # setApplicationIconImage:（1 个对象指针）

@@ -188,6 +188,21 @@ def main():
     # 启动即显示主界面（否则后台启动的窗口会被压在其它窗口后面）
     _activate_frontmost(root)
 
+    # macOS 首次运行需辅助功能授权；未授权时主动引导授权。
+    # 注意：系统授权框（AXIsProcessTrustedWithOptions(prompt)）在很多场景下不会弹
+    # （非用户点击触发 / 曾被拒绝 / 打包解释器），故额外直接打开设置页 + 界面提示，
+    # 确保用户一定被引导到要开启的开关（最可靠）。
+    if sys.platform == "darwin":
+        def _maybe_prompt_accessibility():
+            try:
+                if not backend.is_accessibility_trusted():
+                    backend.request_accessibility()          # 尽力弹系统框（常无效，静默忽略）
+                    backend.open_accessibility_settings()     # 直接跳到辅助功能设置页（必现引导）
+                    app.show_accessibility_hint()
+            except Exception:  # noqa: BLE001
+                pass
+        root.after(800, _maybe_prompt_accessibility)
+
     root.protocol("WM_DELETE_WINDOW", app.on_close)
 
     # 托盘运行在独立 Tk 子进程，避免与主窗口共用事件循环导致 macOS 黑屏

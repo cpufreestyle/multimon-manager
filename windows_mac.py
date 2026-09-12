@@ -409,21 +409,53 @@ def get_window_rect(hwnd):
 
 
 def set_window_rect(hwnd, x, y, w, h, activate=True):
-    """移动/缩放窗口。用 position + size（bounds 属性在当前 macOS 不可用）。"""
+    """移动/缩放窗口。用 position + size（bounds 属性在当前 macOS 不可用）。
+
+    部分 App 在 zoomed/全屏态或 Auto Layout 约束下会忽略 `set size`，故先退出
+    zoom；改为先定位到目标位置再设尺寸（在正确位置更容易被 App 接受），最后读回
+    实际几何校验，偏差过大时再补一次 size。
+    """
     if not hwnd:
         return
     app, _win = hwnd.split("::", 1)
-    # 先设 size 再设 position，避免目标 App 因临时越界被系统纠正位置
-    script = (
+    x, y, w, h = int(round(x)), int(round(y)), int(round(w)), int(round(h))
+    logger.info("移动窗口: 进程=%s -> x=%d y=%d w=%d h=%d", app, x, y, w, h)
+    # 退出 zoom/全屏态，否则 size 变更可能被忽略
+    _osa(
         f'tell application "System Events"\n'
         f'  tell process "{app}"\n'
-        f'    set size of window 1 to {{{int(w)}, {int(h)}}}\n'
-        f'    set position of window 1 to {{{int(x)}, {int(y)}}}\n'
+        f'    if (count of windows) > 0 then\n'
+        f'      try\n'
+        f'        tell window 1 to if zoomed then set zoomed to false\n'
+        f'      end try\n'
+        f'    end if\n'
         f'  end tell\n'
         f'end tell\n'
     )
-    logger.info("移动窗口: 进程=%s -> x=%d y=%d w=%d h=%d", app, x, y, w, h)
-    _osa(script)
+    # 先定位到目标位置，再调整尺寸（避免 App 在越界/缩放态拒绝 size）
+    _osa(
+        f'tell application "System Events"\n'
+        f'  tell process "{app}"\n'
+        f'    set position of window 1 to {{{x}, {y}}}\n'
+        f'    set size of window 1 to {{{w}, {h}}}\n'
+        f'  end tell\n'
+        f'end tell\n'
+    )
+    # 读回实际几何校验；偏差过大则再补一次 size
+    _last_rect.pop(hwnd, None)
+    try:
+        _, _, aw, ah = get_window_rect(hwnd)
+    except Exception:  # noqa: BLE001
+        aw = ah = None
+    if aw is not None and (abs(aw - w) > 8 or abs(ah - h) > 8):
+        logger.warning("尺寸未生效(期望 %dx%d 实际 %dx%d)，重试 size", w, h, aw, ah)
+        _osa(
+            f'tell application "System Events"\n'
+            f'  tell process "{app}"\n'
+            f'    set size of window 1 to {{{w}, {h}}}\n'
+            f'  end tell\n'
+            f'end tell\n'
+        )
     if activate:
         _osa(f'tell application "{app}" to activate')
 
@@ -497,7 +529,7 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True):
 
     left_hwnd / right_hwnd 为 "应用::窗口" 标识；未指定时自动取最前面的两个
     窗口（左侧优先用界面固定的目标窗口）。以左侧窗口当前所在屏幕为准，
-    且不激活任何窗口，避免互相"踢掉"。
+    并排完成后把左右窗口激活到最前，确保并排结果可见、不被其他窗口遮挡。
     """
     ms = monitors.enum_monitors()
     if not ms:
@@ -544,9 +576,9 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True):
 
     wl, wt, ww, wh = monitor.work_rect
     half = ww // 2
-    # activate=False：不激活任何窗口，保持两者位置稳定、不互相抢焦点
-    set_window_rect(left_hwnd, wl, wt, half, wh, activate=False)
-    set_window_rect(right_hwnd, wl + half, wt, ww - half, wh, activate=False)
+    # 并排后激活左右两个窗口，让它们显示到所有窗口最前面（可见、不被遮挡）
+    set_window_rect(left_hwnd, wl, wt, half, wh, activate=True)
+    set_window_rect(right_hwnd, wl + half, wt, ww - half, wh, activate=True)
     logger.info("并排完成: 左=%s 右=%s（屏幕 %s）", left_hwnd, right_hwnd,
                 monitor.device_name)
     return True

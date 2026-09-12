@@ -1,7 +1,7 @@
 import os, subprocess, json, urllib.request, urllib.error, sys
 
 TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-TAG = "v0.1.0"
+TAG = "v0.2.3"
 REPO = "cpufreestyle/multimon-manager"
 
 # Step 1: Push tag
@@ -19,10 +19,15 @@ if r.returncode != 0:
 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 body = {
     "tag_name": TAG,
-    "name": "v0.1.0 — Initial Release",
+    "name": "v0.2.3 — Bugfix & UI Refinement",
     "body": (
-        "## Multi-Monitor Manager v0.1.0\n\n"
+        "## Multi-Monitor Manager v0.2.3\n\n"
         "跨平台多屏管理器，Windows + macOS 双实现。\n\n"
+        "### What's Changed\n"
+        "- 修复 macOS 启动时因 Dock 图标设置（NSImage 需 NSString）导致的段错误崩溃\n"
+        "- 修复「并排左右」后窗口未置顶到最前的问题\n"
+        "- 增强窗口缩放：退出 zoom 态、先定位再缩放、设置后校验重试\n"
+        "- 界面重构为分页：窗口操作 / 壁纸与设置\n\n"
         "### Features\n"
         "- **每屏壁纸** — 为每个显示器设置独立壁纸\n"
         "- **窗口跨屏/吸附** — 窗口在多屏间移动与边缘吸附\n"

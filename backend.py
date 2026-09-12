@@ -21,6 +21,7 @@ if IS_MAC:
     import hotkeys_mac as hotkeys
     import tray_mac as tray
     import display_notify_mac as display_notify
+    import accessibility_mac as accessibility
 else:
     import monitors
     import wallpaper
@@ -60,3 +61,18 @@ set_window_rect = windows.set_window_rect
 snap_two_side_by_side = getattr(windows, "snap_two_side_by_side", lambda *a, **k: False)
 HotkeyManager = hotkeys.HotkeyManager
 register_display_callback = display_notify.register
+
+# 辅助功能授权（仅 macOS 有意义；Windows 始终视为已授权）
+if IS_MAC:
+    is_accessibility_trusted = accessibility.is_trusted
+    request_accessibility = accessibility.request_trusted
+    open_accessibility_settings = accessibility.open_settings
+else:
+    def is_accessibility_trusted():
+        return True
+
+    def request_accessibility():
+        return False
+
+    def open_accessibility_settings():
+        pass
