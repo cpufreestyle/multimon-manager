@@ -4,9 +4,14 @@ TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 TAG = "v0.2.3"
 REPO = "cpufreestyle/multimon-manager"
 
-# Step 1: Push tag
+# Step 1: 打轻量 tag 并推送（本地无 tag 时先创建，避免 'src refspec does not match'）
 env = {k: v for k, v in os.environ.items() if k not in ("HTTP_PROXY", "HTTPS_PROXY")}
-cmd = ["git", "push", "origin", TAG]
+tag_cmd = ["git", "tag", TAG]
+print(f"[git] {' '.join(tag_cmd)}")
+t = subprocess.run(tag_cmd, env=env, capture_output=True, text=True, timeout=30)
+if t.stderr and "already exists" not in t.stderr:
+    print(t.stderr.strip(), file=sys.stderr)
+cmd = ["git", "push", "origin", f"refs/tags/{TAG}"]
 print(f"[git] {' '.join(cmd)}")
 r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
 print(r.stdout.strip())
