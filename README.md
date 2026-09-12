@@ -24,6 +24,19 @@ python main.py
 python3 main.py
 ```
 
+## 打包（生成可双击的应用）
+
+```bash
+python3 build.py          # 为当前平台打包
+python3 build.py --clean  # 清理构建产物
+```
+
+- **macOS**：生成 `dist/多屏管理器.app`，**双击即可运行**。用系统 `sips`/`iconutil`
+  把 `assets/` 里的图标转成 `.icns`，使用系统 `python3`，零第三方依赖。
+  若系统默认 `python3` 不是你要的解释器，可执行 `echo /your/python3 > ~/.multimon_python` 指定。
+- **Windows**：先 `pip install pyinstaller`，脚本生成单文件 `dist/MultiMonManager.exe`；
+  图标优先用 Pillow 从 `assets/` 转换（未装 Pillow 时回退到内置图标）。
+
 ## 平台注意事项
 ### Windows
 - 每屏壁纸需 **Windows 8+**（依赖 `IDesktopWallpaper`），旧系统回退单屏壁纸。
