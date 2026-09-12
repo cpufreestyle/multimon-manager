@@ -17,8 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cmd_channel  # noqa: E402
 
 
-def main():
-    tip = sys.argv[1] if len(sys.argv) > 1 else "多屏管理器"
+def main(tip=None):
+    if tip is None:
+        tip = sys.argv[1] if len(sys.argv) > 1 else "多屏管理器"
     main_pid = int(os.environ.get("MAIN_PID", "0"))
 
     root = tk.Tk()

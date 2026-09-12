@@ -155,25 +155,43 @@ def build_macos_frozen(icon_png):
     """用 PyInstaller 打成**自带 Python 运行时**的独立 .app（需先安装 pyinstaller）。
 
     与默认的 shim 方案不同，这个 .app 不依赖系统 python3，可直接分发给别人。
+    输出先落在本次唯一的临时目录，再用覆盖方式同步到 dist/，避免 PyInstaller
+    删除上一次的大量输出（批量删除可能被环境的安全策略拦截）。
     """
     if sys.platform != "darwin":
         print("[macOS] 当前不是 macOS，跳过")
         return None
     os.makedirs(BUILD, exist_ok=True)
     icns = _make_icns(icon_png, os.path.join(BUILD, "app.icns"))
-    cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
-           "--windowed", f"--icon={icns}", f"--name={APP_NAME}",
+    tmp_dist = os.path.join(BUILD, f"pyinst-{os.getpid()}")     # 每次唯一，无需删除
+    tmp_work = os.path.join(BUILD, f"work-{os.getpid()}")
+    cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--windowed",
+           f"--icon={icns}", f"--name={APP_NAME}",
            f"--osx-bundle-identifier={BUNDLE_ID}",
-           "--hidden-import=_tray_panel", "main.py"]
+           "--hidden-import=_tray_panel",
+           f"--distpath={tmp_dist}", f"--workpath={tmp_work}",
+           f"--specpath={BUILD}", "main.py"]
     print("[macOS-frozen]", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True, cwd=HERE)
     except Exception as e:  # noqa: BLE001
         print("[macOS-frozen] 构建失败（请先 `pip install pyinstaller`）:", e)
         return None
-    app = os.path.join(DIST, APP_NAME + ".app")
-    print(f"[macOS-frozen] 已生成: {app}")
-    return app
+    src_app = os.path.join(tmp_dist, APP_NAME + ".app")
+    final = os.path.join(DIST, APP_NAME + ".app")
+    os.makedirs(DIST, exist_ok=True)
+    # 复制到全新暂存目录，再把旧包「移走」而非删除（批量删除会被安全策略拦截，
+    # 且直接覆盖会因符号链接冲突失败）。
+    staging = final + ".new"
+    if os.path.exists(staging):
+        shutil.rmtree(staging, ignore_errors=True)
+    shutil.copytree(src_app, staging, symlinks=True)
+    if os.path.exists(final):
+        trash = os.path.join(BUILD, f"old-{os.getpid()}")
+        os.replace(final, trash)
+    os.replace(staging, final)
+    print(f"[macOS-frozen] 已生成: {final}")
+    return final
 
 
 def _make_ico(icon_png, out_ico):

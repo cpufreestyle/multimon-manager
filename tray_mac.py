@@ -29,9 +29,12 @@ class TrayIcon:
         子进程面板，暂不支持"刷新显示器"回调，接收后忽略（不传会 TypeError）。
         """
         self.tip = tip
+        env = dict(os.environ)
         if getattr(sys, "frozen", False):
-            # 独立打包后没有可用的 .py 路径，改用同一可执行文件的 --tray-panel 模式
-            args = [sys.executable, "--tray-panel", tip]
+            # 独立打包后没有可用的 .py 路径：用同一可执行文件 + 环境变量区分托盘模式
+            args = [sys.executable]
+            env["MMM_TRAY"] = "1"
+            env["MMM_TRAY_TIP"] = tip
         else:
             here = os.path.dirname(os.path.abspath(__file__))
             tray_script = os.path.join(here, "_tray_panel.py")
@@ -43,6 +46,7 @@ class TrayIcon:
                 args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=env,
             )
         except Exception:  # noqa: BLE001
             self.proc = None

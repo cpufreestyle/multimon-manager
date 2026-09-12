@@ -133,47 +133,57 @@ def _activate_frontmost(root, delay_ms=400):
 
 
 def main():
-    # 独立打包（PyInstaller 冻结）后，托盘面板以「同一可执行文件 + --tray-panel」
-    # 启动；必须在单实例检查之前处理，否则会被误判为重复启动而直接退出。
-    if "--tray-panel" in sys.argv:
-        idx = sys.argv.index("--tray-panel")
-        sys.argv = [sys.argv[0]] + sys.argv[idx + 1:]
+    # 独立打包（PyInstaller 冻结）后，托盘面板以「同一可执行文件」启动，用环境变量
+    # MMM_TRAY=1 区分（比命令行参数可靠，避免 bootloader 吞参导致无限派生）。
+    # 必须在单实例检查之前处理，否则会被误判为重复启动而直接退出。
+    if os.environ.get("MMM_TRAY") == "1":
         import _tray_panel
-        _tray_panel.main()
+        _tray_panel.main(os.environ.get("MMM_TRAY_TIP"))
         return
 
+    logging.getLogger(__name__).info("启动: frozen=%s argv=%s",
+                                     getattr(sys, "frozen", False), sys.argv[1:])
     _set_dpi_aware()
     if not _single_instance():
+        logging.getLogger(__name__).info("已有实例在运行，退出")
         try:
             import ctypes
             ctypes.windll.user32.MessageBoxW(None, "多屏管理器已在运行。", "多屏管理器", 0x40)
         except Exception:  # noqa: BLE001
             pass
         return
+    logging.getLogger(__name__).info("单实例锁已获取，准备创建窗口…")
 
     root = tk.Tk()
+    logging.getLogger(__name__).info("Tk 窗口已创建")
 
-    here = os.path.dirname(os.path.abspath(__file__))
-    icon_path = resources.create_ico(os.path.join(here, "app.ico"))
-    # macOS 上 iconbitmap 会导致 tkinter 窗口黑屏，仅 Windows 使用
-    if icon_path and sys.platform.startswith("win"):
-        try:
-            root.iconbitmap(icon_path)
-        except Exception:  # noqa: BLE001
-            pass
-    # macOS：Tk 默认沿用 Python 解释器图标，这里替换成程序自己的图标（Dock 显示）
-    if sys.platform == "darwin":
-        try:
-            png = resources.create_png(os.path.join(here, "app.png"))
-            if png:
-                import dock_icon_mac
-                ok = dock_icon_mac.set_dock_icon(png)
-                logging.getLogger(__name__).info(
-                    "Dock 图标%s: %s", "已设置" if ok else "设置失败", png)
-        except Exception as e:  # noqa: BLE001
-            logging.getLogger(__name__).warning("设置 Dock 图标失败: %s", e)
+    # 独立打包(.app)时，Dock 图标由 bundle 的 app.icns / Info.plist 提供：
+    # 既不需要运行时设置，也避免往包内写文件（包可能已签名或只读）。
+    icon_path = None
+    if not getattr(sys, "frozen", False):
+        here = os.path.dirname(os.path.abspath(__file__))
+        icon_path = resources.create_ico(os.path.join(here, "app.ico"))
+        # macOS 上 iconbitmap 会导致 tkinter 窗口黑屏，仅 Windows 使用
+        if icon_path and sys.platform.startswith("win"):
+            try:
+                root.iconbitmap(icon_path)
+            except Exception:  # noqa: BLE001
+                pass
+        # macOS：Tk 默认沿用 Python 解释器图标，替换成程序自己的图标（Dock 显示）
+        if sys.platform == "darwin":
+            try:
+                png = resources.create_png(os.path.join(here, "app.png"))
+                if png:
+                    import dock_icon_mac
+                    ok = dock_icon_mac.set_dock_icon(png)
+                    logging.getLogger(__name__).info(
+                        "Dock 图标%s: %s", "已设置" if ok else "设置失败", png)
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger(__name__).warning("设置 Dock 图标失败: %s", e)
+    logging.getLogger(__name__).info("图标处理完成，开始构建界面…")
 
     app = ui.App(root)
+    logging.getLogger(__name__).info("界面构建完成")
 
     # 启动即显示主界面（否则后台启动的窗口会被压在其它窗口后面）
     _activate_frontmost(root)
