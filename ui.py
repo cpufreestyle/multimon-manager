@@ -44,6 +44,10 @@ class App:
         self._build()
         self.refresh_monitors()
         self._start_command_poll()
+        # 窗口大小变化时防抖重绘布局图，并设最小尺寸避免控件被压坏
+        self.root.minsize(680, 560)
+        self._resize_job = None
+        self.root.bind("<Configure>", self._on_window_resize)
 
     # ---------- 构建 ----------
     def _build(self):
@@ -533,9 +537,11 @@ class App:
         """在 Canvas 上按比例画出各显示器相对位置。
 
         monitors_mac 返回的是 CoreGraphics 的全局拼接坐标：原点在主屏左上、
-        x 向右为正、y 向下为正（与 Canvas 方向一致，故不做 y 翻转）。这里按
-        比例缩放适配 Canvas。标签按矩形尺寸自适应（分级内容 + 动态字号 +
-        强制折行），避免文字溢出边界、与相邻屏幕重叠。
+        x 向右为正、y 向下为正（与 Canvas 方向一致，故不做 y 翻转）。
+
+        画布高度随宽度自适应（尽量铺满宽度），内容再在画布内居中，这样窗口
+        放大/缩小时布局图都保持合适大小、不偏在角落。标签按矩形尺寸自适应
+        （分级内容 + 动态字号 + 强制折行），避免文字溢出边界或与相邻屏重叠。
         """
         cv = self.layout_canvas
         cv.delete("all")
@@ -546,15 +552,23 @@ class App:
         min_y = min(m.top for m in ms)
         world_w = max(m.left + m.width for m in ms) - min_x
         world_h = max(m.top + m.height for m in ms) - min_y
-        cw = max(620, cv.winfo_width())
-        ch = cv.winfo_height()
-        if ch < 50:            # 控件未真正渲染时 winfo_height 返回 1，用默认高度兜底
-            ch = 196
+        cw = max(400, cv.winfo_width())
         pad = 14
-        scale = min((cw - 2 * pad) / world_w, (ch - 2 * pad) / world_h)
+        avail_w = max(cw - 2 * pad, 80)
+        # 高度自适应：按宽度铺满算出的理想高度，限制在 [180, 320]，
+        # 避免过矮看不清、过高把下面的面板挤出窗口。
+        ideal_h = pad * 2 + (world_h / world_w) * avail_w
+        target_h = int(max(180, min(ideal_h, 320)))
+        if abs(cv.winfo_height() - target_h) > 4:
+            cv.configure(height=target_h)
+        ch = target_h
+        scale = min(avail_w / world_w, (ch - 2 * pad) / world_h)
+        # 内容整体在画布内居中（左右、上下留白均匀）
+        off_x = (cw - world_w * scale) / 2
+        off_y = (ch - world_h * scale) / 2
         for i, m in enumerate(ms):
-            x1 = pad + (m.left - min_x) * scale
-            y1 = pad + (m.top - min_y) * scale
+            x1 = off_x + (m.left - min_x) * scale
+            y1 = off_y + (m.top - min_y) * scale
             x2 = x1 + m.width * scale
             y2 = y1 + m.height * scale
             bw, bh = x2 - x1, y2 - y1
@@ -562,13 +576,11 @@ class App:
             rid = cv.create_rectangle(x1, y1, x2, y2, fill=fill,
                                       outline="#5a5a5a", width=1.5)
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-            # 按矩形大小分级：太小只显示编号，中等显示两行，够大才显示完整信息。
-            # 主屏用 ★ 前缀（比"主屏"两字省宽度）；create_text 的 width 限制折行，
-            # 保证文字始终落在矩形内部。
+            # 按矩形大小分级：太小只显示编号，否则编号 + 屏幕名 + 分辨率。
+            # 主屏用 ★ 前缀（省宽度）；create_text 的 width 限制折行，保证不越界。
             head = f"★{i + 1}" if m.is_primary else f"{i + 1}"
             name = (m.device_name or "").strip()
             res = f"{m.width}x{m.height}"
-            # 太小的矩形只放编号；否则编号 + 屏幕名 + 分辨率（名称过长自动折行）
             if bw < 52 or bh < 22:
                 txt, size = head, 8
             elif bw < 128 or bh < 66:
@@ -579,6 +591,17 @@ class App:
                            width=max(int(bw) - 8, 16), justify="center")
             cv.tag_bind(rid, "<Button-1>",
                         lambda e, idx=i: self._on_screen_click(idx))
+
+    def _on_window_resize(self, event):
+        """窗口尺寸变化后防抖重绘布局图，让其随窗口大小合理适配。"""
+        if event.widget is not self.root:
+            return
+        if getattr(self, "_resize_job", None) is not None:
+            try:
+                self.root.after_cancel(self._resize_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._resize_job = self.root.after(120, self._draw_layout)
 
     def _on_screen_click(self, index):
         """点击可视化中的屏幕，直接为该屏选择壁纸。"""
