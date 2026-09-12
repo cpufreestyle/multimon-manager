@@ -152,6 +152,17 @@ def main():
             root.iconbitmap(icon_path)
         except Exception:  # noqa: BLE001
             pass
+    # macOS：Tk 默认沿用 Python 解释器图标，这里替换成程序自己的图标（Dock 显示）
+    if sys.platform == "darwin":
+        try:
+            png = resources.create_png(os.path.join(here, "app.png"))
+            if png:
+                import dock_icon_mac
+                ok = dock_icon_mac.set_dock_icon(png)
+                logging.getLogger(__name__).info(
+                    "Dock 图标%s: %s", "已设置" if ok else "设置失败", png)
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger(__name__).warning("设置 Dock 图标失败: %s", e)
 
     app = ui.App(root)
 
