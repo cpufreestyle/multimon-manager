@@ -15,6 +15,14 @@ import monitors
 ole32 = ctypes.windll.ole32
 user32 = ctypes.windll.user32
 
+# 在模块加载时声明一次 argtypes，避免每次调用都重复赋值。
+user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, wintypes.LPCWSTR, wintypes.UINT]
+user32.SystemParametersInfoW.restype = ctypes.c_bool
+HWND_BROADCAST = 0xFFFF
+WM_SETTINGCHANGE = 0x001A
+user32.SendNotifyMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.SendNotifyMessageW.restype = ctypes.c_bool
+
 
 class GUID(ctypes.Structure):
     _fields_ = [
@@ -141,6 +149,17 @@ def get_desktop_wallpaper():
     return _dw
 
 
+def close():
+    """释放缓存的 COM 实例（若存在）。供进程退出时调用。"""
+    global _dw
+    if _dw is not None:
+        try:
+            _dw.close()
+        except Exception:  # noqa: BLE001
+            pass
+        _dw = None
+
+
 def apply_per_monitor(mapping, position="fill"):
     """mapping: {device_path: image_path}。position 为全局填充方式。"""
     dw = get_desktop_wallpaper()
@@ -178,11 +197,6 @@ def _set_legacy(path, position):
         pass
     user32.SystemParametersInfoW(20, 0, path, 3)  # SPI_SETDESKWALLPAPER | UPDATEINIFILE | SENDCHANGE
     # 额外广播 WM_SETTINGCHANGE 确保所有窗口即时刷新
-    HWND_BROADCAST = 0xFFFF
-    WM_SETTINGCHANGE = 0x001A
-    user32.SendNotifyMessageW = ctypes.windll.user32.SendNotifyMessageW
-    user32.SendNotifyMessageW.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
-    user32.SendNotifyMessageW.restype = ctypes.c_bool
     user32.SendNotifyMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment")
 
 

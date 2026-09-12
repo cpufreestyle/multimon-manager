@@ -6,11 +6,13 @@ import os
 def create_ico(path, size=32):
     """生成一个纯色渐变方块图标，返回路径。失败返回 None。
 
-    若 path 已存在且为打包内置的丰富图标（体积较大），直接复用不覆盖。
+    注意：本函数仅作为「内置图标缺失时的兜底生成器」。若目标路径已存在
+    （无论是 AI 生成的精美图标还是打包内置图标），一律不覆盖，直接复用，
+    避免把高质量图标误写成低质占位图。
     """
     if not path:
         return None
-    if os.path.exists(path) and os.path.getsize(path) > 8192:
+    if os.path.exists(path):
         return path
     # 确保父目录存在
     parent = os.path.dirname(os.path.abspath(path))

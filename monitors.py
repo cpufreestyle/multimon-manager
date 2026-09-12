@@ -1,4 +1,5 @@
 """显示器枚举与虚拟桌面信息（纯 ctypes，无第三方依赖）。"""
+import copy
 import ctypes
 import time
 from ctypes import wintypes
@@ -21,6 +22,19 @@ class RECT(ctypes.Structure):
 
     def as_tuple(self):
         return (self.left, self.top, self.right - self.left, self.bottom - self.top)
+
+
+# EnumDisplayMonitors 的回调与参数类型只需声明一次（模块加载时，且 RECT 已定义）。
+MonitorEnumProc = ctypes.WINFUNCTYPE(
+    ctypes.c_bool, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(RECT), ctypes.c_void_p
+)
+user32.EnumDisplayMonitors.argtypes = [
+    wintypes.HDC,
+    ctypes.POINTER(RECT),
+    MonitorEnumProc,
+    ctypes.c_void_p,
+]
+user32.EnumDisplayMonitors.restype = ctypes.c_bool
 
 
 class MONITORINFOEX(ctypes.Structure):
@@ -61,7 +75,8 @@ def enum_monitors():
     """枚举所有显示器，返回 MonitorInfo 列表（按设备顺序排列）。带短期缓存。"""
     now = time.time()
     if _cache["data"] is not None and (now - _cache["ts"]) < _CACHE_TTL:
-        return list(_cache["data"])
+        # 返回深拷贝，避免调用方修改污染缓存
+        return copy.deepcopy(_cache["data"])
     monitors = []
 
     def callback(hmon, hdc, lprect, lparam):
@@ -85,21 +100,11 @@ def enum_monitors():
             monitors.append(m)
         return True
 
-    MonitorEnumProc = ctypes.WINFUNCTYPE(
-        ctypes.c_bool, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(RECT), ctypes.c_void_p
-    )
     proc = MonitorEnumProc(callback)
-    user32.EnumDisplayMonitors.argtypes = [
-        wintypes.HDC,
-        ctypes.POINTER(RECT),
-        MonitorEnumProc,
-        ctypes.c_void_p,
-    ]
-    user32.EnumDisplayMonitors.restype = ctypes.c_bool
     user32.EnumDisplayMonitors(None, None, proc, None)
     _cache["data"] = list(monitors)
     _cache["ts"] = time.time()
-    return list(monitors)
+    return copy.deepcopy(_cache["data"])
 
 
 def get_virtual_screen():

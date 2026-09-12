@@ -60,13 +60,39 @@ def _single_instance():
 _lock_fd = None
 
 
+def _set_dpi_aware():
+    """在高 DPI 多屏环境下，让窗口坐标与显示器坐标处于同一物理像素空间。
+
+    不设置时，系统会把本进程按 96 DPI 虚拟化，导致 GetWindowRect /
+    EnumDisplayMonitors 的坐标错位，跨屏移动与分屏吸附出错。
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    try:
+        shcore = ctypes.windll.shcore
+        shcore.SetProcessDpiAwareness.restype = ctypes.c_int
+        shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2
+        shcore.SetProcessDpiAwareness(2)
+    except Exception:  # noqa: BLE001
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _cleanup():
-    """进程退出时释放 COM 资源。"""
+    """进程退出时释放已缓存的 COM 资源（仅在实际用过壁纸时才有意义）。"""
     if sys.platform == "win32":
         try:
-            dw = backend.wallpaper.get_desktop_wallpaper()
-            if hasattr(dw, "close"):
-                dw.close()
+            close = getattr(backend.wallpaper, "close", None)
+            if close is not None:
+                close()
+            else:  # 兼容旧实现
+                dw = backend.wallpaper.get_desktop_wallpaper()
+                if hasattr(dw, "close"):
+                    dw.close()
         except Exception:  # noqa: BLE001
             pass
 
@@ -107,6 +133,7 @@ def _activate_frontmost(root, delay_ms=400):
 
 
 def main():
+    _set_dpi_aware()
     if not _single_instance():
         try:
             import ctypes

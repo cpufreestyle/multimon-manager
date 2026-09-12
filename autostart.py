@@ -58,7 +58,10 @@ def is_enabled():
 def set_enabled(enabled):
     if sys.platform == "win32":
         import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE)
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE)
+        except OSError as e:
+            raise RuntimeError(f"无法打开开机自启注册表项: {e}") from e
         try:
             if enabled:
                 winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, _app_command())
@@ -67,19 +70,24 @@ def set_enabled(enabled):
                     winreg.DeleteValue(key, APP_NAME)
                 except OSError:
                     pass
+        except OSError as e:
+            raise RuntimeError(f"写入开机自启注册表失败: {e}") from e
         finally:
             winreg.CloseKey(key)
         return True
 
     # macOS LaunchAgent
-    if enabled:
-        agent_dir = os.path.dirname(LAUNCH_AGENT)
-        os.makedirs(agent_dir, exist_ok=True)
-        python = sys.executable or "/usr/bin/python3"
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
-        with open(LAUNCH_AGENT, "w", encoding="utf-8") as f:
-            f.write(_PLIST.format(python=python, script=script))
-    else:
-        if os.path.exists(LAUNCH_AGENT):
-            os.remove(LAUNCH_AGENT)
+    try:
+        if enabled:
+            agent_dir = os.path.dirname(LAUNCH_AGENT)
+            os.makedirs(agent_dir, exist_ok=True)
+            python = sys.executable or "/usr/bin/python3"
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
+            with open(LAUNCH_AGENT, "w", encoding="utf-8") as f:
+                f.write(_PLIST.format(python=python, script=script))
+        else:
+            if os.path.exists(LAUNCH_AGENT):
+                os.remove(LAUNCH_AGENT)
+    except OSError as e:
+        raise RuntimeError(f"设置 macOS 开机自启失败: {e}") from e
     return True

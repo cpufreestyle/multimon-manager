@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(0, 2, 1, 0),
-    prodvers=(0, 2, 1, 0),
+    filevers=(0, 2, 2, 0),
+    prodvers=(0, 2, 2, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -15,12 +15,12 @@ VSVersionInfo(
         u'080404b0',
         [StringStruct(u'CompanyName', u'cpufreestyle'),
          StringStruct(u'FileDescription', u'Multi-Monitor Manager \u591a\u5c4f\u7ba1\u7406\u5668'),
-         StringStruct(u'FileVersion', u'0.2.1'),
+         StringStruct(u'FileVersion', u'0.2.2'),
          StringStruct(u'InternalName', u'MultiMonManager'),
          StringStruct(u'LegalCopyright', u'Copyright \u00a9 2026'),
          StringStruct(u'OriginalFilename', u'MultiMonManager.exe'),
          StringStruct(u'ProductName', u'Multi-Monitor Manager'),
-         StringStruct(u'ProductVersion', u'0.2.1')])
+         StringStruct(u'ProductVersion', u'0.2.2')])
     ]),
     VarFileInfo([VarStruct(u'Translation', [2052, 1200])])
   ]
