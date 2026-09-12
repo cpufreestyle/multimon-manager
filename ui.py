@@ -647,7 +647,8 @@ class App:
         sym = self._mod_symbol.get(label, label)
         return (f"{sym}+←/→ : 活动窗口移到上一/下一屏\n"
                 f"{sym}+1/2/3/4 : 左/右/上/下半屏\n"
-                f"{sym}+5/6 : 最大化 / 居中")
+                f"{sym}+5/6 : 最大化 / 居中\n"
+                f"{sym}+7/8/9 : 三分屏（左/中/右）")
 
     def _current_hk_mods(self):
         """把用户选择的修饰键组合映射为 backend 的 MOD_* 位掩码。"""
@@ -688,22 +689,29 @@ class App:
                     return
                 # 快捷键语义是"作用于当前活动窗口"，故忽略界面固定的目标
                 mods = self._current_hk_mods()
+                dk = b.DIGIT_KEYS
                 self.hk.register(mods, VK_RIGHT,
                                  lambda: b.move_active_to_next_monitor(1, use_pinned=False))
                 self.hk.register(mods, VK_LEFT,
                                  lambda: b.move_active_to_next_monitor(-1, use_pinned=False))
-                self.hk.register(mods, ord("1"),
+                self.hk.register(mods, dk[1],
                                  lambda: b.snap_active("left", use_pinned=False))
-                self.hk.register(mods, ord("2"),
+                self.hk.register(mods, dk[2],
                                  lambda: b.snap_active("right", use_pinned=False))
-                self.hk.register(mods, ord("3"),
+                self.hk.register(mods, dk[3],
                                  lambda: b.snap_active("top", use_pinned=False))
-                self.hk.register(mods, ord("4"),
+                self.hk.register(mods, dk[4],
                                  lambda: b.snap_active("bottom", use_pinned=False))
-                self.hk.register(mods, ord("5"),
+                self.hk.register(mods, dk[5],
                                  lambda: b.snap_active("maximize", use_pinned=False))
-                self.hk.register(mods, ord("6"),
+                self.hk.register(mods, dk[6],
                                  lambda: b.snap_active("center", use_pinned=False))
+                self.hk.register(mods, dk[7],
+                                 lambda: b.snap_active("left-third", use_pinned=False))
+                self.hk.register(mods, dk[8],
+                                 lambda: b.snap_active("middle-third", use_pinned=False))
+                self.hk.register(mods, dk[9],
+                                 lambda: b.snap_active("right-third", use_pinned=False))
             self.hk.start()
         else:
             if self.hk:

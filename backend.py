@@ -43,6 +43,7 @@ MOD_ALT = getattr(hotkeys, "MOD_ALT", 1)
 MOD_CONTROL = getattr(hotkeys, "MOD_CONTROL", 2)
 MOD_WIN = getattr(hotkeys, "MOD_WIN", 8)
 MOD_SHIFT = getattr(hotkeys, "MOD_SHIFT", 4)
+DIGIT_KEYS = getattr(hotkeys, "DIGIT_KEYS", {d: ord(str(d)) for d in range(10)})
 
 # 重新导出子模块的关键属性，供 ui.py 通过 backend 直接访问
 # （ui.py 使用 `import backend as wallpaper` 等别名，需要这些属性在 backend 根空间）

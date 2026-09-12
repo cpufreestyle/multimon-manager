@@ -37,6 +37,9 @@ VK_UP = 0x26
 VK_RIGHT = 0x27
 VK_DOWN = 0x28
 
+# 数字键 1-9 的 Windows 虚拟键码（与 ASCII 一致，如 "1" = 0x31）。
+DIGIT_KEYS = {d: ord(str(d)) for d in range(10)}
+
 WM_HOTKEY = 0x0312
 WM_DESTROY = 0x0010
 

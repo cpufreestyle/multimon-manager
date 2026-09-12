@@ -51,6 +51,13 @@ VK_RIGHT = 124
 VK_UP = 126
 VK_DOWN = 125
 
+# 数字键 1-9 的 macOS 虚拟键码（CGKeycode）。注意它与 ASCII 不同：
+# 例如 "1" 的 CGKeycode 是 18 而非 ord("1")=49，用 ord() 注册会导致快捷键
+# 永远匹配不上。UI 统一通过 backend.DIGIT_KEYS 取用。
+DIGIT_KEYS = {
+    0: 29, 1: 18, 2: 19, 3: 20, 4: 21, 5: 23, 6: 22, 7: 26, 8: 28, 9: 25,
+}
+
 # ctypes 函数签名
 if _HAS_QUARTZ:
     _quartz.CGEventTapCreate.restype = ctypes.c_void_p
