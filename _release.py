@@ -29,21 +29,21 @@ def gh(method, url, data=None):
             return e.code, {"message": raw}
 
 
-# Step 1: 打轻量 tag 并推送（本地无 tag 时先创建，避免 'src refspec does not match'）
-env = {k: v for k, v in os.environ.items() if k not in ("HTTP_PROXY", "HTTPS_PROXY")}
-tag_cmd = ["git", "tag", TAG]
-print(f"[git] {' '.join(tag_cmd)}")
-t = subprocess.run(tag_cmd, env=env, capture_output=True, text=True, timeout=30)
+# Step 1: 本地打 tag + 通过 GitHub API 在远程创建 tag（绕过本机 git 凭证/keychain）
+print(f"[git] git tag {TAG}")
+t = subprocess.run(["git", "tag", TAG], capture_output=True, text=True, timeout=30)
 if t.stderr and "already exists" not in t.stderr:
     print(t.stderr.strip(), file=sys.stderr)
-cmd = ["git", "push", "origin", f"refs/tags/{TAG}"]
-print(f"[git] {' '.join(cmd)}")
-r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
-print(r.stdout.strip())
-if r.stderr:
-    print(r.stderr.strip(), file=sys.stderr)
-if r.returncode != 0:
-    sys.exit(r.returncode)
+
+sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+s1, rd = gh("POST", f"{API}/git/refs", {"ref": f"refs/tags/{TAG}", "sha": sha})
+if s1 == 201:
+    print(f"[git] 远程 tag {TAG} 已创建 (sha {sha[:8]})")
+elif s1 == 422:
+    print(f"[git] 远程 tag {TAG} 已存在，跳过")
+else:
+    print(f"[git] 远程 tag 创建失败 status={s1}: {rd.get('message')}", file=sys.stderr)
+    sys.exit(1)
 
 # Step 2: 创建（或复用已存在的）Release
 body = {
