@@ -24,7 +24,7 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("多屏管理器")
-        self.root.geometry("720x880")
+        self.root.geometry("760x720")
         self.monitors = []
         self.mon_rows = []
         self.fit_var = tk.StringVar(value="fill")
@@ -45,32 +45,40 @@ class App:
         self.refresh_monitors()
         self._start_command_poll()
         # 窗口大小变化时防抖重绘布局图，并设最小尺寸避免控件被压坏
-        self.root.minsize(680, 560)
+        self.root.minsize(660, 520)
         self._resize_job = None
         self.root.bind("<Configure>", self._on_window_resize)
 
     # ---------- 构建 ----------
     def _build(self):
-        # macOS 上直接用普通 Frame，避免 Canvas/Scrollbar 组合的黑屏问题
+        # 面板较多，纵向堆叠在窗口不够高时会被截断；而 macOS 上 Canvas+Scrollbar
+        # 组合有黑屏风险，故改用纯 ttk 的 Notebook 分页，任何窗口高度都能完整显示。
         self.content = ttk.Frame(self.root)
         self.content.pack(fill="both", expand=True)
 
         top = ttk.Frame(self.content)
-        top.pack(fill="x", padx=8, pady=6)
+        top.pack(fill="x", padx=8, pady=(6, 2))
         ttk.Button(top, text="刷新显示器", command=self.refresh_monitors).pack(side="left")
         self.status_var = tk.StringVar(value="")
         ttk.Label(top, textvariable=self.status_var).pack(side="left", padx=10)
 
-        self._build_wallpaper()
-        self._build_window_tools()
-        self._build_layouts()
-        self._build_profiles()
-        self._build_hotkeys()
-        self._build_autostart()
-        self._build_display_watch()
+        self.nb = ttk.Notebook(self.content)
+        self.nb.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.tab_display = ttk.Frame(self.nb)
+        self.tab_settings = ttk.Frame(self.nb)
+        self.nb.add(self.tab_display, text=" 壁纸与窗口 ")
+        self.nb.add(self.tab_settings, text=" 布局与设置 ")
 
-    def _build_wallpaper(self):
-        f = ttk.LabelFrame(self.content, text="壁纸")
+        self._build_wallpaper(self.tab_display)
+        self._build_window_tools(self.tab_display)
+        self._build_profiles(self.tab_settings)
+        self._build_layouts(self.tab_settings)
+        self._build_hotkeys(self.tab_settings)
+        self._build_autostart(self.tab_settings)
+        self._build_display_watch(self.tab_settings)
+
+    def _build_wallpaper(self, parent):
+        f = ttk.LabelFrame(parent, text="壁纸")
         f.pack(fill="x", padx=8, pady=6)
 
         mode = ttk.Frame(f)
@@ -115,8 +123,8 @@ class App:
         if p:
             var.set(p)
 
-    def _build_window_tools(self):
-        f = ttk.LabelFrame(self.content, text="窗口工具")
+    def _build_window_tools(self, parent):
+        f = ttk.LabelFrame(parent, text="窗口工具")
         f.pack(fill="x", padx=8, pady=6)
 
         # 目标窗口显式选择：自动判断（"最前面的非本程序窗口"）常猜错，
@@ -268,8 +276,8 @@ class App:
         except Exception:  # noqa: BLE001
             pass
 
-    def _build_profiles(self):
-        f = ttk.LabelFrame(self.content, text="壁纸方案")
+    def _build_profiles(self, parent):
+        f = ttk.LabelFrame(parent, text="壁纸方案")
         f.pack(fill="x", padx=8, pady=6)
         top = ttk.Frame(f)
         top.pack(fill="x", pady=4)
@@ -285,8 +293,8 @@ class App:
         self._refresh_profile_list()
 
     # ---------- 窗口布局方案 ----------
-    def _build_layouts(self):
-        f = ttk.LabelFrame(self.content, text="窗口布局方案")
+    def _build_layouts(self, parent):
+        f = ttk.LabelFrame(parent, text="窗口布局方案")
         f.pack(fill="x", padx=8, pady=6)
         ttk.Label(
             f,
@@ -381,8 +389,8 @@ class App:
         self._refresh_layout_list()
         self.status_var.set(f"已删除布局：{name}")
 
-    def _build_hotkeys(self):
-        f = ttk.LabelFrame(self.content, text="全局快捷键")
+    def _build_hotkeys(self, parent):
+        f = ttk.LabelFrame(parent, text="全局快捷键")
         f.pack(fill="x", padx=8, pady=6)
         # 修饰键按平台可选：macOS 习惯 ⌘⌥，Windows 习惯 Ctrl+Alt
         is_mac = sys.platform.startswith("darwin")
@@ -418,8 +426,8 @@ class App:
         ttk.Checkbutton(hk_row, text="启用全局快捷键", variable=self.hk_enabled,
                         command=self._toggle_hk).pack(side="left")
 
-    def _build_autostart(self):
-        f = ttk.LabelFrame(self.content, text="启动选项")
+    def _build_autostart(self, parent):
+        f = ttk.LabelFrame(parent, text="启动选项")
         f.pack(fill="x", padx=8, pady=6)
         ttk.Checkbutton(f, text="开机自动启动", variable=self.autostart_var,
                         command=self._toggle_autostart).pack(anchor="w", padx=4, pady=4)
@@ -432,8 +440,8 @@ class App:
             self.autostart_var.set(autostart.is_enabled())
 
     # ---------- 显示器热插拔 ----------
-    def _build_display_watch(self):
-        f = ttk.LabelFrame(self.content, text="显示器热插拔")
+    def _build_display_watch(self, parent):
+        f = ttk.LabelFrame(parent, text="显示器热插拔")
         f.pack(fill="x", padx=8, pady=6)
         self.watch_enabled = tk.BooleanVar(
             value=bool(settings.load().get("watch_displays", True)))
