@@ -524,11 +524,28 @@ def _monitor_index_by_rect(monitors_list, x, y, w, h):
     return 0
 
 
-def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True):
+def _resolve_monitor_index(monitors_list, monitor):
+    """把 monitor 参数（int 索引 / device_name 字符串 / None）解析为显示器索引。
+
+    无法解析或越界时返回 None，调用方应回退到「按窗口所在屏」逻辑。
+    """
+    if monitor is None:
+        return None
+    if isinstance(monitor, int):
+        return monitor if 0 <= monitor < len(monitors_list) else None
+    if isinstance(monitor, str):
+        for i, m in enumerate(monitors_list):
+            if m.device_name == monitor or m.device_path == monitor:
+                return i
+    return None
+
+
+def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, monitor=None):
     """把两个窗口并排到同一屏的左右半屏（左/右可显式指定）。
 
     left_hwnd / right_hwnd 为 "应用::窗口" 标识；未指定时自动取最前面的两个
-    窗口（左侧优先用界面固定的目标窗口）。以左侧窗口当前所在屏幕为准，
+    窗口（左侧优先用界面固定的目标窗口）。monitor 可指定目标显示器
+    （int 索引或 device_name 字符串）；为 None 时以左侧窗口当前所在屏幕为准。
     并排完成后把左右窗口激活到最前，确保并排结果可见、不被其他窗口遮挡。
     """
     ms = monitors.enum_monitors()
@@ -566,29 +583,32 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True):
         return False
     right_hwnd = f'{right_w["owner"]}::{right_w["name"]}'
 
-    # 以左侧窗口当前所在的屏幕为准
-    idx = _monitor_index_by_rect(ms, left_w["x"], left_w["y"], left_w["w"], left_w["h"])
-    monitor = ms[idx]
+    # 以左侧窗口当前所在的屏幕为准；若显式指定了显示器则用指定的
+    idx = _resolve_monitor_index(ms, monitor)
+    if idx is None:
+        idx = _monitor_index_by_rect(ms, left_w["x"], left_w["y"], left_w["w"], left_w["h"])
+    mon = ms[idx]
 
     # 登记几何，供后续 get_window_rect 使用
     _last_rect[left_hwnd] = (left_w["x"], left_w["y"], left_w["w"], left_w["h"])
     _last_rect[right_hwnd] = (right_w["x"], right_w["y"], right_w["w"], right_w["h"])
 
-    wl, wt, ww, wh = monitor.work_rect
+    wl, wt, ww, wh = mon.work_rect
     half = ww // 2
     # 并排后激活左右两个窗口，让它们显示到所有窗口最前面（可见、不被遮挡）
     set_window_rect(left_hwnd, wl, wt, half, wh, activate=True)
     set_window_rect(right_hwnd, wl + half, wt, ww - half, wh, activate=True)
     logger.info("并排完成: 左=%s 右=%s（屏幕 %s）", left_hwnd, right_hwnd,
-                monitor.device_name)
+                mon.device_name)
     return True
 
 
-def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=True):
+def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=True, monitor=None):
     """把三个窗口堆叠到同一屏的上/中/下三栏（竖屏排列）。
 
     top/mid/bot_hwnd 为 "应用::窗口" 标识；未指定时自动取最前面的三个窗口
-    （顶部优先用界面固定的目标窗口）。以顶部窗口当前所在屏幕为准，
+    （顶部优先用界面固定的目标窗口）。monitor 可指定目标显示器
+    （int 索引或 device_name 字符串）；为 None 时以顶部窗口当前所在屏幕为准。
     排列完成后把三个窗口激活到最前，确保结果可见、不被遮挡。
     """
     ms = monitors.enum_monitors()
@@ -641,18 +661,20 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
         return False
     bot_hwnd = f'{bot_w["owner"]}::{bot_w["name"]}'
 
-    # 以顶部窗口当前所在屏幕为准
-    idx = _monitor_index_by_rect(ms, top_w["x"], top_w["y"], top_w["w"], top_w["h"])
-    monitor = ms[idx]
+    # 以顶部窗口当前所在的屏幕为准；若显式指定了显示器则用指定的
+    idx = _resolve_monitor_index(ms, monitor)
+    if idx is None:
+        idx = _monitor_index_by_rect(ms, top_w["x"], top_w["y"], top_w["w"], top_w["h"])
+    mon = ms[idx]
 
-    wl, wt, ww, wh = monitor.work_rect
+    wl, wt, ww, wh = mon.work_rect
     third = wh // 3
     # 三栏排列后激活三个窗口，让它们显示到所有窗口最前面（可见、不被遮挡）
     set_window_rect(top_hwnd, wl, wt, ww, third, activate=True)
     set_window_rect(mid_hwnd, wl, wt + third, ww, third, activate=True)
     set_window_rect(bot_hwnd, wl, wt + 2 * third, ww, wh - 2 * third, activate=True)
     logger.info("三栏排列完成: 上=%s 中=%s 下=%s（屏幕 %s）", top_hwnd, mid_hwnd,
-                bot_hwnd, monitor.device_name)
+                bot_hwnd, mon.device_name)
     return True
 
 

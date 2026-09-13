@@ -159,6 +159,80 @@ def create_png(path, size=512):
         return None
 
 
+def remove_white_corners_png(path):
+    """把 PNG 图标四角/边缘的白色背景区域设为透明（保留内部白色图形）。
+
+    通过从边缘 flood-fill 背景色实现：仅标记与边缘相连、且颜色接近背景
+    的像素为透明；内部白色线条/图形因被非背景色包围而不会受影响。
+    使用 Pillow；未安装则原样返回。
+    """
+    try:
+        from PIL import Image
+    except Exception:  # noqa: BLE001
+        return path
+    try:
+        img = Image.open(path).convert("RGBA")
+        w, h = img.size
+        px = img.load()
+        corners = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+        bg = tuple(sum(px[x, y][c] for x, y in corners) // 4 for c in range(4))
+        tol = 80  # 与背景色的 RGB 欧氏距离容差
+
+        from collections import deque
+        keep = [[True] * h for _ in range(w)]  # True = 保留
+        q = deque()
+        for x in range(w):
+            q.append((x, 0))
+            q.append((x, h - 1))
+        for y in range(h):
+            q.append((0, y))
+            q.append((w - 1, y))
+
+        while q:
+            x, y = q.popleft()
+            if not (0 <= x < w and 0 <= y < h):
+                continue
+            if not keep[x][y]:
+                continue
+            r, g, b, a = px[x, y]
+            dist = ((r - bg[0]) ** 2 + (g - bg[1]) ** 2 + (b - bg[2]) ** 2) ** 0.5
+            if a > 20 and dist <= tol:
+                keep[x][y] = False
+                q.append((x - 1, y))
+                q.append((x + 1, y))
+                q.append((x, y - 1))
+                q.append((x, y + 1))
+
+        changed = False
+        for y in range(h):
+            for x in range(w):
+                if not keep[x][y]:
+                    px[x, y] = (0, 0, 0, 0)
+                    changed = True
+        if changed:
+            img.save(path)
+        return path
+    except Exception as e:  # noqa: BLE001
+        print("[resources] 图标去白失败:", e)
+        return path
+
+
+def ensure_transparent_icon(path, size=512):
+    """确保 path 指向的图标四角透明。
+
+    优先用 Pillow 处理原图（保留用户自定义设计）；未安装 Pillow 时，删除
+    旧图并重新生成内置的透明圆角图标。
+    """
+    remove_white_corners_png(path)
+    try:
+        from PIL import Image  # noqa: F401
+    except Exception:  # noqa: BLE001
+        if os.path.exists(path):
+            os.remove(path)
+        return create_png(path, size=size)
+    return path
+
+
 if __name__ == "__main__":
     here = os.path.dirname(os.path.abspath(__file__))
     print(create_ico(os.path.join(here, "app.ico")))

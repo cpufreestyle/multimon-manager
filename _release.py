@@ -3,9 +3,59 @@ import os, sys, json, zipfile, urllib.parse
 import subprocess, urllib.request, urllib.error
 
 TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-TAG = "v0.2.3"
+TAG = "v0.2.4"
 REPO = "cpufreestyle/multimon-manager"
 API = f"https://api.github.com/repos/{REPO}"
+
+RELEASE_BODY = """## Multi-Monitor Manager v0.2.4
+
+跨平台多屏管理器，Windows + macOS 双实现，零第三方依赖。
+
+### What's Changed
+- **修复 macOS 启动即崩溃**（`Fatal Python error: PyEval_RestoreThread: GIL is released`）：
+  移除与 Tk 主循环并存的后台 `CFRunLoop`，显示器监听改为主线程轮询，
+  全局热键的事件 tap 改挂主线程 CFRunLoop
+- **修复全局快捷键在 macOS 上从未真正生效**（三处常量错误）：
+  - `CGEventTapCreate` 的 `eventsOfInterest` 是位掩码，须传 `1 << kCGEventKeyDown`（1024），
+    此前误传 10，导致键盘事件被全部过滤
+  - `CGEventField` 字段号修正：键码 `9`、修饰键 `59`（此前误为 113 / 115，键码恒读 0）
+  - tap 位置与插入位常量修正为 `kCGSessionEventTap=1` / `kCGHeadInsertEventTap=0`
+- 显示器变化监听 `display_notify_mac` 改为主线程注册回调，彻底消除后台 runloop 隐患
+- **界面改为单页 + 垂直滚动**：原先的两个分页面板合并为一页，右侧滑块可上下滑动，
+  并支持滚轮（macOS / Windows / X11 量级自动换算）
+- 日志降噪：工作区计算日志由 INFO 降为 DEBUG，不再每 2 秒刷屏
+- 新增「竖排上中下」：把三个窗口堆叠到上 / 中 / 下三栏
+- 「并排左右」「竖排上中下」现已支持 Windows（此前仅 macOS）
+- 应用图标圆角外的白色背景改为透明
+
+### Features
+- **每屏壁纸** — 为每个显示器设置独立壁纸
+- **窗口跨屏 / 吸附** — 窗口在多屏间移动与边缘吸附
+- **全局快捷键** — 可自定义修饰键（macOS ⌘⌥ / Windows Ctrl+Alt）+ 数字键 1~9 与方向键
+- **系统托盘** — Windows 托盘 / macOS Dock 菜单 + 面板
+- **竖排上中下 / 并排左右** — 两 / 三个窗口排到左右半屏或上中下三栏（macOS + Windows）
+- **显示器热插拔** — 自动检测显示器变化
+- **零第三方依赖** — 纯 Python 标准库 + ctypes 实现
+
+### Download
+- **macOS**：`多屏管理器.app.zip`（已作为下方附件，解压即用）
+- **Windows**：在 Windows 上执行 `python3 build.py`（需 PyInstaller）自行打包 exe
+
+### Files
+| 模块 | 说明 |
+|------|------|
+| `backend.py` | 平台分发入口 |
+| `wallpaper.py` / `wallpaper_mac.py` | 壁纸管理 |
+| `windows.py` / `windows_mac.py` | 窗口管理 |
+| `monitors.py` / `monitors_mac.py` | 显示器信息 |
+| `hotkeys.py` / `hotkeys_mac.py` | 全局快捷键 |
+| `tray.py` / `tray_mac.py` | 系统托盘 |
+| `display_notify_mac.py` | 显示器变化监听（主线程） |
+| `profiles.py` | 配置管理 |
+| `resources.py` | 资源文件 |
+| `ui.py` | 用户界面 |
+| `main.py` | 主入口 |
+"""
 
 
 def gh(method, url, data=None):
@@ -48,40 +98,8 @@ else:
 # Step 2: 创建（或复用已存在的）Release
 body = {
     "tag_name": TAG,
-    "name": "v0.2.3 — Bugfix & UI Refinement",
-    "body": (
-        "## Multi-Monitor Manager v0.2.3\n\n"
-        "跨平台多屏管理器，Windows + macOS 双实现。\n\n"
-        "### What's Changed\n"
-        "- 修复 macOS 启动时因 Dock 图标设置（NSImage 需 NSString）导致的段错误崩溃\n"
-        "- 修复「并排左右」后窗口未置顶到最前的问题\n"
-        "- 增强窗口缩放：退出 zoom 态、先定位再缩放、设置后校验重试\n"
-        "- 新增「竖排上中下」：把三个窗口堆叠到上/中/下三栏（竖屏排列，macOS + Windows）\n"
-        "- 「并排左右」现已支持 Windows（此前仅 macOS）\n"
-        "- 界面重构为分页：窗口操作 / 壁纸与设置\n\n"
-        "### Features\n"
-        "- **每屏壁纸** — 为每个显示器设置独立壁纸\n"
-        "- **窗口跨屏/吸附** — 窗口在多屏间移动与边缘吸附\n"
-        "- **全局快捷键** — 可自定义的快捷键控制\n"
-        "- **系统托盘** — Windows 托盘 / macOS Dock 菜单+面板\n"
-        "- **竖排上中下 / 并排左右** — 将两/三个窗口排到屏幕的左右半屏或上/中/下三栏（macOS + Windows）\n"
-        "- **零第三方依赖** — 纯标准库实现\n\n"
-        "### Download\n"
-        "- **macOS**：`多屏管理器.app.zip`（已打包为下方附件，解压即用）\n\n"
-        "### Files\n"
-        "| 模块 | 说明 |\n"
-        "|------|------|\n"
-        "| `backend.py` | 平台分发入口 |\n"
-        "| `wallpaper.py` / `wallpaper_mac.py` | 壁纸管理 |\n"
-        "| `windows.py` / `windows_mac.py` | 窗口管理 |\n"
-        "| `monitors.py` / `monitors_mac.py` | 显示器信息 |\n"
-        "| `hotkeys.py` / `hotkeys_mac.py` | 快捷键 |\n"
-        "| `tray.py` / `tray_mac.py` | 系统托盘 |\n"
-        "| `profiles.py` | 配置管理 |\n"
-        "| `resources.py` | 资源文件 |\n"
-        "| `ui.py` | 用户界面 |\n"
-        "| `main.py` | 主入口 |\n"
-    ),
+    "name": "v0.2.4 — Stability, Hotkeys & UI",
+    "body": RELEASE_BODY,
     "draft": False,
     "prerelease": False,
 }

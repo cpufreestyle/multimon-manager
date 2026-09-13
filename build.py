@@ -37,7 +37,8 @@ def _py_files():
 def prepare_icon():
     """准备统一的应用图标 PNG（app.png）并返回其路径。
 
-    app.png 已存在时直接复用（与 resources.create_png 的"不覆盖"策略一致）。
+    app.png 已存在时直接复用（与 resources.create_png 的"不覆盖"策略一致），
+    但最终会确保四角透明，避免 AI 生成图标常带的圆角白底。
     """
     out = os.path.join(HERE, "app.png")
     src = _source_png()
@@ -50,6 +51,10 @@ def prepare_icon():
         print(f"[icon] 程序化生成 -> {out}")
     else:
         print(f"[icon] 复用已有 -> {out}")
+    # 确保无论哪种来源，最终 app.png 圆角外无白底
+    import resources
+    resources.ensure_transparent_icon(out, size=1024)
+    print(f"[icon] 已确保透明圆角 -> {out}")
     return out
 
 

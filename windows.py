@@ -335,10 +335,27 @@ def _resolve_pair(left_hwnd, right_hwnd, use_pinned, cands, by_hwnd):
     return left_w, right_w
 
 
-def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True):
+def _resolve_monitor_index(monitors_list, monitor):
+    """把 monitor 参数（int 索引 / device_name 字符串 / None）解析为显示器索引。
+
+    无法解析或越界时返回 None，调用方应回退到「按窗口所在屏」逻辑。
+    """
+    if monitor is None:
+        return None
+    if isinstance(monitor, int):
+        return monitor if 0 <= monitor < len(monitors_list) else None
+    if isinstance(monitor, str):
+        for i, m in enumerate(monitors_list):
+            if getattr(m, "device_name", None) == monitor:
+                return i
+    return None
+
+
+def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, monitor=None):
     """把两个窗口并排到同一屏的左右半屏（左/右可显式指定，整数 HWND）。
 
     未指定时自动取最前面的两个窗口（左侧优先用界面固定的目标窗口）。
+    monitor 可指定目标显示器（int 索引或 device_name 字符串）；为 None 时
     以左侧窗口当前所在屏幕为准，并排后激活两窗口到最前。
     """
     ms = monitors.enum_monitors()
@@ -357,22 +374,26 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True):
         logger.warning("只找到一个可用窗口，无法并排")
         return False
 
-    idx = _monitor_index_by_rect(
-        ms, left_w["x"], left_w["y"], left_w["w"], left_w["h"])
-    monitor = ms[idx]
-    wl, wt, ww, wh = monitor.work_rect
+    idx = _resolve_monitor_index(ms, monitor)
+    if idx is None:
+        idx = _monitor_index_by_rect(
+            ms, left_w["x"], left_w["y"], left_w["w"], left_w["h"])
+    mon = ms[idx]
+    wl, wt, ww, wh = mon.work_rect
     half = ww // 2
     _place_window(left_w["hwnd"], wl, wt, half, wh)
     _place_window(right_w["hwnd"], wl + half, wt, ww - half, wh)
-    logger.info("并排完成(Windows): 左=%s 右=%s", left_w["hwnd"], right_w["hwnd"])
+    logger.info("并排完成(Windows): 左=%s 右=%s（屏幕 %s）",
+                left_w["hwnd"], right_w["hwnd"], mon.device_name)
     return True
 
 
-def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=True):
+def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=True, monitor=None):
     """把三个窗口堆叠到同一屏的上/中/下三栏（竖屏排列，整数 HWND）。
 
     top/mid/bot_hwnd 可显式指定；未指定时自动取最前面的三个窗口
-    （顶部优先用界面固定的目标窗口）。以顶部窗口当前所在屏幕为准。
+    （顶部优先用界面固定的目标窗口）。monitor 可指定目标显示器
+    （int 索引或 device_name 字符串）；为 None 时以顶部窗口当前所在屏幕为准。
     """
     ms = monitors.enum_monitors()
     if not ms:
@@ -423,16 +444,18 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
         return False
     bot_hwnd = bot_w["hwnd"]
 
-    idx = _monitor_index_by_rect(
-        ms, top_w["x"], top_w["y"], top_w["w"], top_w["h"])
-    monitor = ms[idx]
-    wl, wt, ww, wh = monitor.work_rect
+    idx = _resolve_monitor_index(ms, monitor)
+    if idx is None:
+        idx = _monitor_index_by_rect(
+            ms, top_w["x"], top_w["y"], top_w["w"], top_w["h"])
+    mon = ms[idx]
+    wl, wt, ww, wh = mon.work_rect
     third = wh // 3
     _place_window(top_hwnd, wl, wt, ww, third)
     _place_window(mid_hwnd, wl, wt + third, ww, third)
     _place_window(bot_hwnd, wl, wt + 2 * third, ww, wh - 2 * third)
-    logger.info("三栏排列完成(Windows): 上=%s 中=%s 下=%s",
-                top_hwnd, mid_hwnd, bot_hwnd)
+    logger.info("三栏排列完成(Windows): 上=%s 中=%s 下=%s（屏幕 %s）",
+                top_hwnd, mid_hwnd, bot_hwnd, mon.device_name)
     return True
 
 

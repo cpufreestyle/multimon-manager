@@ -18,6 +18,8 @@ VK_DOWN = b.VK_DOWN
 
 # 目标窗口下拉框的"自动"选项：由程序判断最前面的非本程序窗口
 AUTO_TARGET = "自动（上次活动窗口）"
+# 并排/竖排显示器下拉框的"自动"选项：按窗口当前所在屏决定
+AUTO_MON = "自动（按窗口所在屏）"
 
 
 class App:
@@ -39,8 +41,10 @@ class App:
         # 无需常驻置顶；需要始终压住其它窗口时可手动勾选。
         self.topmost = tk.BooleanVar(value=False)
         self.hk = None
-        # 显示器热插拔监听的取消注册句柄（None 表示未启用）
+        # 显示器热插拔监听（主线程轮询，避免后台 CFRunLoop 与 Tk 主循环冲突）
         self.monitor_watch = None
+        self._display_poll_id = None
+        self._last_mon_sig = None
         self._build()
         self.refresh_monitors()
         self._start_command_poll()
@@ -51,8 +55,8 @@ class App:
 
     # ---------- 构建 ----------
     def _build(self):
-        # 面板较多，纵向堆叠在窗口不够高时会被截断；而 macOS 上 Canvas+Scrollbar
-        # 组合有黑屏风险，故改用纯 ttk 的 Notebook 分页，任何窗口高度都能完整显示。
+        # 所有分区放在同一个页面里：纵向内容超出窗口高度时，用画布 + 垂直滑块
+        # 上下滚动浏览（不再分页）。
         self.content = ttk.Frame(self.root)
         self.content.pack(fill="both", expand=True)
 
@@ -76,20 +80,95 @@ class App:
         ttk.Button(self._perm_frame, text="已授权/知道了",
                    command=self.hide_accessibility_hint).pack(side="left", padx=4)
 
-        self.nb = ttk.Notebook(self.content)
-        self.nb.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        self.tab_display = ttk.Frame(self.nb)
-        self.tab_settings = ttk.Frame(self.nb)
-        self.nb.add(self.tab_display, text=" 窗口操作 ")
-        self.nb.add(self.tab_settings, text=" 壁纸与设置 ")
+        # ---- 可滚动主区域：单页 + 垂直滑块 ----
+        self._scroll_area = ttk.Frame(self.content)
+        self._scroll_area.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
-        self._build_window_tools(self.tab_display)
-        self._build_wallpaper(self.tab_settings)
-        self._build_profiles(self.tab_settings)
-        self._build_layouts(self.tab_settings)
-        self._build_hotkeys(self.tab_settings)
-        self._build_autostart(self.tab_settings)
-        self._build_display_watch(self.tab_settings)
+        # 画布背景取当前主题底色，避免与周围 ttk 控件出现色差
+        try:
+            canvas_bg = ttk.Style(self.root).lookup("TFrame", "background") or "#f0f0f0"
+        except Exception:  # noqa: BLE001
+            canvas_bg = "#f0f0f0"
+
+        self._canvas = tk.Canvas(self._scroll_area, highlightthickness=0, bg=canvas_bg)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._vscroll = ttk.Scrollbar(self._scroll_area, orient="vertical",
+                                      command=self._canvas.yview)
+        self._vscroll.pack(side="right", fill="y")
+        self._canvas.configure(yscrollcommand=self._vscroll.set)
+
+        # 真正承载各分区的内部容器
+        self.body = ttk.Frame(self._canvas)
+        self._body_win = self._canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.body.bind("<Configure>", self._on_body_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+        self._bind_mousewheel()
+
+        # 所有分区统一挂到同一个容器（不再分页）
+        self._build_window_tools(self.body)
+        self._build_wallpaper(self.body)
+        self._build_profiles(self.body)
+        self._build_layouts(self.body)
+        self._build_hotkeys(self.body)
+        self._build_autostart(self.body)
+        self._build_display_watch(self.body)
+
+    # ---------- 滚动支持 ----------
+    def _on_body_configure(self, event=None):
+        """内容尺寸变化时同步滚动区域（决定滑块可拖动范围）。"""
+        try:
+            self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_canvas_configure(self, event):
+        """内容宽度跟随画布宽度，避免出现横向滚动。"""
+        try:
+            self._canvas.itemconfigure(self._body_win, width=event.width)
+        except Exception:  # noqa: BLE001
+            pass
+        self._on_body_configure()
+
+    def _bind_mousewheel(self):
+        """绑定滚轮：macOS/Windows 用 <MouseWheel>，X11 另有 Button-4/5。"""
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._on_mousewheel_button, add="+")
+        self.root.bind_all("<Button-5>", self._on_mousewheel_button, add="+")
+
+    def _pointer_in_scroll_area(self, event):
+        """指针是否落在滚动区域内；自带滚动的控件交还给它们自己处理。"""
+        try:
+            w = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:  # noqa: BLE001
+            return False
+        if w is None:
+            return False
+        if isinstance(w, (tk.Listbox, tk.Text, ttk.Treeview)):
+            return False
+        while w is not None:
+            if w == self._scroll_area:
+                return True
+            w = getattr(w, "master", None)
+        return False
+
+    def _on_mousewheel(self, event):
+        if not self._pointer_in_scroll_area(event):
+            return
+        delta = getattr(event, "delta", 0) or 0
+        if not delta:
+            return
+        if abs(delta) >= 120:  # Windows / X11：一格 120
+            units = int(-delta / 120) or (-1 if delta > 0 else 1)
+        else:                  # macOS：量级很小，按方向滚一格
+            units = -1 if delta > 0 else 1
+        self._canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _on_mousewheel_button(self, event):
+        if not self._pointer_in_scroll_area(event):
+            return
+        self._canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
+        return "break"
 
     def _build_wallpaper(self, parent):
         f = ttk.LabelFrame(parent, text="壁纸")
@@ -181,10 +260,14 @@ class App:
                 ttk.Button(row, text=text,
                            command=self._keep_front_after(cmd)).pack(side="left", padx=3)
 
-        # 并排左右：可指定左右两个窗口（留"自动"则由程序取最前面两个）
+        # 并排左右：可选目标显示器 + 可指定左右两个窗口（留"自动"则由程序取最前面两个）
         sbs = ttk.Frame(f)
         sbs.pack(fill="x", padx=6, pady=(4, 2))
         ttk.Label(sbs, text="并排:").pack(side="left")
+        self.sbs_mon_var = tk.StringVar(value=AUTO_MON)
+        self.sbs_mon_cb = ttk.Combobox(sbs, textvariable=self.sbs_mon_var,
+                                       state="readonly", width=20)
+        self.sbs_mon_cb.pack(side="left", padx=(4, 2))
         self.sbs_left_var = tk.StringVar(value=AUTO_TARGET)
         self.sbs_right_var = tk.StringVar(value=AUTO_TARGET)
         ttk.Label(sbs, text="左").pack(side="left", padx=(8, 2))
@@ -199,10 +282,14 @@ class App:
                    command=self._snap_two_side_by_side).pack(
             side="left", padx=(10, 0))
 
-        # 竖排上中下：可指定上/中/下三个窗口（留"自动"则由程序取最前面三个）
+        # 竖排上中下：可选目标显示器 + 可指定上/中/下三个窗口（留"自动"则由程序取最前面三个）
         stack = ttk.Frame(f)
         stack.pack(fill="x", padx=6, pady=(4, 2))
         ttk.Label(stack, text="竖排:").pack(side="left")
+        self.stack_mon_var = tk.StringVar(value=AUTO_MON)
+        self.stack_mon_cb = ttk.Combobox(stack, textvariable=self.stack_mon_var,
+                                         state="readonly", width=18)
+        self.stack_mon_cb.pack(side="left", padx=(4, 2))
         self.stack_top_var = tk.StringVar(value=AUTO_TARGET)
         self.stack_mid_var = tk.StringVar(value=AUTO_TARGET)
         self.stack_bot_var = tk.StringVar(value=AUTO_TARGET)
@@ -267,6 +354,22 @@ class App:
             self.target_var.set(AUTO_TARGET)
             b.set_target(None)
 
+    def _refresh_monitor_choices(self):
+        """刷新并排/竖排所用的显示器下拉（含"自动"），尽量保留当前选择。"""
+        labels = [AUTO_MON]
+        self._monitor_map = {AUTO_MON: None}
+        for i, m in enumerate(self.monitors):
+            label = (f"显示器{i + 1}"
+                     + ("（主屏）" if m.is_primary else "")
+                     + f" {m.width}x{m.height}")
+            labels.append(label)
+            self._monitor_map[label] = i
+        for cb, var in ((self.sbs_mon_cb, self.sbs_mon_var),
+                        (self.stack_mon_cb, self.stack_mon_var)):
+            cb["values"] = labels
+            if var.get() not in self._monitor_map:
+                var.set(AUTO_MON)
+
     def _on_target_selected(self, _event=None):
         label = self.target_var.get()
         b.set_target(self._target_map.get(label))
@@ -288,8 +391,10 @@ class App:
         if left and right and left == right:
             messagebox.showwarning("提示", "左右窗口不能选同一个")
             return
-        if b.snap_two_side_by_side(left_hwnd=left, right_hwnd=right):
-            self.status_var.set("已并排左右")
+        mon_idx = self._monitor_map.get(self.sbs_mon_var.get())
+        mon_label = self.sbs_mon_var.get()
+        if b.snap_two_side_by_side(left_hwnd=left, right_hwnd=right, monitor=mon_idx):
+            self.status_var.set("已并排左右" + (f"（{mon_label}）" if mon_idx is not None else ""))
         else:
             self.status_var.set("并排失败：需要至少两个可操作窗口")
 
@@ -311,8 +416,10 @@ class App:
         if len(set(chosen)) < len(chosen):
             messagebox.showwarning("提示", "上/中/下窗口不能重复选择")
             return
-        if b.snap_three_stack(top_hwnd=top, mid_hwnd=mid, bot_hwnd=bot):
-            self.status_var.set("已竖排上中下")
+        mon_idx = self._monitor_map.get(self.stack_mon_var.get())
+        mon_label = self.stack_mon_var.get()
+        if b.snap_three_stack(top_hwnd=top, mid_hwnd=mid, bot_hwnd=bot, monitor=mon_idx):
+            self.status_var.set("已竖排上中下" + (f"（{mon_label}）" if mon_idx is not None else ""))
         else:
             self.status_var.set("竖排失败：需要至少三个可操作窗口")
 
@@ -328,7 +435,8 @@ class App:
     def show_accessibility_hint(self):
         """未获得辅助功能授权时，在界面顶部显示引导提示。"""
         try:
-            self._perm_frame.pack(fill="x", padx=4, pady=(0, 4), before=self.nb)
+            self._perm_frame.pack(fill="x", padx=4, pady=(0, 4),
+                                  before=self._scroll_area)
         except Exception:  # noqa: BLE001
             pass
 
@@ -558,23 +666,40 @@ class App:
     def _toggle_display_watch(self):
         self._save_watch_prefs()
         if self.watch_enabled.get():
-            if self.monitor_watch is None:
-                self.monitor_watch = b.register_display_callback(self._on_display_change)
-                if self.monitor_watch is None:
-                    self.status_var.set("当前平台不支持显示器变化监听")
-        elif self.monitor_watch is not None:
-            try:
-                self.monitor_watch()
-            except Exception:  # noqa: BLE001
-                pass
-            self.monitor_watch = None
+            if self._display_poll_id is None:
+                self._last_mon_sig = self._monitor_signature()
+                self._display_poll_id = self.root.after(1500, self._poll_display)
+        else:
+            if self._display_poll_id is not None:
+                try:
+                    self.root.after_cancel(self._display_poll_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._display_poll_id = None
 
-    def _on_display_change(self):
-        """系统后台线程回调：切回 Tk 主线程处理。"""
+    def _monitor_signature(self):
+        """生成当前显示器配置的指纹，用于检测热插拔/重排。"""
         try:
-            self.root.after(0, self._handle_display_change)
+            ms = b.enum_monitors(force=True)
+        except Exception:  # noqa: BLE001
+            return None
+        return tuple(sorted(
+            (m.width, m.height, m.left, m.top, bool(m.is_primary)) for m in ms))
+
+    def _poll_display(self):
+        """主线程轮询：显示器配置变化则刷新（不依赖后台 CFRunLoop，避免 GIL 崩溃）。"""
+        if not self.watch_enabled.get():
+            self._display_poll_id = None
+            return
+        try:
+            sig = self._monitor_signature()
+            if sig is not None and sig != self._last_mon_sig:
+                self._last_mon_sig = sig
+                self._handle_display_change()
         except Exception:  # noqa: BLE001
             pass
+        if self.watch_enabled.get():
+            self._display_poll_id = self.root.after(1500, self._poll_display)
 
     def _handle_display_change(self):
         """显示器配置变化后：刷新列表；可选自动重应用上次壁纸方案。"""
@@ -634,6 +759,8 @@ class App:
             self.mon_rows.append({"device_path": m.device_path, "var": var})
         # 刷新后重绘布局可视化（点击屏幕可直接为该屏选壁纸）
         self._draw_layout()
+        # 同步并排/竖排的显示器下拉选项
+        self._refresh_monitor_choices()
 
     def _draw_layout(self):
         """在 Canvas 上按比例画出各显示器相对位置。

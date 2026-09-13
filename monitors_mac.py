@@ -280,8 +280,8 @@ def _compute_work_areas(monitors):
                     m.work_height = int(round(vh))
                     applied += 1
         if applied:
-            logger.info("工作区取自 NSScreen.visibleFrame（%d/%d 屏）",
-                        applied, len(monitors))
+            logger.debug("工作区取自 NSScreen.visibleFrame（%d/%d 屏）",
+                         applied, len(monitors))
             return
 
     # 退化：所有屏统一扣除菜单栏高度

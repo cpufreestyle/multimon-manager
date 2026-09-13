@@ -172,7 +172,8 @@ def main():
         # macOS：Tk 默认沿用 Python 解释器图标，替换成程序自己的图标（Dock 显示）
         if sys.platform == "darwin":
             try:
-                png = resources.create_png(os.path.join(here, "app.png"))
+                png = resources.ensure_transparent_icon(
+                    os.path.join(here, "app.png"))
                 if png:
                     import dock_icon_mac
                     ok = dock_icon_mac.set_dock_icon(png)
