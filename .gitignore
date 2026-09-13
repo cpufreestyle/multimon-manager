@@ -14,8 +14,9 @@ app.png
 # 构建产物（build.py / PyInstaller 生成）
 build/
 app.icns
-dist/*/
+dist/
 *.spec
+*.log
 
 # 调试/临时产物
 *.txt
@@ -33,3 +34,8 @@ settings.json
 profiles.json
 layouts.json
 
+# 临时/一次性脚本
+_*.py
+
+# 本地工作数据（AI 助手记忆/会话数据）
+.codebuddy/
