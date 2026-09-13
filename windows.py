@@ -21,6 +21,19 @@ user32.SetForegroundWindow.restype = ctypes.c_bool
 user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.ShowWindow.restype = ctypes.c_bool
 
+# 窗口枚举（供界面列出可选择的窗口）
+WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+user32.EnumWindows.restype = ctypes.c_bool
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.IsWindow.restype = ctypes.c_bool
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindowVisible.restype = ctypes.c_bool
+user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+user32.GetWindowTextLengthW.restype = ctypes.c_int
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowTextW.restype = ctypes.c_int
+
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
@@ -31,6 +44,40 @@ SW_MAXIMIZE = 0x03
 
 def get_foreground_window():
     return user32.GetForegroundWindow()
+
+
+def is_window(hwnd):
+    """句柄是否仍指向一个存在的窗口（窗口可能已被关闭）。"""
+    return bool(hwnd) and bool(user32.IsWindow(hwnd))
+
+
+def list_windows():
+    """枚举当前可见的顶层窗口，返回 [(hwnd, title), ...]。
+
+    仅保留可见且有标题的窗口，隐藏/无标题的系统窗口会被过滤掉。
+    """
+    items = []
+
+    @WNDENUMPROC
+    def _cb(hwnd, _lparam):
+        try:
+            h = int(hwnd)
+        except (TypeError, ValueError):
+            return True
+        if not h or not user32.IsWindowVisible(h):
+            return True
+        n = user32.GetWindowTextLengthW(h)
+        if n <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(n + 1)
+        user32.GetWindowTextW(h, buf, n + 1)
+        title = buf.value.strip()
+        if title:
+            items.append((h, title))
+        return True
+
+    user32.EnumWindows(_cb, 0)
+    return items
 
 
 def get_window_rect(hwnd):
@@ -117,28 +164,33 @@ def monitors_list_snapshot():
     return monitors.enum_monitors()
 
 
-def move_active_to_next_monitor(direction=1):
+def move_window_to_next_monitor(hwnd, direction=1):
+    """把指定窗口移到相邻显示器（direction: -1 上一屏 / 1 下一屏）。"""
     ms = monitors.enum_monitors()
-    if not ms:
-        return
-    hwnd = get_foreground_window()
-    if not hwnd:
-        return
+    if not ms or not hwnd:
+        return False
     idx = _monitor_by_relative(ms, hwnd)
     n = len(ms)
-    nxt = (idx + direction) % n
-    move_to_monitor(hwnd, ms[nxt], src=ms)
+    move_to_monitor(hwnd, ms[(idx + direction) % n], src=ms)
+    return True
+
+
+def snap_window(hwnd, zone):
+    """把指定窗口吸附到其所在显示器的某个区域。"""
+    ms = monitors.enum_monitors()
+    if not ms or not hwnd:
+        return False
+    idx = _monitor_by_relative(ms, hwnd)
+    snap(hwnd, ms[idx], zone)
+    return True
+
+
+def move_active_to_next_monitor(direction=1):
+    return move_window_to_next_monitor(get_foreground_window(), direction)
 
 
 def snap_active(zone):
-    ms = monitors.enum_monitors()
-    if not ms:
-        return
-    hwnd = get_foreground_window()
-    if not hwnd:
-        return
-    idx = _monitor_by_relative(ms, hwnd)
-    snap(hwnd, ms[idx], zone)
+    return snap_window(get_foreground_window(), zone)
 
 
 if __name__ == "__main__":
