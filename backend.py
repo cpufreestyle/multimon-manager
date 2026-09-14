@@ -22,6 +22,7 @@ if IS_MAC:
     import tray_mac as tray
     import display_notify_mac as display_notify
     import accessibility_mac as accessibility
+    import dragsnap_mac as dragsnap
 else:
     import monitors
     import wallpaper
@@ -29,6 +30,7 @@ else:
     import hotkeys
     import tray
     import display_notify
+    import dragsnap
 
 
 # 统一常量（供 UI 使用）
@@ -37,8 +39,9 @@ try:
     VK_RIGHT = hotkeys.VK_RIGHT
     VK_UP = hotkeys.VK_UP
     VK_DOWN = hotkeys.VK_DOWN
+    VK_Z = hotkeys.VK_Z
 except Exception:  # noqa: BLE001
-    VK_LEFT = VK_RIGHT = VK_UP = VK_DOWN = 0
+    VK_LEFT = VK_RIGHT = VK_UP = VK_DOWN = VK_Z = 0
 
 MOD_ALT = getattr(hotkeys, "MOD_ALT", 1)
 MOD_CONTROL = getattr(hotkeys, "MOD_CONTROL", 2)
@@ -61,7 +64,11 @@ set_window_rect = windows.set_window_rect
 snap_two_side_by_side = getattr(windows, "snap_two_side_by_side", lambda *a, **k: False)
 snap_three_stack = getattr(windows, "snap_three_stack", lambda *a, **k: False)
 HotkeyManager = hotkeys.HotkeyManager
+# 拖拽吸附监听（F3；macOS 为真实实现，Windows 为占位）
+DragSnapWatcher = dragsnap.DragSnapWatcher
 register_display_callback = display_notify.register
+# 撤销上一次窗口移动（F7）
+undo_last_move = windows.undo_last_move
 
 # 辅助功能授权（仅 macOS 有意义；Windows 始终视为已授权）
 if IS_MAC:

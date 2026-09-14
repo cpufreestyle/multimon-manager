@@ -1,7 +1,8 @@
 """托盘子进程与主进程之间的极简命令通道（基于临时文件）。
 
 托盘是独立进程，无法直接调用主进程的函数；这里用一个约定路径的文件传命令：
-托盘写入命令，主进程定时读取并清空。命令取值：open / refresh / apply_layout。
+托盘写入命令，主进程定时读取并清空。
+命令取值：open / refresh / apply_layout / apply_scenario:<情景签名>（F4）。
 """
 import os
 import tempfile

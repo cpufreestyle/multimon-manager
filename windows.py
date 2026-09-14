@@ -2,11 +2,25 @@
 import ctypes
 import logging
 import os
+import threading
 from ctypes import wintypes
 
 import monitors
 
 logger = logging.getLogger(__name__)
+
+# ── 撤销栈：记录每次移动/缩放前的窗口几何，供"撤销移动"使用（F7）──
+_undo_stack = []
+_undo_lock = threading.Lock()
+_suppress_undo = False
+
+
+def push_undo(hwnd, rect):
+    """记录一次移动前几何（hwnd, (x, y, w, h)）；保留最近 20 步。"""
+    with _undo_lock:
+        _undo_stack.append((hwnd, tuple(rect)))
+        if len(_undo_stack) > 20:
+            _undo_stack.pop(0)
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -129,12 +143,35 @@ def get_window_rect(hwnd):
 
 
 def set_window_rect(hwnd, x, y, w, h, activate=True):
+    if not _suppress_undo:
+        try:
+            push_undo(hwnd, get_window_rect(hwnd))
+        except Exception:  # noqa: BLE001
+            pass
     flags = SWP_NOZORDER | SWP_FRAMECHANGED
     if not activate:
         flags |= SWP_NOACTIVATE
     user32.SetWindowPos(hwnd, None, int(x), int(y), int(w), int(h), flags)
     if activate:
         user32.SetForegroundWindow(hwnd)
+
+
+def undo_last_move():
+    """撤销最近一次窗口移动/缩放（恢复该窗口移动前的几何）。
+
+    返回被还原的 hwnd；无可撤销项时返回 None。恢复过程自身不再次入栈。
+    """
+    global _suppress_undo
+    with _undo_lock:
+        if not _undo_stack:
+            return None
+        hwnd, rect = _undo_stack.pop()
+    _suppress_undo = True
+    try:
+        set_window_rect(hwnd, rect[0], rect[1], rect[2], rect[3], activate=False)
+    finally:
+        _suppress_undo = False
+    return hwnd
 
 
 def _monitor_by_relative(monitors_list, src_hwnd):

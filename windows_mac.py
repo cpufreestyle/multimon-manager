@@ -19,11 +19,25 @@ import ctypes.util
 import logging
 import os
 import subprocess
+import threading
 
 import monitors_mac as monitors
 from monitors_mac import CGRect
 
 logger = logging.getLogger(__name__)
+
+# ── 撤销栈：记录每次移动/缩放前的窗口几何，供"撤销移动"使用（F7）──
+_undo_stack = []
+_undo_lock = threading.Lock()
+_suppress_undo = False
+
+
+def push_undo(hwnd, rect):
+    """记录一次移动前几何（hwnd, (x, y, w, h)）；保留最近 20 步。"""
+    with _undo_lock:
+        _undo_stack.append((hwnd, tuple(rect)))
+        if len(_undo_stack) > 20:
+            _undo_stack.pop(0)
 
 
 # ── AppleScript 执行 ─────────────────────────────────────────────────
@@ -381,14 +395,40 @@ def get_foreground_window(use_pinned=True):
 
 
 def get_window_rect(hwnd):
-    """返回 (x, y, w, h)。优先用 CG 结果，回退 System Events 的 position+size。"""
+    """返回 (x, y, w, h)。
+
+    优先用 CoreGraphics 枚举按 (owner + name) 精确匹配，完全不经过 AppleScript，
+    因此不受窗口标题特殊字符（如全角引号）影响（修复 B 债：OneNote / 微信开发者工具
+    等标题含全角引号的窗口几何读取失败）。CG 取不到时再回退 System Events 的
+    position+size。
+    """
     if not hwnd:
         return (0, 0, 0, 0)
     if hwnd in _last_rect:
         return _last_rect[hwnd]
 
-    app, _win = hwnd.split("::", 1)
-    # 注意：不能用 bounds —— 当前 macOS 的 System Events window 无此属性，恒报 -1728
+    app, name = hwnd.split("::", 1)
+    # 优先走 CG：按 owner 匹配，精确匹配窗口名；同时记录该 App 最前的窗口作后备，
+    # 避免标题含特殊字符/空格差异导致完全匹配不到。
+    try:
+        front = None
+        for w in list_windows_front_to_back():
+            if w["owner"] != app:
+                continue
+            if front is None:
+                front = w
+            if w["name"] == name:
+                rect = (w["x"], w["y"], w["w"], w["h"])
+                _last_rect[hwnd] = rect
+                return rect
+        if front is not None:
+            rect = (front["x"], front["y"], front["w"], front["h"])
+            _last_rect[hwnd] = rect
+            return rect
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 回退：System Events 的 position+size（注意 bounds 在 macOS 当前不可用，恒报 -1728）
     script = (
         f'tell application "System Events"\n'
         f'  tell process "{app}"\n'
@@ -402,13 +442,20 @@ def get_window_rect(hwnd):
     out = _osa(script)
     try:
         x, y, w, h = (int(float(v)) for v in out.split(","))
-        return (x, y, w, h)
+        rect = (x, y, w, h)
     except Exception:  # noqa: BLE001
         logger.warning("读取窗口几何失败: %r -> %r", hwnd, out)
         return (0, 0, 0, 0)
+    _last_rect[hwnd] = rect
+    return rect
 
 
 def set_window_rect(hwnd, x, y, w, h, activate=True):
+    if not _suppress_undo:
+        try:
+            push_undo(hwnd, get_window_rect(hwnd))
+        except Exception:  # noqa: BLE001
+            pass
     """移动/缩放窗口。用 position + size（bounds 属性在当前 macOS 不可用）。
 
     部分 App 在 zoomed/全屏态或 Auto Layout 约束下会忽略 `set size`，故先退出
@@ -458,6 +505,24 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
         )
     if activate:
         _osa(f'tell application "{app}" to activate')
+
+
+def undo_last_move():
+    """撤销最近一次窗口移动/缩放（恢复该窗口移动前的几何）。
+
+    返回被还原的 hwnd；无可撤销项时返回 None。恢复过程自身不再次入栈。
+    """
+    global _suppress_undo
+    with _undo_lock:
+        if not _undo_stack:
+            return None
+        hwnd, rect = _undo_stack.pop()
+    _suppress_undo = True
+    try:
+        set_window_rect(hwnd, rect[0], rect[1], rect[2], rect[3], activate=False)
+    finally:
+        _suppress_undo = False
+    return hwnd
 
 
 def _monitor_by_relative(monitors_list, src_hwnd):

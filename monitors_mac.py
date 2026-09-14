@@ -4,6 +4,7 @@
 通过 system_profiler 文本输出获取显示器名称。
 macOS 坐标系原点在左上角（CGDisplayBounds 返回的即是左上坐标系）。
 """
+import copy
 import ctypes
 import ctypes.util
 import logging
@@ -62,21 +63,14 @@ _cg = _load_cg()
 
 # ── 显示器名称解析 ────────────────────────────────────────────────────
 
-def _parse_display_names():
-    """从 system_profiler SPDisplaysDataType 文本输出解析显示器名称和属性。
+# C 债修复：system_profiler 偶发超时（曾用 15s）会拖住 UI，且超时后屏名退化为
+# "Display N"。这里把超时收紧到 5s，并缓存"上次成功解析结果"，超时/解析失败时退回
+# 缓存，保证屏名不退化（配合 F6 别名可进一步兜底）。
+_names_cache = None
 
-    返回列表，每项: (name, resolution_str, ui_looks_like, is_main)
-    """
-    try:
-        r = subprocess.run(
-            ["system_profiler", "SPDisplaysDataType"],
-            capture_output=True, text=True, timeout=15,
-        )
-        text = r.stdout
-    except Exception as e:  # noqa: BLE001
-        logger.warning("调用 system_profiler 失败: %s", e)
-        return []
 
+def _parse_display_names_text(text):
+    """从 system_profiler 输出文本解析显示器条目列表（不触碰缓存）。"""
     # 定位 Displays: 段落（最后一段，即 GPU 下的显示器列表）
     sections = text.split("Displays:")
     if len(sections) < 2:
@@ -115,6 +109,32 @@ def _parse_display_names():
                     current["is_main"] = "yes" in val.lower()
 
     return results
+
+
+def _parse_display_names():
+    """从 system_profiler SPDisplaysDataType 文本输出解析显示器名称和属性。
+
+    返回列表，每项: (name, resolution_str, ui_looks_like, is_main)
+    超时或解析失败时退回上次成功结果（C 债），避免屏名退化为 "Display N"。
+    始终返回深拷贝，避免调用方（匹配时给条目打标记）污染缓存。
+    """
+    global _names_cache
+    try:
+        r = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType"],
+            capture_output=True, text=True, timeout=5,
+        )
+        text = r.stdout
+    except Exception as e:  # noqa: BLE001
+        logger.warning("调用 system_profiler 失败（退回上次结果）: %s", e)
+        return copy.deepcopy(_names_cache) if _names_cache else []
+
+    results = _parse_display_names_text(text)
+    if results:
+        _names_cache = results
+        return copy.deepcopy(results)
+    # 解析不到（输出异常）：同样退回上次成功结果
+    return copy.deepcopy(_names_cache) if _names_cache else []
 
 
 def _parse_resolution_to_wh(res_str):

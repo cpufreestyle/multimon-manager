@@ -66,6 +66,8 @@ VK_LEFT = 123
 VK_RIGHT = 124
 VK_UP = 126
 VK_DOWN = 125
+# Z 键（撤销），macOS CGKeycode
+VK_Z = 6
 
 # 数字键 1-9 的 macOS 虚拟键码（CGKeycode）。注意它与 ASCII 不同：
 # 例如 "1" 的 CGKeycode 是 18 而非 ord("1")=49，用 ord() 注册会导致快捷键
@@ -222,7 +224,9 @@ class HotkeyManager:
         for _hid, (mod, vk, cb) in self.hotkeys.items():
             if vk == code and self._flags_match(flags, mod):
                 self._queue.put(cb)  # 只入队，立即返回
-                break  # 一个按键只触发一个动作
+                # 已匹配并消费该按键：返回 None 阻止事件继续传递给前台 App，
+                # 否则前台程序也会收到同样的 ⌘⌥+数字 组合（"双重触发"）。
+                return None
         return event
 
     def _worker(self):

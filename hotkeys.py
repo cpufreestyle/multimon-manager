@@ -36,6 +36,8 @@ VK_LEFT = 0x25
 VK_UP = 0x26
 VK_RIGHT = 0x27
 VK_DOWN = 0x28
+# Z 键（撤销）
+VK_Z = ord("z")
 
 # 数字键 1-9 的 Windows 虚拟键码（与 ASCII 一致，如 "1" = 0x31）。
 DIGIT_KEYS = {d: ord(str(d)) for d in range(10)}
