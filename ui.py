@@ -62,6 +62,9 @@ class App:
         self._drag_watcher = None
         self._drag_zone = None
         self._last_zone_ts = 0.0
+        # 拖拽事件在 CGEventTap 原生回调里只记录坐标，真正的 UI/窗口操作延迟到主循环
+        self._drag_pending = None
+        self._drag_job = None
         # 规则引擎（F5）：记录已知窗口，用于识别"新出现的窗口"
         self._rule_seen = None
         self._build()
@@ -125,6 +128,7 @@ class App:
         self._bind_mousewheel()
 
         # 所有分区统一挂到同一个容器（不再分页）
+        self._build_getting_started(self.body)
         self._build_window_tools(self.body)
         self._build_wallpaper(self.body)
         self._build_profiles(self.body)
@@ -515,6 +519,60 @@ class App:
         """跳转到系统设置的辅助功能页面。"""
         try:
             b.open_accessibility_settings()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------- 上手建议卡片 ----------
+    def _build_getting_started(self, parent):
+        """单页顶部的动态「上手建议」卡片：根据授权状态与屏数给出实用建议。"""
+        self._gs_frame = ttk.LabelFrame(parent, text="上手建议")
+        self._gs_frame.pack(fill="x", padx=6, pady=(4, 8), anchor="n")
+
+        self._gs_text = tk.StringVar(value="")
+        self._gs_label = ttk.Label(self._gs_frame, textvariable=self._gs_text,
+                                   wraplength=720, justify="left")
+        self._gs_label.pack(fill="x", padx=8, pady=(4, 2), anchor="w")
+
+        btn_row = ttk.Frame(self._gs_frame)
+        btn_row.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Button(btn_row, text="刷新状态",
+                   command=self._refresh_getting_started).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="去授权辅助功能",
+                   command=self._open_accessibility_settings).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="收起",
+                   command=lambda: self._gs_frame.pack_forget()).pack(side="left", padx=4)
+
+        self._refresh_getting_started()
+
+    def _refresh_getting_started(self):
+        """根据辅助功能授权状态与显示器数量，动态给出实用建议。"""
+        try:
+            trusted = b.is_accessibility_trusted()
+        except Exception:  # noqa: BLE001
+            trusted = False
+        n = len(self.monitors or [])
+        lines = []
+        if b.IS_MAC and not trusted:
+            lines.append("• 尚未授权「辅助功能」：窗口控制、全局快捷键、拖拽吸附会静默失效。"
+                         "点「去授权辅助功能」，在系统设置中开启本程序后点「刷新状态」。")
+        if n <= 1:
+            lines.append("• 当前仅 1 块显示器：情景(F2)、拖拽吸附(F3)、窗口规则(F5) 的多屏效果"
+                         "需在多屏真机验证；UI 与配置读写均可正常使用。")
+        if not lines:
+            lines.append("• 环境就绪（已授权、多屏）。三步上手：")
+            lines.append("  F6 给显示器起别名 → F2 绑定当前组合的情景（壁纸+布局）→ F5 加窗口规则自动归位。")
+            lines.append("  F3 拖拽吸附 + ⌘⌥/Ctrl+Alt+Z 撤销误移动；F8 导出设置以便换机备份。")
+        else:
+            lines.append("• 通用建议：F6 起别名 → F2 建情景 → F5 加规则；F3 拖拽吸附 + 撤销；F8 备份设置。")
+        self._gs_text.set("\n".join(lines))
+        try:
+            if b.IS_MAC and not trusted:
+                color = "#a15c00"
+            elif n <= 1:
+                color = "#1a6bb3"
+            else:
+                color = "#1f7a1f"
+            self._gs_label.configure(foreground=color)
         except Exception:  # noqa: BLE001
             pass
 
@@ -910,6 +968,24 @@ class App:
         ttk.Checkbutton(f, text="显示器变化时自动套用匹配情景",
                         variable=self.scen_auto,
                         command=self._save_scenario_prefs).pack(anchor="w", padx=4, pady=2)
+
+        # ---- 定时套用：到点自动套用指定情景（每天一次）----
+        tf = ttk.Frame(f)
+        tf.pack(fill="x", padx=4, pady=(2, 2))
+        ttk.Label(tf, text="定时套用").pack(side="left")
+        self.scen_time_sig_var = tk.StringVar()
+        self.scen_time_sig_cb = ttk.Combobox(tf, textvariable=self.scen_time_sig_var,
+                                             width=18, state="readonly")
+        self.scen_time_sig_cb.pack(side="left", padx=2)
+        self.scen_time_var = tk.StringVar(value="09:00")
+        ttk.Entry(tf, textvariable=self.scen_time_var, width=6).pack(side="left", padx=2)
+        ttk.Button(tf, text="添加", command=self._add_scenario_time).pack(side="left", padx=2)
+        ttk.Button(tf, text="删除", command=self._delete_scenario_time).pack(side="left", padx=2)
+
+        ttk.Label(f, text="到点自动套用对应情景（每天一次，时间格式 HH:MM）",
+                  foreground="#666").pack(anchor="w", padx=4)
+        self.scen_time_list = tk.Listbox(f, height=3, activestyle="none")
+        self.scen_time_list.pack(fill="x", padx=4, pady=2)
         self._refresh_scenario_ui()
 
     def _save_scenario_prefs(self):
@@ -951,6 +1027,75 @@ class App:
                 label = "★ " + label
             self.scen_list.insert("end", label)
             self._scen_rows.append(s)
+        self._refresh_scenario_time_ui()
+
+    def _refresh_scenario_time_ui(self):
+        """刷新"定时套用"的情景下拉候选与已设定列表。"""
+        try:
+            sigs = scenarios.list_scenarios()
+            names = [(scen.get("name") or scenarios.describe(s))
+                     for _s, scen in sorted(sigs.items())]
+            self.scen_time_sig_cb["values"] = names
+            if names and self.scen_time_sig_var.get() not in names:
+                self.scen_time_sig_var.set(names[0])
+        except Exception:  # noqa: BLE001
+            pass
+        self._scen_time_rows = []
+        try:
+            self.scen_time_list.delete(0, "end")
+            for t in scenarios.list_time_triggers():
+                sig = t.get("signature")
+                scen = scenarios.get(sig)
+                if scen:
+                    label = scen.get("name") or scenarios.describe(sig)
+                else:
+                    label = sig or "?"
+                if not t.get("enabled", True):
+                    label += "  [停用]"
+                self.scen_time_list.insert("end", f"{label}  {t.get('time')}")
+                self._scen_time_rows.append(sig)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _signature_by_name(self, name):
+        """按情景显示名反查签名；找不到返回 None。"""
+        try:
+            for s, scen in scenarios.list_scenarios().items():
+                if (scen.get("name") or scenarios.describe(s)) == name:
+                    return s
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _selected_index(self, listbox):
+        """Listbox 当前选中索引；无选中返回 None。"""
+        try:
+            sel = listbox.curselection()
+            return int(sel[0]) if sel else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _add_scenario_time(self):
+        """添加一个定时套用（情景 + HH:MM）。"""
+        name = self.scen_time_sig_var.get()
+        hhmm = (self.scen_time_var.get() or "").strip()
+        sig = self._signature_by_name(name) or self._current_signature()
+        try:
+            ok, _items = scenarios.add_time_trigger(sig, hhmm)
+        except Exception:  # noqa: BLE001
+            ok = False
+        self._refresh_scenario_time_ui()
+        self.status_var.set(
+            f"已添加定时：{name} @ {hhmm}" if ok else f"添加失败（时间需为 HH:MM）：{hhmm}")
+
+    def _delete_scenario_time(self):
+        idx = self._selected_index(self.scen_time_list)
+        if idx is None:
+            self.status_var.set("请先在定时列表中选中一条")
+            return
+        scenarios.remove_time_trigger(idx)
+        self._refresh_scenario_time_ui()
+        self.status_var.set("已删除该定时套用")
 
     def _bind_scenario(self):
         sig = self._current_signature()
@@ -1106,14 +1251,41 @@ class App:
         return None
 
     def _on_mouse_event(self, stage, x, y):
-        """拖拽监听回调（主线程）：更新预览浮层，松手时执行吸附。"""
+        """拖拽监听回调：**运行在 CGEventTap 原生回调上下文中**。
+
+        这里只记录最新事件并调度一次主循环任务，绝不能做 Tk 操作或窗口枚举：
+        1) 原生回调必须立刻返回，否则事件 tap 会因超时被系统禁用；
+        2) 在 tap 回调里重入 Tk（deiconify/lift/update_idletasks）或调用 objc
+           会触发原生崩溃（Segmentation fault，Python 的 try/except 抓不到）。
+        """
+        try:
+            self._drag_pending = (stage, int(x), int(y))
+            if self._drag_job is None:
+                self._drag_job = self.root.after_idle(self._process_drag_event)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _process_drag_event(self):
+        """在 Tk 主循环里处理暂存的拖拽事件（唯一允许做 UI/窗口操作的地方）。"""
+        self._drag_job = None
+        try:
+            stage, x, y = self._drag_pending
+        except Exception:  # noqa: BLE001
+            return
         try:
             if stage == "down":
                 self._drag_zone = None
+                if self._snap_preview is not None:
+                    self._snap_preview.hide()
                 return
             if stage == "drag":
                 now = time.monotonic()
                 if now - self._last_zone_ts < 0.05:  # 节流到约 20fps
+                    # 未到节流窗口：稍后重调度，避免吞掉最后一次移动
+                    try:
+                        self._drag_job = self.root.after(20, self._process_drag_event)
+                    except Exception:  # noqa: BLE001
+                        pass
                     return
                 self._last_zone_ts = now
                 zone = self._snap_zone_at(x, y)
@@ -1133,6 +1305,7 @@ class App:
                     self._snap_preview.hide()
                 if not zone:
                     return
+                # 枚举窗口可能较慢/起子进程：只能在主循环里做，不能在 tap 回调里做
                 wins = [w for w in b.list_target_windows()
                         if not self._is_own_window(w.get("owner"))]
                 if not wins:
@@ -1189,6 +1362,22 @@ class App:
                      values=["整屏", "左半屏", "右半屏", "上半屏", "下半屏"]).pack(side="left", padx=2)
         ttk.Button(form2, text="添加规则", command=self._add_rule).pack(side="left", padx=4)
 
+        # 内置规则模板：一键导入常用组合（跨平台关键词，不依赖具体显示器）
+        form3 = ttk.Frame(f)
+        form3.pack(fill="x", padx=4, pady=2)
+        ttk.Label(form3, text="模板:").pack(side="left")
+        self.rule_tpl_var = tk.StringVar()
+        self.rule_tpl_cb = ttk.Combobox(form3, textvariable=self.rule_tpl_var,
+                                        width=26, state="readonly",
+                                        values=list(rules.TEMPLATES))
+        self.rule_tpl_cb.pack(side="left", padx=2)
+        if rules.TEMPLATES:
+            self.rule_tpl_var.set(next(iter(rules.TEMPLATES)))
+        ttk.Button(form3, text="追加导入",
+                   command=lambda: self._import_rule_template(False)).pack(side="left", padx=2)
+        ttk.Button(form3, text="替换导入",
+                   command=lambda: self._import_rule_template(True)).pack(side="left", padx=2)
+
         self.rules_auto = tk.BooleanVar(
             value=bool(settings.load().get("rules_auto_apply", False)))
         ttk.Checkbutton(f, text="自动应用（新窗口出现时）",
@@ -1200,6 +1389,20 @@ class App:
         s = settings.load()
         s["rules_auto_apply"] = self.rules_auto.get()
         settings.save(s)
+
+    def _import_rule_template(self, replace=False):
+        """一键导入内置规则模板（replace=True 时先清空现有规则）。"""
+        name = self.rule_tpl_var.get()
+        if not name:
+            self.status_var.set("请先选择一个模板")
+            return
+        try:
+            added, total = rules.apply_template(name, replace=replace)
+        except Exception:  # noqa: BLE001
+            self.status_var.set("导入模板失败")
+            return
+        self._refresh_rule_list()
+        self.status_var.set(f"已导入模板「{name}」：新增 {added} 条，当前共 {total} 条")
 
     def _refresh_rule_list(self):
         self.rule_rows.delete(0, "end")
@@ -1295,10 +1498,17 @@ class App:
         self.status_var.set(f"规则引擎：已应用规则，移动 {moved} 个窗口")
 
     def _poll_rules(self):
-        """主线程轮询：识别新出现的窗口并自动套用规则。"""
+        """主线程轮询：识别新出现的窗口并自动套用规则；并检查情景定时触发。"""
         try:
             if getattr(self, "rules_auto", None) is not None and self.rules_auto.get():
                 self._scan_new_windows()
+        except Exception:  # noqa: BLE001
+            pass
+        # 情景定时套用：到点（分钟级）且当天未触发过则自动套用
+        try:
+            for sig in scenarios.due_time_triggers():
+                self._apply_scenario_by_signature(sig)
+                self.status_var.set("定时触发：已套用情景")
         except Exception:  # noqa: BLE001
             pass
         self.root.after(1500, self._poll_rules)
@@ -1397,6 +1607,8 @@ class App:
         self._draw_layout()
         # 同步并排/竖排的显示器下拉选项
         self._refresh_monitor_choices()
+        # 显示器数量变化后，同步「上手建议」卡片的屏数提示
+        self._refresh_getting_started()
 
     def _draw_layout(self):
         """在 Canvas 上按比例画出各显示器相对位置。

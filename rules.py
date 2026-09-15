@@ -148,3 +148,47 @@ def apply_to_window(rule, win, monitors):
     b.set_window_rect(win["hwnd"], target[0], target[1], target[2], target[3],
                       activate=False)
     return True
+
+
+# ---------- 内置规则模板 ----------
+# 模板用「应用名子串（不区分大小写）」匹配，跨平台通用：macOS / Windows 的应用名
+# 不同（如 "Code" vs "Code.exe"），但 code / chrome / terminal 这类关键词两边都命中。
+# monitor=None 表示「不换屏」：按窗口中心点所在屏分区，不绑定具体显示器，
+# 因此换机器、换接口、改系统屏号都不会失效。
+TEMPLATES = {
+    "开发：编辑器左 / 浏览器右 / 终端下": [
+        ("code", "left"),
+        ("chrome", "right"), ("safari", "right"), ("edge", "right"),
+        ("terminal", "bottom"), ("iterm", "bottom"), ("powershell", "bottom"),
+    ],
+    "写作：编辑器左 / 资料右": [
+        ("code", "left"), ("typora", "left"), ("notion", "left"), ("obsidian", "left"),
+        ("chrome", "right"), ("safari", "right"), ("preview", "right"), ("acrobat", "right"),
+    ],
+    "会议：会议软件整屏 / 浏览器右": [
+        ("zoom", "full"), ("teams", "full"), ("tencent", "full"), ("meeting", "full"),
+        ("chrome", "right"), ("safari", "right"),
+    ],
+}
+
+
+def apply_template(name, replace=False):
+    """把内置模板导入用户规则列表；replace=True 时先清空现有规则。
+
+    返回 (新增条数, 导入后总条数)；模板名不存在时返回 (0, 现有条数)。
+    """
+    tpl = TEMPLATES.get(name)
+    if not tpl:
+        return 0, len(list_rules())
+    items = [] if replace else list_rules()
+    for pattern, zone in tpl:
+        items.append({
+            "enabled": True,
+            "field": "owner",
+            "pattern": pattern,
+            "regex": False,
+            "monitor": None,   # 不换屏：按窗口所在屏分区
+            "zone": zone,
+        })
+    save_rules(items)
+    return len(tpl), len(items)

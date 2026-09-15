@@ -21,6 +21,8 @@ class SnapPreview:
         self.win = None
         self._visible = False
         self._click_through_bound = False
+        # 点击穿透设置失败后不再反复重试：避免每次 show 都调用原生 objc API
+        self._click_through_failed = False
 
     def _ensure(self):
         if self.win is not None:
@@ -47,15 +49,20 @@ class SnapPreview:
         return w
 
     def _bind_click_through(self):
-        """macOS：令浮层忽略鼠标事件（只需成功一次）。"""
-        if self._click_through_bound or sys.platform != "darwin" or self.win is None:
+        """macOS：令浮层忽略鼠标事件（最多尝试一次，成功或失败后都不再重试）。"""
+        if self._click_through_bound or self._click_through_failed:
+            return
+        if sys.platform != "darwin" or self.win is None:
+            self._click_through_failed = True
             return
         try:
             self.root.update_idletasks()
             if _set_ignores_mouse_events(self.win.winfo_id()):
                 self._click_through_bound = True
+            else:
+                self._click_through_failed = True
         except Exception:  # noqa: BLE001
-            pass
+            self._click_through_failed = True
 
     def show(self, x, y, width, height):
         """把浮层显示在 (x, y, width, height)（屏幕坐标，左上原点）。"""
