@@ -60,6 +60,15 @@ SWP_FRAMECHANGED = 0x0020
 
 SW_RESTORE = 0x09
 SW_MAXIMIZE = 0x03
+SW_SHOWNOACTIVATE = 0x04
+
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
+HWND_TOPMOST = wintypes.HWND(-1)
+HWND_NOTOPMOST = wintypes.HWND(-2)
 
 
 # ── 本程序自身的进程白名单（窗口操作时应跳过自己） ────────────────────
@@ -77,14 +86,20 @@ register_own_pid(os.getpid())
 
 
 def get_foreground_window(use_pinned=True):
-    """返回当前前台窗口的整数 HWND。
+    """返回要操作窗口的整数 HWND。
 
-    use_pinned=True（界面按钮）时优先用界面固定的目标窗口；
+    use_pinned=True（界面按钮）时优先用界面固定的目标窗口；未固定目标时
+    取「最前面的非本程序窗口」——点按钮瞬间前台是本程序自己，直接用
+    GetForegroundWindow 会把管理器自己分屏/移动（与 macOS 行为对齐）；
     use_pinned=False（全局快捷键）时始终作用于真正的活动窗口。
     """
     if use_pinned and _pinned_target:
         if _find_window(_pinned_target):
             return _pinned_target
+    if use_pinned:
+        w = front_external_window()
+        if w:
+            return w["hwnd"]
     return user32.GetForegroundWindow()
 
 
@@ -147,10 +162,11 @@ def _monitor_by_relative(monitors_list, src_hwnd):
     return 0
 
 
-def move_to_monitor(hwnd, monitor, src=None):
+def move_to_monitor(hwnd, monitor, src=None, activate=True):
     """将窗口移动到目标显示器，保持相对位置比例。
 
     src 为显示器列表快照；缺省时自动枚举（已有列表时应传入避免重复调用）。
+    activate=False 时只移动不激活（界面按钮模式，管理器不会被挤到后面）。
     """
     x, y, w, h = get_window_rect(hwnd)
     if src is None:
@@ -161,78 +177,142 @@ def move_to_monitor(hwnd, monitor, src=None):
     rel_y = (y - src_m.top) / max(src_m.height, 1)
     new_x = monitor.work_left + rel_x * max(monitor.work_width - w, 0)
     new_y = monitor.work_top + rel_y * max(monitor.work_height - h, 0)
-    set_window_rect(hwnd, new_x, new_y, w, h)
+    set_window_rect(hwnd, new_x, new_y, w, h, activate=activate)
 
 
-def snap(hwnd, monitor, zone):
+def snap(hwnd, monitor, zone, activate=True):
     """将窗口吸附到目标显示器的某个区域。zone 取值:
     left/right/top/bottom/maximize/center，三分屏 left-third/middle-third/right-third，
-    四等分 quad-tl/quad-tr/quad-bl/quad-br。"""
+    四等分 quad-tl/quad-tr/quad-bl/quad-br。
+
+    activate=False 时只移动不激活目标窗口（界面按钮模式）：还原改用
+    SW_SHOWNOACTIVATE，「最大化」退化为铺满工作区（真最大化会抢焦点）。
+    """
     wl, wt, ww, wh = monitor.work_rect
     x, y, w, h = get_window_rect(hwnd)
     if zone == "maximize":
-        # 真正最大化（含任务栏避让、动画与双击标题栏还原行为）
-        user32.ShowWindow(hwnd, SW_MAXIMIZE)
+        if activate:
+            # 真正最大化（含任务栏避让、动画与双击标题栏还原行为）
+            user32.ShowWindow(hwnd, SW_MAXIMIZE)
+        else:
+            user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+            set_window_rect(hwnd, wl, wt, ww, wh, activate=False)
         return
     # 非最大化区域前先还原窗口，否则已最大化的窗口不会被正确缩放/移动
-    user32.ShowWindow(hwnd, SW_RESTORE)
+    user32.ShowWindow(hwnd, SW_RESTORE if activate else SW_SHOWNOACTIVATE)
     if zone == "left":
-        set_window_rect(hwnd, wl, wt, ww // 2, wh)
+        set_window_rect(hwnd, wl, wt, ww // 2, wh, activate=activate)
     elif zone == "right":
-        set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh)
+        set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh, activate=activate)
     elif zone == "top":
-        set_window_rect(hwnd, wl, wt, ww, wh // 2)
+        set_window_rect(hwnd, wl, wt, ww, wh // 2, activate=activate)
     elif zone == "bottom":
-        set_window_rect(hwnd, wl, wt + wh // 2, ww, wh - wh // 2)
+        set_window_rect(hwnd, wl, wt + wh // 2, ww, wh - wh // 2, activate=activate)
     elif zone == "center":
-        set_window_rect(hwnd, wl + (ww - w) // 2, wt + (wh - h) // 2, w, h)
+        set_window_rect(hwnd, wl + (ww - w) // 2, wt + (wh - h) // 2, w, h,
+                        activate=activate)
     elif zone == "left-third":
-        set_window_rect(hwnd, wl, wt, ww // 3, wh)
+        set_window_rect(hwnd, wl, wt, ww // 3, wh, activate=activate)
     elif zone == "middle-third":
-        set_window_rect(hwnd, wl + ww // 3, wt, ww // 3, wh)
+        set_window_rect(hwnd, wl + ww // 3, wt, ww // 3, wh, activate=activate)
     elif zone == "right-third":
-        set_window_rect(hwnd, wl + 2 * (ww // 3), wt, ww - 2 * (ww // 3), wh)
+        set_window_rect(hwnd, wl + 2 * (ww // 3), wt, ww - 2 * (ww // 3), wh,
+                        activate=activate)
     elif zone == "quad-tl":
-        set_window_rect(hwnd, wl, wt, ww // 2, wh // 2)
+        set_window_rect(hwnd, wl, wt, ww // 2, wh // 2, activate=activate)
     elif zone == "quad-tr":
-        set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh // 2)
+        set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh // 2,
+                        activate=activate)
     elif zone == "quad-bl":
-        set_window_rect(hwnd, wl, wt + wh // 2, ww // 2, wh - wh // 2)
+        set_window_rect(hwnd, wl, wt + wh // 2, ww // 2, wh - wh // 2,
+                        activate=activate)
     elif zone == "quad-br":
-        set_window_rect(hwnd, wl + ww // 2, wt + wh // 2, ww - ww // 2, wh - wh // 2)
+        set_window_rect(hwnd, wl + ww // 2, wt + wh // 2, ww - ww // 2, wh - wh // 2,
+                        activate=activate)
 
 
 def monitors_list_snapshot():
     return monitors.enum_monitors()
 
 
-def move_window_to_next_monitor(hwnd, direction=1):
+def move_window_to_next_monitor(hwnd, direction=1, activate=True):
     """把指定窗口移到相邻显示器（direction: -1 上一屏 / 1 下一屏）。"""
     ms = monitors.enum_monitors()
     if not ms or not hwnd:
         return False
     idx = _monitor_by_relative(ms, hwnd)
     n = len(ms)
-    move_to_monitor(hwnd, ms[(idx + direction) % n], src=ms)
+    move_to_monitor(hwnd, ms[(idx + direction) % n], src=ms, activate=activate)
     return True
 
 
-def snap_window(hwnd, zone):
+def snap_window(hwnd, zone, activate=True):
     """把指定窗口吸附到其所在显示器的某个区域。"""
     ms = monitors.enum_monitors()
     if not ms or not hwnd:
         return False
     idx = _monitor_by_relative(ms, hwnd)
-    snap(hwnd, ms[idx], zone)
+    snap(hwnd, ms[idx], zone, activate=activate)
     return True
 
 
-def move_active_to_next_monitor(direction=1):
-    return move_window_to_next_monitor(get_foreground_window(), direction)
+def move_active_to_next_monitor(direction=1, use_pinned=True, activate=True):
+    """移动活动/目标窗口到相邻显示器（与 windows_mac 同名函数签名一致）。
+
+    use_pinned=True 优先用界面固定的目标窗口；False 始终作用于当前活动窗口。
+    """
+    return move_window_to_next_monitor(
+        get_foreground_window(use_pinned), direction, activate=activate)
 
 
-def snap_active(zone):
-    return snap_window(get_foreground_window(), zone)
+def snap_active(zone, use_pinned=True, activate=True):
+    """把活动/目标窗口吸附到所在显示器的某个区域（与 windows_mac 签名一致）。"""
+    return snap_window(get_foreground_window(use_pinned), zone, activate=activate)
+
+
+def front_external_window():
+    """返回最前面的非本程序窗口（z 序第一个）；没有则 None。
+
+    「自动（上次活动窗口）」语义：点按钮瞬间前台是本程序自己，自动模式
+    应取 z 序最前的外部窗口（list_windows_front_to_back 已排除自身 PID）。
+    """
+    for w in list_windows_front_to_back():
+        return w
+    return None
+
+
+def is_topmost(hwnd):
+    """窗口当前是否处于置顶（WS_EX_TOPMOST）状态。"""
+    try:
+        get_long = user32.GetWindowLongPtrW
+    except AttributeError:  # 32 位 Python 无 Ptr 版本
+        get_long = user32.GetWindowLongW
+    get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+    get_long.restype = ctypes.c_ssize_t
+    try:
+        return bool(get_long(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def toggle_topmost(hwnd=None, use_pinned=True):
+    """切换窗口置顶（always-on-top）状态。
+
+    hwnd 缺省时取目标窗口（use_pinned=True 优先界面固定的目标，否则活动窗口）。
+    返回 True=已置顶 / False=已取消置顶 / None=失败。不改变窗口焦点。
+    """
+    h = hwnd or get_foreground_window(use_pinned)
+    if not h or not is_window(h):
+        logger.warning("toggle_topmost: 没有可操作的窗口")
+        return None
+    make_top = not is_topmost(h)
+    insert_after = HWND_TOPMOST if make_top else HWND_NOTOPMOST
+    if not user32.SetWindowPos(h, insert_after, 0, 0, 0, 0,
+                               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE):
+        logger.warning("toggle_topmost: SetWindowPos 失败 (hwnd=%s)", h)
+        return None
+    logger.info("toggle_topmost: hwnd=%s -> %s", h, "置顶" if make_top else "取消置顶")
+    return make_top
 
 
 def _proc_name(pid):

@@ -71,10 +71,15 @@ class MonitorInfo:
         return (self.work_left, self.work_top, self.work_width, self.work_height)
 
 
-def enum_monitors():
-    """枚举所有显示器，返回 MonitorInfo 列表（按设备顺序排列）。带短期缓存。"""
+def enum_monitors(force=False):
+    """枚举所有显示器，返回 MonitorInfo 列表（按设备顺序排列）。
+
+    结果带短期缓存（TTL=2s，避免同一次操作内重复调用 Windows API）；
+    force=True 跳过缓存立即重新枚举（供界面「刷新显示器」与热插拔轮询
+    使用，与 monitors_mac.enum_monitors(force=...) 参数保持一致）。
+    """
     now = time.time()
-    if _cache["data"] is not None and (now - _cache["ts"]) < _CACHE_TTL:
+    if not force and _cache["data"] is not None and (now - _cache["ts"]) < _CACHE_TTL:
         # 返回深拷贝，避免调用方修改污染缓存
         return copy.deepcopy(_cache["data"])
     monitors = []
@@ -121,6 +126,15 @@ def get_primary_monitor():
         if m.is_primary:
             return m
     return None
+
+
+def stage_manager_enabled():
+    """Windows 没有 macOS 的「台前调度」概念，恒返回 False。
+
+    与 monitors_mac.stage_manager_enabled 同名同签名；backend 统一导出时
+    依赖该属性存在，缺失会导致 Windows 上 import backend 直接失败。
+    """
+    return False
 
 
 if __name__ == "__main__":

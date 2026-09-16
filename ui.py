@@ -32,7 +32,9 @@ class App:
         self.fit_var = tk.StringVar(value="fill")
         self.mode_var = tk.StringVar(value="per")
         self.single_var = tk.StringVar()
-        self.hk_enabled = tk.BooleanVar(value=False)
+        # 全局快捷键开关：持久化到 settings，重启后自动恢复上次状态
+        self.hk_enabled = tk.BooleanVar(
+            value=bool(settings.load().get("hk_enabled", False)))
         # 全局快捷键修饰键：按平台默认（macOS ⌘⌥，Windows Ctrl+Alt），用户可改并持久化
         self.hk_mods_var = tk.StringVar(value=self._default_hk_mods())
         # 开机自动启动（v0.2.1）
@@ -48,6 +50,9 @@ class App:
         self._build()
         self.refresh_monitors()
         self._start_command_poll()
+        # 上次会话启用过全局快捷键则自动恢复（免每次启动手动勾选；失败静默降级）
+        if self.hk_enabled.get():
+            self.root.after(600, lambda: self._toggle_hk(quiet=True))
         # 窗口大小变化时防抖重绘布局图，并设最小尺寸避免控件被压坏
         self.root.minsize(660, 520)
         self._resize_job = None
@@ -252,6 +257,9 @@ class App:
             ("左下", lambda: b.snap_active("quad-bl", activate=False)),
             ("右下", lambda: b.snap_active("quad-br", activate=False)),
         ]
+        # 窗口置顶切换（当前仅 Windows 提供实现，其它平台自动隐藏入口）
+        if getattr(b, "toggle_topmost", None) is not None:
+            btns.append(("置顶切换", lambda: self._toggle_topmost_action()))
         # 15 个按钮分三行排列（6 + 6 + 3），避免超出窗口宽度被截断。
         for group in (btns[:6], btns[6:12], btns[12:]):
             row = ttk.Frame(f)
@@ -422,6 +430,20 @@ class App:
             self.status_var.set("已竖排上中下" + (f"（{mon_label}）" if mon_idx is not None else ""))
         else:
             self.status_var.set("竖排失败：需要至少三个可操作窗口")
+
+    def _toggle_topmost_action(self):
+        """切换目标窗口的置顶（always-on-top）状态并反馈。"""
+        try:
+            res = b.toggle_topmost(use_pinned=True)
+        except Exception as e:  # noqa: BLE001
+            self.status_var.set(f"置顶切换失败：{e}")
+            return
+        if res is True:
+            self.status_var.set("目标窗口已置顶")
+        elif res is False:
+            self.status_var.set("目标窗口已取消置顶")
+        else:
+            self.status_var.set("置顶切换失败：未找到可操作窗口")
 
     # ---------- 置顶 ----------
     def _apply_topmost(self):
@@ -632,14 +654,21 @@ class App:
         f = ttk.LabelFrame(parent, text="启动选项")
         f.pack(fill="x", padx=8, pady=6)
         ttk.Checkbutton(f, text="开机自动启动", variable=self.autostart_var,
-                        command=self._toggle_autostart).pack(anchor="w", padx=4, pady=4)
+                        command=self._toggle_autostart).pack(anchor="w", padx=4, pady=2)
+        # 静默启动：自启命令带 --minimized，开机后只进托盘不弹主窗口
+        self.autostart_min_var = tk.BooleanVar(value=autostart.is_minimized())
+        ttk.Checkbutton(f, text="开机自启时最小化到托盘（静默启动）",
+                        variable=self.autostart_min_var,
+                        command=self._toggle_autostart).pack(anchor="w", padx=4, pady=2)
 
     def _toggle_autostart(self):
         try:
-            autostart.set_enabled(self.autostart_var.get())
+            autostart.set_enabled(self.autostart_var.get(),
+                                  minimized=self.autostart_min_var.get())
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("错误", f"设置开机自启失败:\n{e}")
             self.autostart_var.set(autostart.is_enabled())
+            self.autostart_min_var.set(autostart.is_minimized())
 
     # ---------- 显示器热插拔 ----------
     def _build_display_watch(self, parent):
@@ -730,6 +759,9 @@ class App:
             self._apply_last_layout()
         elif cmd == "open":
             self.show()
+        elif cmd == "exit":
+            # 托盘「退出」：命令发回 Tk 主线程安全退出（托盘线程只发命令）
+            self.quit()
 
     def _apply_last_layout(self):
         """应用最近保存/使用的窗口布局（供托盘一键调用）。"""
@@ -952,7 +984,8 @@ class App:
         return (f"{sym}+←/→ : 活动窗口移到上一/下一屏\n"
                 f"{sym}+1/2/3/4 : 左/右/上/下半屏\n"
                 f"{sym}+5/6 : 最大化 / 居中\n"
-                f"{sym}+7/8/9 : 三分屏（左/中/右）")
+                f"{sym}+7/8/9 : 三分屏（左/中/右）\n"
+                f"{sym}+Shift+1/2/3/4 : 四象限（左上/右上/左下/右下）")
 
     def _current_hk_mods(self):
         """把用户选择的修饰键组合映射为 backend 的 MOD_* 位掩码。"""
@@ -982,14 +1015,18 @@ class App:
             self.hk = None
             self._toggle_hk()
 
-    def _toggle_hk(self):
+    def _toggle_hk(self, quiet=False):
         if self.hk_enabled.get():
             if self.hk is None:
                 try:
                     self.hk = b.HotkeyManager()
                 except Exception as e:  # noqa: BLE001
-                    messagebox.showerror("错误", f"快捷键初始化失败:\n{e}")
-                    self.hk_enabled.set(False)
+                    if quiet:
+                        # 启动自动恢复失败：保留勾选状态，下次启动再试
+                        self.status_var.set(f"全局快捷键恢复失败：{e}")
+                    else:
+                        messagebox.showerror("错误", f"快捷键初始化失败:\n{e}")
+                        self.hk_enabled.set(False)
                     return
                 # 快捷键语义是"作用于当前活动窗口"，故忽略界面固定的目标
                 mods = self._current_hk_mods()
@@ -1016,10 +1053,19 @@ class App:
                                  lambda: b.snap_active("middle-third", use_pinned=False))
                 self.hk.register(mods, dk[9],
                                  lambda: b.snap_active("right-third", use_pinned=False))
+                # 四象限：修饰键+Shift+数字 1-4（左上/右上/左下/右下）
+                for vk, zone in ((dk[1], "quad-tl"), (dk[2], "quad-tr"),
+                                 (dk[3], "quad-bl"), (dk[4], "quad-br")):
+                    self.hk.register(mods | b.MOD_SHIFT, vk,
+                                     lambda z=zone: b.snap_active(z, use_pinned=False))
             self.hk.start()
         else:
             if self.hk:
                 self.hk.stop()
+        # 记住开关状态，下次启动自动恢复
+        s = settings.load()
+        s["hk_enabled"] = bool(self.hk_enabled.get())
+        settings.save(s)
 
     # ---------- 窗口管理 ----------
     def show(self):

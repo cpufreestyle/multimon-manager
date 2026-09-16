@@ -7,7 +7,10 @@ import json
 import os
 from datetime import datetime
 
-_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "layouts.json")
+import settings
+
+# 源码运行在仓库内；打包运行用用户数据目录（_MEIPASS 是临时目录，会丢配置）
+_PATH = os.path.join(settings.data_dir(), "layouts.json")
 
 
 def list_layouts():

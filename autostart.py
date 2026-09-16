@@ -24,7 +24,7 @@ _PLIST = """<?xml version="1.0" encoding="UTF-8"?>
     <key>ProgramArguments</key>
     <array>
         <string>{python}</string>
-        <string>{script}</string>
+        <string>{script}</string>{minimized_arg}
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -35,12 +35,19 @@ _PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
-def _app_command():
-    """返回启动命令。打包 exe 时用 sys.executable，否则 python + main.py。"""
+def _app_command(minimized=False):
+    """返回启动命令。打包 exe 时用 sys.executable，否则 python + main.py。
+
+    minimized=True 时追加 --minimized 参数（开机自启时静默启动到托盘）。
+    """
     if getattr(sys, "frozen", False):
-        return '"%s"' % sys.executable
-    here = os.path.dirname(os.path.abspath(__file__))
-    return '"%s" "%s"' % (sys.executable, os.path.join(here, "main.py"))
+        cmd = '"%s"' % sys.executable
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+        cmd = '"%s" "%s"' % (sys.executable, os.path.join(here, "main.py"))
+    if minimized:
+        cmd += " --minimized"
+    return cmd
 
 
 def is_enabled():
@@ -55,7 +62,34 @@ def is_enabled():
     return os.path.exists(LAUNCH_AGENT)
 
 
-def set_enabled(enabled):
+def get_command():
+    """读取当前注册的自启动命令/配置；未注册返回 None。"""
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as k:
+                value, _ = winreg.QueryValueEx(k, APP_NAME)
+                return value
+        except OSError:
+            return None
+    if os.path.exists(LAUNCH_AGENT):
+        try:
+            with open(LAUNCH_AGENT, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return ""
+    return None
+
+
+def is_minimized():
+    """自启动是否配置为静默启动（--minimized）。未注册自启时返回 False。"""
+    cmd = get_command()
+    if not cmd:
+        return False
+    return "--minimized" in cmd
+
+
+def set_enabled(enabled, minimized=False):
     if sys.platform == "win32":
         import winreg
         try:
@@ -64,7 +98,8 @@ def set_enabled(enabled):
             raise RuntimeError(f"无法打开开机自启注册表项: {e}") from e
         try:
             if enabled:
-                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, _app_command())
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ,
+                                  _app_command(minimized))
             else:
                 try:
                     winreg.DeleteValue(key, APP_NAME)
@@ -83,8 +118,10 @@ def set_enabled(enabled):
             os.makedirs(agent_dir, exist_ok=True)
             python = sys.executable or "/usr/bin/python3"
             script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
+            minimized_arg = "\n        <string>--minimized</string>" if minimized else ""
             with open(LAUNCH_AGENT, "w", encoding="utf-8") as f:
-                f.write(_PLIST.format(python=python, script=script))
+                f.write(_PLIST.format(python=python, script=script,
+                                      minimized_arg=minimized_arg))
         else:
             if os.path.exists(LAUNCH_AGENT):
                 os.remove(LAUNCH_AGENT)

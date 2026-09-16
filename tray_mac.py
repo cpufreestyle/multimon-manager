@@ -18,15 +18,16 @@ class TrayIcon:
         self.tip = "多屏管理器"
 
     def create(self, icon_path, tip="多屏管理器", on_open=None, on_exit=None,
-               on_refresh=None):
+               on_refresh=None, on_apply_layout=None):
         """启动独立托盘子进程。
 
         on_open / on_exit 是主进程回调，这里仅用于提示，真正动作由主进程
         通过退出码 / 信号等方式感知（为简单起见，面板按钮通过 AppleScript
         激活主窗口，退出按钮直接终止主进程）。
 
-        on_refresh 仅为兼容 Windows 版托盘的统一调用签名：macOS 托盘是独立的
-        子进程面板，暂不支持"刷新显示器"回调，接收后忽略（不传会 TypeError）。
+        on_refresh / on_apply_layout 仅为兼容 Windows 版托盘的统一调用签名：
+        macOS 托盘是独立子进程面板，动作由面板自行通过 cmd_channel 下发，
+        这些回调接收后忽略（不传会 TypeError）。
         """
         self.tip = tip
         env = dict(os.environ)

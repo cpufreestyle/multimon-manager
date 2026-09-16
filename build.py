@@ -221,7 +221,18 @@ def build_windows(icon_png):
         return None
     ico = _make_ico(icon_png, os.path.join(HERE, "app.ico"))
     cmd = [sys.executable, "-m", "PyInstaller", "--noconsole", "--onefile",
-           f"--icon={ico}", f"--name={EXE_NAME}", "main.py"]
+           f"--icon={ico}", f"--name={EXE_NAME}"]
+    # 版本信息文件（exe 属性里的版本号）；文件存在才加，避免老环境构建失败
+    version_file = os.path.join(HERE, "version_info.py")
+    if os.path.exists(version_file):
+        cmd.append(f"--version-file={version_file}")
+    # 排除运行时不需要的第三方大包：resources.py 对 PIL 是可选导入（未装时
+    # 自动降级），numpy/psutil/charset_normalizer 由 PIL（或构建环境）连带
+    # 引入。本程序零第三方运行时依赖；不排除会让 exe 从 ~12MB 涨到 ~29MB，
+    # 也会拖慢每次启动的解包速度。
+    for mod in ("numpy", "psutil", "charset_normalizer", "PIL"):
+        cmd.append(f"--exclude-module={mod}")
+    cmd.append("main.py")
     print("[win]", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True, cwd=HERE)
