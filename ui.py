@@ -1006,6 +1006,9 @@ class App:
             head = f"★{i + 1}" if m.is_primary else f"{i + 1}"
             name = (m.device_name or "").strip()
             res = f"{m.width}x{m.height}"
+            pct = getattr(m, "scale_percent", 100)
+            if pct and pct != 100:
+                res += f" @{pct}%"
             if bw < 52 or bh < 22:
                 txt, size = head, 8
             elif bw < 128 or bh < 66:

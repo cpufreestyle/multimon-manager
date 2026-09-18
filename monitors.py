@@ -6,6 +6,14 @@ from ctypes import wintypes
 from dataclasses import dataclass
 
 user32 = ctypes.windll.user32
+try:
+    shcore = ctypes.windll.shcore
+    shcore.GetDpiForMonitor.argtypes = [
+        wintypes.HMONITOR, ctypes.c_int,
+        ctypes.POINTER(wintypes.UINT), ctypes.POINTER(wintypes.UINT)]
+    shcore.GetDpiForMonitor.restype = ctypes.c_long
+except Exception:  # noqa: BLE001  # Windows 8 之前没有 shcore
+    shcore = None
 
 # 枚举结果缓存（TTL=2s，避免同一次操作内重复调用 Windows API）
 _cache = {"data": None, "ts": 0}
@@ -37,6 +45,29 @@ user32.EnumDisplayMonitors.argtypes = [
 user32.EnumDisplayMonitors.restype = ctypes.c_bool
 
 
+MDT_EFFECTIVE_DPI = 0
+
+
+def effective_dpi(hmon, fallback=96):
+    """返回显示器的有效 DPI（Windows 8.1+）。失败返回 fallback（96 = 100%）。
+
+    多屏混合缩放时（例如主屏 125%、副屏 100%），窗口跨屏移动的视觉效果依赖它：
+    per-monitor DPI aware 的窗口物理尺寸固定，挪到不同 DPI 的屏上肉眼大小会变。
+    """
+    if shcore is None or not hmon:
+        return fallback
+    try:
+        dx, dy = wintypes.UINT(), wintypes.UINT()
+        hr = shcore.GetDpiForMonitor(
+            wintypes.HMONITOR(int(hmon)), MDT_EFFECTIVE_DPI,
+            ctypes.byref(dx), ctypes.byref(dy))
+        if hr == 0 and dx.value:
+            return int(dx.value)
+    except Exception:  # noqa: BLE001
+        pass
+    return fallback
+
+
 class MONITORINFOEX(ctypes.Structure):
     _fields_ = [
         ("cbSize", ctypes.c_ulong),
@@ -53,6 +84,9 @@ class MonitorInfo:
     device_name: str        # 设备名，如 \\.\DISPLAY1
     device_path: str = ""   # IDesktopWallpaper 用的监视器路径（如 \\.\DISPLAY1）
     is_primary: bool = False
+    handle: int = 0          # HMONITOR（取有效 DPI 要用）
+    dpi_x: int = 96          # 该屏的有效 DPI，96 = 100% 缩放
+    dpi_y: int = 96
     left: int = 0
     top: int = 0
     width: int = 0
@@ -65,6 +99,11 @@ class MonitorInfo:
     @property
     def rect(self):
         return (self.left, self.top, self.width, self.height)
+
+    @property
+    def scale_percent(self):
+        """显示缩放百分比（125 / 150 …），取不到 DPI 时为 100。"""
+        return int(round(self.dpi_x / 96 * 100)) if self.dpi_x else 100
 
     @property
     def work_rect(self):
@@ -88,11 +127,15 @@ def enum_monitors(force=False):
         info = MONITORINFOEX()
         info.cbSize = ctypes.sizeof(MONITORINFOEX)
         if user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+            dpi = effective_dpi(hmon)
             m = MonitorInfo(
                 index=len(monitors),
                 device_name=info.szDevice,
                 device_path=info.szDevice,
                 is_primary=bool(info.dwFlags & 1),
+                handle=int(hmon) if hmon else 0,
+                dpi_x=dpi,
+                dpi_y=dpi,
                 left=info.rcMonitor.left,
                 top=info.rcMonitor.top,
                 width=info.rcMonitor.right - info.rcMonitor.left,

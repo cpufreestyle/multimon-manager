@@ -54,6 +54,9 @@ if dwmapi is not None:
     dwmapi.DwmGetWindowAttribute.argtypes = [
         wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
     dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+# 窗口的 DPI 感知级别（Win10 1607+）。老系统上这两个 API 不存在，
+# 访问会抛 AttributeError，调用方已包 try/except，恒按「非感知」处理。
+DPI_AWARENESS_PER_MONITOR = 2
 
 # GetWindowLongPtrW 只在 64 位系统存在（32 位 Python 无 Ptr 版本）。
 # 在模块加载时声明一次即可：ctypes 的 argtypes 是函数对象上的全局状态，
@@ -208,6 +211,68 @@ def frame_insets(hwnd):
         return (0, 0, 0, 0)
 
 
+def window_is_per_monitor_aware(hwnd):
+    """窗口所属进程是否 per-monitor DPI aware。
+
+    只有这类窗口的**物理**尺寸是恒定的——挪到不同 DPI 的屏上它的像素尺寸不变、
+    肉眼大小却变了。unaware / system-aware 的窗口由系统做位图缩放，不用我们管。
+    """
+    try:
+        ctx = user32.GetWindowDpiAwarenessContext(hwnd)
+        if not ctx:
+            return False
+        return (user32.GetAwarenessFromDpiAwarenessContext(ctx)
+                == DPI_AWARENESS_PER_MONITOR)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# 跨屏移动时是否自动调整窗口尺寸（保持视觉大小 / 装不下时缩小）。
+# 界面暂不暴露开关，代码层面可用 set_resize_on_monitor_change(False) 关掉。
+_resize_on_monitor_change = True
+
+
+def set_resize_on_monitor_change(enabled):
+    """跨屏移动时是否自动缩放窗口（跨 DPI 保持肉眼大小、目标屏装不下时缩小）。"""
+    global _resize_on_monitor_change
+    _resize_on_monitor_change = bool(enabled)
+    logger.info("跨屏自动调整窗口尺寸: %s", _resize_on_monitor_change)
+
+
+def fit_size_for_monitor(hwnd, src_m, dst_m, w, h, margin=0.96):
+    """按目标屏调整窗口尺寸，返回 (new_w, new_h)。
+
+    两步：
+    1. **跨 DPI 保持视觉大小**：目标屏与源屏缩放比不同、且窗口是 per-monitor
+       DPI aware（物理尺寸不随 DPI 变），按 DPI 比例缩放，肉眼大小保持一致；
+    2. **装不下就缩小**：目标屏工作区比窗口小（例如从 4K 屏挪到 1080p 笔记本
+       屏），再等比缩到留 4% 边距，避免窗口溢到屏幕外。
+    """
+    nw, nh = max(1, int(w)), max(1, int(h))
+    if not _resize_on_monitor_change:
+        return nw, nh
+    scale = 1.0
+    try:
+        s_dpi = getattr(src_m, "dpi_x", 96) or 96
+        d_dpi = getattr(dst_m, "dpi_x", 96) or 96
+        if s_dpi != d_dpi and window_is_per_monitor_aware(hwnd):
+            scale = d_dpi / s_dpi
+    except Exception:  # noqa: BLE001
+        scale = 1.0
+    if scale != 1.0:
+        nw, nh = max(1, int(round(nw * scale))), max(1, int(round(nh * scale)))
+        logger.info("跨屏 DPI %s%% -> %s%%，窗口按 %.3f 缩放",
+                    getattr(src_m, "scale_percent", 100),
+                    getattr(dst_m, "scale_percent", 100), scale)
+    aw, ah = dst_m.work_width, dst_m.work_height
+    if aw > 0 and ah > 0 and (nw > aw or nh > ah):
+        k = min(aw * margin / max(nw, 1), ah * margin / max(nh, 1), 1.0)
+        old = (nw, nh)
+        nw, nh = max(1, int(nw * k)), max(1, int(nh * k))
+        logger.info("目标屏装不下 %s，缩小到 %s", old, (nw, nh))
+    return nw, nh
+
+
 def _verify_visible(hwnd, x, y, w, h, tol=2):
     """校验窗口可见矩形是否真的落到期望位置。
 
@@ -336,13 +401,19 @@ def move_to_monitor(hwnd, monitor, src=None, activate=True):
         if prev:
             user32.SetForegroundWindow(prev)
         return True
+    # 以下一律在「可见矩形」空间里算：GetWindowRect 含一圈透明阴影边框，
+    # 铺满工作区的窗口用它比大小会高出几个像素，被误判成「装不下」而反复缩小。
+    vx, vy, vw, vh = visible_rect(hwnd)
     # 相对位置源与目标都用工作区：此前混用「全屏矩形」与「工作区」，
     # 任务栏占据的那条会被当成可移动范围，导致跨屏后位置整体偏移。
-    rel_x = (x - src_m.work_left) / max(src_m.work_width, 1)
-    rel_y = (y - src_m.work_top) / max(src_m.work_height, 1)
-    new_x = monitor.work_left + rel_x * max(monitor.work_width - w, 0)
-    new_y = monitor.work_top + rel_y * max(monitor.work_height - h, 0)
-    ok = set_window_rect(hwnd, new_x, new_y, w, h, activate=activate)
+    rel_x = (vx - src_m.work_left) / max(src_m.work_width, 1)
+    rel_y = (vy - src_m.work_top) / max(src_m.work_height, 1)
+    # 尺寸按目标屏修正：跨 DPI 保持肉眼大小，且保证装得进目标屏工作区
+    nw, nh = fit_size_for_monitor(hwnd, src_m, monitor, vw, vh)
+    new_x = monitor.work_left + rel_x * max(monitor.work_width - nw, 0)
+    new_y = monitor.work_top + rel_y * max(monitor.work_height - nh, 0)
+    ok = set_window_rect(hwnd, new_x, new_y, nw, nh,
+                         activate=activate, exact=True)
     if not ok:
         logger.warning("move_to_monitor: SetWindowPos 失败 (hwnd=%s)", hwnd)
     return ok
