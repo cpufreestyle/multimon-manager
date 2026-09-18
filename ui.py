@@ -13,6 +13,7 @@ import layouts
 import scenarios
 import snap_preview
 import rules
+import slideshow
 import cmd_channel
 
 VK_LEFT = b.VK_LEFT
@@ -71,6 +72,9 @@ class App:
         self.refresh_monitors()
         self._start_command_poll()
         self.root.after(1500, self._poll_rules)
+        # 壁纸幻灯片：恢复上次的启用状态（若有图片则续跑调度）
+        self._slideshow_job = None
+        self.root.after(2000, self._slideshow_restore)
         # 窗口大小变化时防抖重绘布局图，并设最小尺寸避免控件被压坏
         self.root.minsize(660, 520)
         self._resize_job = None
@@ -228,6 +232,36 @@ class App:
         ttk.Combobox(fit, textvariable=self.fit_var, values=list(b.POSITION.keys()),
                      width=10, state="readonly").pack(side="left", padx=4)
         ttk.Button(f, text="应用壁纸", command=self.apply_wallpaper).pack(anchor="e", pady=4)
+
+        # ---- 壁纸幻灯片：按间隔自动轮换一组图片（纯标准库，主线程定时器驱动）----
+        sf = ttk.LabelFrame(f, text="幻灯片")
+        sf.pack(fill="x", padx=4, pady=(2, 4))
+        row1 = ttk.Frame(sf)
+        row1.pack(fill="x", padx=4, pady=2)
+        ttk.Button(row1, text="添加图片", command=self._slideshow_add).pack(side="left")
+        ttk.Button(row1, text="清空", command=self._slideshow_clear).pack(side="left", padx=4)
+        ttk.Button(row1, text="立即切换",
+                   command=self._slideshow_next_now).pack(side="left", padx=4)
+        ttk.Label(row1, text="间隔(分):").pack(side="left", padx=(8, 2))
+        self.slideshow_interval_var = tk.StringVar(value="5")
+        ttk.Entry(row1, textvariable=self.slideshow_interval_var, width=4).pack(side="left")
+        self.slideshow_shuffle_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row1, text="随机",
+                        variable=self.slideshow_shuffle_var).pack(side="left", padx=6)
+        self.slideshow_enabled_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row1, text="启用", variable=self.slideshow_enabled_var,
+                        command=self._slideshow_toggle).pack(side="left", padx=6)
+
+        self.slideshow_list = tk.Listbox(sf, height=3, activestyle="none")
+        self.slideshow_list.pack(fill="x", padx=4, pady=2)
+        row2 = ttk.Frame(sf)
+        row2.pack(fill="x", padx=4, pady=(0, 2))
+        ttk.Button(row2, text="移除选中",
+                   command=self._slideshow_remove_selected).pack(side="left")
+        self.slideshow_status_var = tk.StringVar(value="")
+        ttk.Label(row2, textvariable=self.slideshow_status_var,
+                  foreground="#666").pack(side="left", padx=8)
+        self._slideshow_refresh()
 
     def _on_mode(self):
         if self.mode_var.get() == "per":
@@ -1377,6 +1411,8 @@ class App:
                    command=lambda: self._import_rule_template(False)).pack(side="left", padx=2)
         ttk.Button(form3, text="替换导入",
                    command=lambda: self._import_rule_template(True)).pack(side="left", padx=2)
+        ttk.Button(form3, text="从当前窗口学习",
+                   command=self._learn_rules_from_windows).pack(side="left", padx=(10, 2))
 
         self.rules_auto = tk.BooleanVar(
             value=bool(settings.load().get("rules_auto_apply", False)))
@@ -1403,6 +1439,161 @@ class App:
             return
         self._refresh_rule_list()
         self.status_var.set(f"已导入模板「{name}」：新增 {added} 条，当前共 {total} 条")
+
+    def _learn_rules_from_windows(self):
+        """从当前窗口布局一键生成规则（同应用名只取一次，按所在屏 + 位置推断）。"""
+        try:
+            wins = [w for w in b.list_target_windows()
+                    if not self._is_own_window(w.get("owner"))]
+        except Exception:  # noqa: BLE001
+            wins = []
+        learned = rules.learn_from_windows(self.monitors, wins)
+        if not learned:
+            self.status_var.set("未发现可学习的窗口（需已授权、且能枚举到窗口）")
+            return
+        added, total = rules.add_rules(learned)
+        self._refresh_rule_list()
+        self.status_var.set(
+            f"已从当前窗口学习：识别 {len(learned)} 个应用，新增 {added} 条规则（共 {total} 条）")
+
+    # ---------- 壁纸幻灯片 ----------
+    def _slideshow_refresh(self):
+        """把幻灯片配置同步到 UI 控件。"""
+        try:
+            cfg = slideshow.get_config()
+        except Exception:  # noqa: BLE001
+            return
+        self.slideshow_enabled_var.set(cfg["enabled"])
+        self.slideshow_shuffle_var.set(cfg["shuffle"])
+        try:
+            self.slideshow_interval_var.set(str(max(1, cfg["interval"] // 60)))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.slideshow_list.delete(0, "end")
+            cur = slideshow.current_path()
+            for p in cfg["items"]:
+                mark = "★ " if (cur and p == cur) else "   "
+                self.slideshow_list.insert("end", mark + os.path.basename(p))
+            state = "已启用" if cfg["enabled"] else "未启用"
+            extra = f"，当前：{os.path.basename(cur)}" if cur else ""
+            self.slideshow_status_var.set(f"{len(cfg['items'])} 张｜{state}{extra}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _slideshow_minutes(self):
+        """读取间隔输入框（分钟），非法时回退 5 分钟。"""
+        try:
+            return max(1, int(float(self.slideshow_interval_var.get() or "5")))
+        except Exception:  # noqa: BLE001
+            return 5
+
+    def _slideshow_schedule(self, secs):
+        """（重新）安排下一次切换：主线程 after，安全且随窗口关闭自动取消。"""
+        self._slideshow_cancel()
+        try:
+            self._slideshow_job = self.root.after(max(10, int(secs)) * 1000,
+                                                  self._slideshow_tick)
+        except Exception:  # noqa: BLE001
+            self._slideshow_job = None
+
+    def _slideshow_cancel(self):
+        if self._slideshow_job is not None:
+            try:
+                self.root.after_cancel(self._slideshow_job)
+            except Exception:  # noqa: BLE001
+                pass
+            self._slideshow_job = None
+
+    def _slideshow_toggle(self):
+        """启用/停用自动轮换。"""
+        enabled = self.slideshow_enabled_var.get()
+        cfg = slideshow.set_config(
+            enabled=enabled,
+            interval=self._slideshow_minutes() * 60,
+            shuffle=self.slideshow_shuffle_var.get(),
+            position=self.fit_var.get() or "fill",
+        )
+        if enabled and cfg["items"]:
+            self._slideshow_schedule(cfg["interval"])
+            self.status_var.set(f"幻灯片已启用：每 {cfg['interval'] // 60} 分钟切换")
+        else:
+            self._slideshow_cancel()
+            self.status_var.set("幻灯片无图片，请先「添加图片」" if enabled else "幻灯片已停用")
+        self._slideshow_refresh()
+
+    def _slideshow_tick(self):
+        """定时切换壁纸（主线程执行）。"""
+        self._slideshow_job = None
+        try:
+            cfg = slideshow.get_config()
+        except Exception:  # noqa: BLE001
+            return
+        if not cfg["enabled"] or not cfg["items"]:
+            return
+        p = slideshow.next_path()
+        if p:
+            try:
+                b.apply_single(p, cfg["position"])
+            except Exception:  # noqa: BLE001
+                pass
+        self._slideshow_refresh()
+        self._slideshow_schedule(cfg["interval"])
+
+    def _slideshow_next_now(self):
+        """立即切到下一张（不影响既有调度）。"""
+        p = slideshow.next_path()
+        if not p:
+            self.status_var.set("幻灯片没有图片，请先添加")
+            return
+        try:
+            b.apply_single(p, slideshow.get_config()["position"])
+        except Exception:  # noqa: BLE001
+            pass
+        self._slideshow_refresh()
+        self.status_var.set(f"已切换到：{os.path.basename(p)}")
+
+    def _slideshow_add(self):
+        """选择图片加入幻灯片。"""
+        paths = filedialog.askopenfilenames(
+            title="选择幻灯片图片",
+            filetypes=[("图片", "*.jpg;*.jpeg;*.png;*.bmp")])
+        if not paths:
+            return
+        try:
+            cfg = slideshow.add_items(list(paths))
+        except Exception:  # noqa: BLE001
+            self.status_var.set("添加图片失败")
+            return
+        self._slideshow_refresh()
+        self.status_var.set(f"已添加：共 {len(cfg['items'])} 张")
+
+    def _slideshow_clear(self):
+        """清空幻灯片图片并停止调度。"""
+        slideshow.clear_items()
+        self._slideshow_cancel()
+        self._slideshow_refresh()
+        self.status_var.set("幻灯片已清空")
+
+    def _slideshow_remove_selected(self):
+        """移除列表中选中的图片。"""
+        idx = self._selected_index(self.slideshow_list)
+        if idx is None:
+            self.status_var.set("请先在幻灯片列表中选中一张")
+            return
+        slideshow.remove_item(idx)
+        self._slideshow_refresh()
+        self.status_var.set("已移除该图片")
+
+    def _slideshow_restore(self):
+        """启动后恢复：同步 UI，并在上次为启用状态时续跑调度。"""
+        self._slideshow_refresh()
+        try:
+            cfg = slideshow.get_config()
+        except Exception:  # noqa: BLE001
+            return
+        if cfg["enabled"] and cfg["items"]:
+            self._slideshow_schedule(cfg["interval"])
 
     def _refresh_rule_list(self):
         self.rule_rows.delete(0, "end")

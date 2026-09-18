@@ -192,3 +192,77 @@ def apply_template(name, replace=False):
         })
     save_rules(items)
     return len(tpl), len(items)
+
+
+# ---------- 从当前窗口布局学习规则 ----------
+def _guess_zone(win, mon):
+    """按窗口在显示器工作区内的相对位置推断位置预设。"""
+    x, y = win.get("x"), win.get("y")
+    w, h = win.get("w") or 0, win.get("h") or 0
+    if x is None or y is None or w <= 0 or h <= 0:
+        return "full"
+    ww = max(mon.work_width, 1)
+    wh = max(mon.work_height, 1)
+    rx = (x - mon.work_left) / ww
+    ry = (y - mon.work_top) / wh
+    rw = w / ww
+    rh = h / wh
+    tol = 0.12
+    if rw <= 0.58 and rx <= tol:
+        return "left"
+    if rw <= 0.58 and rx + rw >= 1 - tol:
+        return "right"
+    if rh <= 0.58 and ry <= tol:
+        return "top"
+    if rh <= 0.58 and ry + rh >= 1 - tol:
+        return "bottom"
+    return "full"
+
+
+def learn_from_windows(monitors, wins):
+    """从当前窗口布局反推一组规则（同一应用名只取一次）。
+
+    返回规则列表（**不持久化**），字段与规则引擎一致；`monitor` 取该窗口所在屏，
+    因此规则会把它钉回原来的屏，`zone` 按当前位置推断。
+    """
+    learned = []
+    seen = set()
+    for win in wins or []:
+        owner = (win.get("owner") or "").strip()
+        if not owner:
+            continue
+        key = owner.lower()
+        if key in seen:
+            continue
+        mon = _monitor_of_window(monitors, win)
+        if mon is None:
+            continue
+        seen.add(key)
+        learned.append({
+            "enabled": True,
+            "field": "owner",
+            "pattern": owner,
+            "regex": False,
+            "monitor": mon.device_path,
+            "zone": _guess_zone(win, mon),
+        })
+    return learned
+
+
+def add_rules(new_rules):
+    """批量追加规则，跳过与现有规则完全重复的条目。返回 (新增条数, 总条数)。"""
+    items = list_rules()
+    added = 0
+    for r in new_rules or []:
+        dup = any(
+            it.get("field") == r.get("field")
+            and (it.get("pattern") or "").lower() == (r.get("pattern") or "").lower()
+            and it.get("monitor") == r.get("monitor")
+            and it.get("zone") == r.get("zone")
+            for it in items
+        )
+        if not dup:
+            items.append(dict(r))
+            added += 1
+    save_rules(items)
+    return added, len(items)

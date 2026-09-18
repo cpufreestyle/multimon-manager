@@ -3,28 +3,69 @@
 用于持久化用户偏好（如全局快捷键的修饰键组合），读写失败时静默降级，
 不影响主流程。
 """
+import copy
 import json
 import os
+import tempfile
 
 _PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
+# 读缓存：(mtime_ns, size) -> 已解析数据。
+# UI 轮询（1.5s）里频繁调用 load()，缓存可避免反复读盘/解析；用 (mtime_ns, size)
+# 作失效依据，能感知托盘子进程等其它进程对文件的写入。
+_cache = {"stat": None, "data": None}
+
+
+def _file_stat():
+    try:
+        st = os.stat(_PATH)
+        return (st.st_mtime_ns, st.st_size)
+    except Exception:  # noqa: BLE001
+        return None
+
 
 def load():
-    """返回设置字典；文件不存在或解析失败时返回空字典。"""
+    """返回设置字典；文件不存在或解析失败时返回空字典。
+
+    带 (mtime_ns, size) 缓存，**始终返回深拷贝**：调用方常直接原地修改返回值
+    (load → 改 → save)，若共享同一对象会污染缓存，导致未保存的改动提前生效。
+    """
+    st = _file_stat()
+    if st is not None and st == _cache["stat"] and _cache["data"] is not None:
+        return copy.deepcopy(_cache["data"])
+    data = {}
     try:
         with open(_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            data = loaded
     except Exception:  # noqa: BLE001
-        return {}
+        data = {}
+    _cache["stat"] = st
+    _cache["data"] = data
+    return copy.deepcopy(data)
 
 
 def save(data):
-    """覆盖写入设置字典；失败时静默忽略。"""
+    """原子写入设置字典：先写临时文件再替换，避免半写导致配置损坏。
+
+    失败时回退为直接写；两种情况都静默忽略异常（不影响主流程）。
+    """
     try:
-        with open(_PATH, "w", encoding="utf-8") as f:
+        d = os.path.dirname(_PATH)
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".settings.", suffix=".tmp", dir=d)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _PATH)
     except Exception:  # noqa: BLE001
-        pass
+        try:
+            with open(_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001
+            return
+    _cache["stat"] = _file_stat()
+    _cache["data"] = copy.deepcopy(data)
 
 
 # ── 配置导入 / 导出（F8）──
