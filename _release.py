@@ -22,8 +22,8 @@ import zipfile
 import subprocess
 
 TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-TAG = "v0.3.1"
-TITLE = "v0.3.1 — 分屏无缝贴合 / 窗口列表过滤 / 最大化跨屏保持"
+TAG = "v0.3.2"
+TITLE = "v0.3.2 — 跨屏尺寸自适应 / 缩放比显示"
 REPO = "cpufreestyle/multimon-manager"
 BRANCH = "master"
 API = f"https://api.github.com/repos/{REPO}"
@@ -32,28 +32,31 @@ API = f"https://api.github.com/repos/{REPO}"
 PROXY_CANDIDATES = [os.environ.get("HTTPS_PROXY"), os.environ.get("https_proxy"),
                     "http://127.0.0.1:7897", "http://127.0.0.1:10809", None]
 
-RELEASE_BODY = """## v0.3.1 更新内容
+RELEASE_BODY = """## v0.3.2 更新内容
 
-> Windows 端一轮针对性优化：把分屏真正做「贴合」，并把窗口列表里的噪音清掉。
+> 接着 v0.3.1 把「窗口挪到另一块屏」这件事做完整：缩放比不同的屏之间保持肉眼大小，
+> 分辨率差太多时自动缩小，顺便修掉一个会让窗口每次跨屏都缩一圈的问题。
 
-### 修复与优化（Windows）
-- **分屏 / 并排不再留缝**：Windows 10/11 的 `GetWindowRect` 含一圈约 8px 的透明阴影边框，
-  以前直接按它摆放，并排的两个窗口之间会露出十几像素的缝，贴边时也会离屏幕边缘一截。
-  现在用 `DWMWA_EXTENDED_FRAME_BOUNDS` 取真实可见矩形做补偿（新增 `frame_insets` /
-  `visible_rect`，`set_window_rect(..., exact=True)`）——实测左右半屏间隙从 16px 降到 0
-- **最大化窗口跨屏仍是最大化**：以前 `SetWindowPos` 会把最大化「打破」成一个铺满的普通
-  大窗口；现在先落到目标屏再重新最大化
-- **跨屏相对位置不再偏移**：源屏与目标屏此前混用「全屏矩形」和「工作区」计算比例，
-  任务栏占的那条被当成可移动范围；现在两边统一用工作区
-- **分屏对最大化 / 最小化窗口生效**：先还原再摆放；不抢焦点模式下会把焦点还给原前台窗口
-- **窗口列表清掉噪音**：剔除 15 类系统壳窗口（任务栏 / 桌面 / 开始菜单 / `CoreWindow` 等）、
-  被 DWM 隐藏的挂起窗口（UWP 后台应用）以及最小化窗口
-- **固定目标被最小化后仍可操作**：`_find_window` 不再走过滤后的列表，避免目标「消失」
-- **枚举更快**：进程名按 PID 缓存，不再每次刷新都对每个窗口 `OpenProcess`
-- **壁纸更稳**：`SetWallpaper` / `SetPosition` 现在校验 HRESULT，失败时回退
-  `SystemParametersInfoW` 单屏方案（以前会静默失败）
-- **热键即时生效**：消息线程运行中新增的键位会立即补注册，不用重启程序
-- 摆放结果会校验可见矩形并在异常时记日志（最小尺寸限制 / UIPI 权限拦截可据此识别）
+### 新增（Windows）
+- **跨屏缩放比自适应**：壁纸可视化现在会标出每块屏的缩放比（`1920x1080 @125%`）。
+  窗口跨屏移动时，若目标屏缩放比不同、且该窗口是 per-monitor DPI aware
+  （这类窗口的物理尺寸不随缩放变化），会按 DPI 比例缩放，**保持肉眼大小一致**。
+  DPI-unaware / system-aware 的窗口由系统自己做拉伸，程序不干预，避免双重缩放
+- **装不下就缩小**：目标屏工作区比窗口小（例如从 4K 屏挪到 1080p 笔记本屏），
+  会等比缩到留 4% 边距，不再让窗口溢出到屏幕外
+
+### 修复
+- **修掉跨屏累积缩小**：`move_to_monitor` 原来用 `GetWindowRect` 判断窗口是否装得进
+  目标屏。但 `GetWindowRect` 含一圈透明阴影边框（v0.3.1 已确认约 8px），铺满工作区的
+  窗口用它比大小会「高」出几个像素，于是每次跨屏都被判定装不下而缩一圈——
+  实测一个半屏窗口 `976x1028 → 929x979`，连挪几次会越来越小。
+  现在位置与尺寸统一在**可见矩形**空间里计算，不再累积缩小
+
+### 实现要点
+- `monitors.py`：记录每块屏的 `HMONITOR` 与有效 DPI（`GetDpiForMonitor`），
+  新增 `effective_dpi()` 与 `MonitorInfo.scale_percent`
+- `windows.py`：新增 `window_is_per_monitor_aware()`、`fit_size_for_monitor()`，
+  以及开关 `set_resize_on_monitor_change()`（默认开启）
 
 ### 附件
 - MultiMonManager.exe：主程序（单文件，可直接运行）
