@@ -7,7 +7,10 @@
 窗口→显示器的归属判定与条几何计算都是纯函数（split_windows_by_monitor /
 bar_geometry / short_title），可在不创建 Tk 窗口的情况下单测。
 """
+import logging
 import tkinter as tk
+
+logger = logging.getLogger(__name__)
 
 BAR_HEIGHT = 30
 BAR_MAX_WIDTH = 900
@@ -83,6 +86,19 @@ def bar_geometry(mon, position="bottom", height=BAR_HEIGHT,
     else:
         y = int(mon.top + mon.height - height - margin)
     return x, y, width, height
+
+
+def geometry_string(x, y, w, h):
+    """生成 Tk geometry 字符串，**必须正确支持负坐标**。
+
+    Tk 语法为 `WxH±X±Y`：坐标可直接带负号，但**不能**写成 `+-38`。
+    副屏位于主屏左侧 / 上方时（macOS 极常见）x 或 y 为负，用 `+%d` 拼接会得到
+    `900x30+350+-38`，Tk 会抛 TclError —— 真机验证时正是这个原因导致两个屏
+    的任务栏根本没被创建出来。
+    """
+    xs = "+%d" % x if x >= 0 else "%d" % x
+    ys = "+%d" % y if y >= 0 else "%d" % y
+    return "%dx%d%s%s" % (w, h, xs, ys)
 
 
 class TaskBar:
@@ -161,7 +177,7 @@ class TaskBar:
         try:
             top = tk.Toplevel(self.root)
             top.overrideredirect(True)
-            top.geometry("%dx%d+%d+%d" % bar_geometry(mon, self.position))
+            top.geometry(geometry_string(*bar_geometry(mon, self.position)))
             try:
                 top.attributes("-topmost", True)
                 top.attributes("-alpha", 0.94)
@@ -171,12 +187,14 @@ class TaskBar:
             frame.pack(fill="both", expand=True)
             return {"top": top, "frame": frame, "sig": None}
         except Exception:  # noqa: BLE001
+            # 不能静默吞掉：负坐标 / 权限等问题会让该屏任务栏不出现且毫无提示
+            logger.warning("创建任务栏失败（该屏将不显示任务栏）", exc_info=True)
             return None
 
     def _fill(self, bar, mon, items):
         top, frame = bar["top"], bar["frame"]
         try:
-            top.geometry("%dx%d+%d+%d" % bar_geometry(mon, self.position))
+            top.geometry(geometry_string(*bar_geometry(mon, self.position)))
         except Exception:  # noqa: BLE001
             pass
         for child in frame.winfo_children():
