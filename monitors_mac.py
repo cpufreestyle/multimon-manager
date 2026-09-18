@@ -327,8 +327,13 @@ def invalidate_monitors_cache():
     _mon_cache["data"] = None
 
 
-def enum_monitors(force=False):
-    """枚举所有活跃显示器，返回 MonitorInfo 列表（带 2s 缓存）。"""
+def enum_monitors(force=False, work=True):
+    """枚举所有活跃显示器，返回 MonitorInfo 列表（带 2s 缓存）。
+
+    work=True 时按 NSScreen.visibleFrame 填充工作区（NSScreen 为 Cocoa 调用，
+    应在主线程上下文使用）；work=False 时跳过工作区计算，仅用 CoreGraphics 几何，
+    可在后台线程安全调用（壁纸设置即走此路径）。
+    """
     now = time.monotonic()
     if not force and _mon_cache["data"] is not None and now - _mon_cache["ts"] < _CACHE_TTL:
         # 缓存命中也必须返回深拷贝：调用方可能修改 MonitorInfo 字段，
@@ -425,8 +430,9 @@ def enum_monitors(force=False):
             work_height=cg["height"],
         ))
 
-    # 工作区：逐屏取系统真实可见区域（扣除菜单栏 / Dock）
-    _compute_work_areas(monitors)
+    # 工作区：逐屏取系统真实可见区域（扣除菜单栏 / Dock）；后台线程调用时跳过
+    if work:
+        _compute_work_areas(monitors)
 
     _mon_cache["data"] = monitors
     _mon_cache["ts"] = now

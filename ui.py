@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
@@ -1505,6 +1506,33 @@ class App:
                 pass
             self._slideshow_job = None
 
+    def _apply_single_async(self, path, position, on_done=None):
+        """后台应用单张壁纸（macOS 走线程，Windows 同步），完成后回主线程回调。
+
+        壁纸应用是 osascript 子进程（macOS）或 COM 调用，耗时 0.3~1s；放后台可避免
+        幻灯片轮播 / 立即切换时主界面冻结。Windows 端 COM 跨线程不安全，保持同步。
+        """
+        def _work():
+            try:
+                b.apply_single(path, position)
+                ok, err = True, None
+            except Exception as e:  # noqa: BLE001
+                ok, err = False, e
+            self.root.after(0, self._on_apply_single_done, ok, err, on_done)
+        if b.IS_MAC:
+            threading.Thread(target=_work, daemon=True).start()
+        else:
+            _work()
+
+    def _on_apply_single_done(self, ok, err, on_done):
+        if err is not None:
+            self.status_var.set("应用壁纸失败")
+        if on_done is not None:
+            try:
+                on_done(ok, err)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _slideshow_toggle(self):
         """启用/停用自动轮换。"""
         enabled = self.slideshow_enabled_var.get()
@@ -1523,7 +1551,7 @@ class App:
         self._slideshow_refresh()
 
     def _slideshow_tick(self):
-        """定时切换壁纸（主线程执行）。"""
+        """定时切换壁纸：切换动作放后台线程，避免主界面冻结。"""
         self._slideshow_job = None
         try:
             cfg = slideshow.get_config()
@@ -1532,26 +1560,33 @@ class App:
         if not cfg["enabled"] or not cfg["items"]:
             return
         p = slideshow.next_path()
-        if p:
-            try:
-                b.apply_single(p, cfg["position"])
-            except Exception:  # noqa: BLE001
-                pass
-        self._slideshow_refresh()
-        self._slideshow_schedule(cfg["interval"])
+        position = cfg["position"]
+        interval = cfg["interval"]
+        if not p:
+            self._slideshow_refresh()
+            self._slideshow_schedule(interval)
+            return
+
+        def _after(ok, err):
+            self._slideshow_refresh()
+            self._slideshow_schedule(interval)
+
+        self._apply_single_async(p, position, on_done=_after)
 
     def _slideshow_next_now(self):
-        """立即切到下一张（不影响既有调度）。"""
+        """立即切到下一张（不影响既有调度）；切换动作放后台线程。"""
         p = slideshow.next_path()
         if not p:
             self.status_var.set("幻灯片没有图片，请先添加")
             return
-        try:
-            b.apply_single(p, slideshow.get_config()["position"])
-        except Exception:  # noqa: BLE001
-            pass
-        self._slideshow_refresh()
-        self.status_var.set(f"已切换到：{os.path.basename(p)}")
+        position = slideshow.get_config()["position"]
+        self.status_var.set(f"正在切换：{os.path.basename(p)}")
+
+        def _after(ok, err):
+            self._slideshow_refresh()
+            self.status_var.set(f"已切换到：{os.path.basename(p)}")
+
+        self._apply_single_async(p, position, on_done=_after)
 
     def _slideshow_add(self):
         """选择图片加入幻灯片。"""
@@ -1890,6 +1925,9 @@ class App:
         return mapping, position
 
     def apply_wallpaper(self):
+        """应用壁纸。耗时操作（macOS 上 osascript 子进程约 0.3~1s）放后台线程，
+        避免按钮点击时主界面冻结；Windows 因 COM 跨线程不安全故保持同步。
+        """
         mapping, position = self._current_mapping()
         if not mapping:
             messagebox.showwarning("提示", "请先为显示器选择图片")
@@ -1907,14 +1945,35 @@ class App:
                     "提示",
                     f"有 {len(self.monitors) - len(mapping)} 块显示器未选择图片，"
                     "将保持当前壁纸。")
-        try:
-            if self.mode_var.get() == "single":
-                ok = b.apply_single(self.single_var.get(), position)
-            else:
-                ok = b.apply_per_monitor(mapping, position)
-            messagebox.showinfo("完成", "壁纸已应用" if ok else "已用回退方式应用(单屏)")
-        except Exception as e:  # noqa: BLE001
-            messagebox.showerror("错误", f"应用壁纸失败:\n{e}")
+        use_single = self.mode_var.get() == "single"
+        # 在主线程读取参数值后传入后台线程（线程内只读，避免共享 UI 状态）
+        src = self.single_var.get() if use_single else mapping
+        self.status_var.set("正在应用壁纸…")
+
+        def _work():
+            try:
+                if use_single:
+                    ok = b.apply_single(src, position)
+                else:
+                    ok = b.apply_per_monitor(src, position)
+                err = None
+            except Exception as e:  # noqa: BLE001
+                ok, err = False, e
+            self.root.after(0, self._wallpaper_applied, ok, err)
+
+        if b.IS_MAC:
+            threading.Thread(target=_work, daemon=True).start()
+        else:
+            _work()
+
+    def _wallpaper_applied(self, ok, err):
+        """壁纸应用完成的回调（主线程执行）。"""
+        if err is not None:
+            messagebox.showerror("错误", f"应用壁纸失败:\n{err}")
+            self.status_var.set("应用壁纸失败")
+            return
+        messagebox.showinfo("完成", "壁纸已应用" if ok else "已用回退方式应用(单屏)")
+        self.status_var.set("壁纸已应用")
 
     def _refresh_profile_list(self):
         self.profile_combo["values"] = list(profiles.load_profiles().keys())

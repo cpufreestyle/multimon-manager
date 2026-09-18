@@ -192,7 +192,9 @@ def set_per_monitor(mapping, position="fill"):
     """
     if not mapping:
         return False
-    mons = monitors.enum_monitors()
+    # 后台线程调用时（UI 把壁纸应用放到了线程里）必须跳过 NSScreen 工作区计算，
+    # 这里只按 device_path 匹配，不需要精确 work_rect，故 work=False
+    mons = monitors.enum_monitors(work=False)
     if not mons:
         logger.warning("未检测到显示器，无法设置每屏壁纸")
         return False
