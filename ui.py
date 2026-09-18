@@ -15,7 +15,11 @@ import scenarios
 import snap_preview
 import rules
 import slideshow
+import taskbar
 import cmd_channel
+
+# 多屏任务栏：界面显示值 → 内部位置值
+TASKBAR_POS = {"底部": "bottom", "顶部": "top"}
 
 VK_LEFT = b.VK_LEFT
 VK_UP = b.VK_UP
@@ -135,6 +139,7 @@ class App:
         # 所有分区统一挂到同一个容器（不再分页）
         self._build_getting_started(self.body)
         self._build_window_tools(self.body)
+        self._build_taskbar(self.body)
         self._build_wallpaper(self.body)
         self._build_profiles(self.body)
         self._build_layouts(self.body)
@@ -556,6 +561,88 @@ class App:
             b.open_accessibility_settings()
         except Exception:  # noqa: BLE001
             pass
+
+    # ---------- 多屏任务栏 ----------
+    def _build_taskbar(self, parent):
+        """每块显示器一个细条：列出该屏窗口，可点击激活、◀ ▶ 移到相邻屏。"""
+        s = settings.load()
+        enabled = bool(s.get("taskbar_enabled", False))
+        position = s.get("taskbar_position", "底部")
+        self.taskbar_enabled_var = tk.BooleanVar(value=enabled)
+        self.taskbar_pos_var = tk.StringVar(
+            value=position if position in TASKBAR_POS else "底部")
+        self._taskbar = None
+        self._taskbar_job = None
+
+        f = ttk.LabelFrame(parent, text="多屏任务栏")
+        f.pack(fill="x", padx=6, pady=(4, 8), anchor="n")
+        ttk.Checkbutton(f, text="启用（每块显示器显示一条窗口列表）",
+                        variable=self.taskbar_enabled_var,
+                        command=self._taskbar_toggle).pack(anchor="w", padx=4, pady=2)
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row, text="位置:").pack(side="left")
+        ttk.Combobox(row, textvariable=self.taskbar_pos_var, width=6, state="readonly",
+                     values=list(TASKBAR_POS)).pack(side="left", padx=2)
+        ttk.Label(row, text="点窗口名激活；◀ ▶ 把选中窗口移到相邻显示器",
+                  foreground="#666").pack(side="left", padx=8)
+        if enabled:
+            self._taskbar_toggle()
+        # 轮询刷新（仅启用时才真正枚举窗口）
+        self.root.after(3000, self._poll_taskbar)
+
+    def _taskbar_toggle(self):
+        """启用 / 停用任务栏，并把偏好写入设置。"""
+        enabled = self.taskbar_enabled_var.get()
+        st = settings.load()
+        st["taskbar_enabled"] = enabled
+        st["taskbar_position"] = self.taskbar_pos_var.get()
+        settings.save(st)
+        if not enabled:
+            if self._taskbar is not None:
+                self._taskbar.destroy()
+                self._taskbar = None
+            self.status_var.set("多屏任务栏已停用")
+            return
+        self._ensure_taskbar()
+        self.status_var.set("多屏任务栏已启用（列出窗口需辅助功能授权）")
+
+    def _ensure_taskbar(self):
+        """确保任务栏实例存在并可见。"""
+        if self._taskbar is None:
+            self._taskbar = taskbar.TaskBar(
+                self.root, on_focus=self._taskbar_focus, on_move=self._taskbar_move,
+                position=TASKBAR_POS.get(self.taskbar_pos_var.get(), "bottom"))
+        self._taskbar.set_position(TASKBAR_POS.get(self.taskbar_pos_var.get(), "bottom"))
+        self._taskbar.show()
+
+    def _poll_taskbar(self):
+        """主线程轮询：刷新多屏任务栏（仅启用时才枚举窗口，避免无谓开销）。"""
+        self._taskbar_job = None
+        try:
+            if (getattr(self, "taskbar_enabled_var", None) is not None
+                    and self.taskbar_enabled_var.get()):
+                self._ensure_taskbar()
+                self._taskbar.refresh(self.monitors, b.list_target_windows())
+        except Exception:  # noqa: BLE001
+            pass
+        self.root.after(3000, self._poll_taskbar)
+
+    def _taskbar_focus(self, win):
+        """激活任务栏上点击的窗口（沿用原几何，仅前置）。"""
+        try:
+            b.set_window_rect(win["hwnd"], win["x"], win["y"], win["w"], win["h"],
+                              activate=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _taskbar_move(self, win, target_mon):
+        """把窗口移到相邻显示器。"""
+        try:
+            b.move_to_monitor(win["hwnd"], target_mon)
+            self.status_var.set("已移动窗口到其他显示器（可用「撤销」还原）")
+        except Exception:  # noqa: BLE001
+            self.status_var.set("移动窗口失败")
 
     # ---------- 上手建议卡片 ----------
     def _build_getting_started(self, parent):
