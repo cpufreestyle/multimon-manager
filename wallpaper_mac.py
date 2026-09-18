@@ -59,13 +59,14 @@ def _apply_placement(position="fill"):
 
     自适应探测：不同 macOS 版本表结构有差异，仅当 data 表含 key/value 列时才写；
     若支持 picture_id 则逐显示器写入，否则写全局。任何异常都只告警不抛出。
+    返回 (changed, ok)：是否实际修改了数据 / 是否确认全部已是目标值。
     """
     placement = _PLACEMENT.get(position)
     if not placement:
-        return False
+        return False, False
     if not os.path.exists(_DB_PATH):
         logger.info("desktoppicture.db 尚不存在，跳过填充方式设置")
-        return False
+        return False, False
 
     con = None
     try:
@@ -73,7 +74,7 @@ def _apply_placement(position="fill"):
         cols = _table_columns(con, "data")
         if not {"key", "value"}.issubset(cols):
             logger.warning("desktoppicture.db 结构非预期（data 列：%s），跳过填充方式设置", cols)
-            return False
+            return False, False
 
         if "picture_id" in cols:
             rows = con.execute("SELECT DISTINCT picture_id FROM data").fetchall()
@@ -81,7 +82,23 @@ def _apply_placement(position="fill"):
         else:
             picture_ids = [None]
 
+        def _current(pid):
+            if pid is None:
+                row = con.execute(
+                    "SELECT value FROM data WHERE key=?", ("Placement",)).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT value FROM data WHERE key=? AND picture_id=?",
+                    ("Placement", pid)).fetchone()
+            return row[0] if row else None
+
+        # 已全部是目标值 → 不写库（调用方也就无需重启 Dock）
+        if all(_current(pid) == placement for pid in picture_ids):
+            return False, True
+
         for pid in picture_ids:
+            if _current(pid) == placement:
+                continue
             if pid is None:
                 cur = con.execute("UPDATE data SET value=? WHERE key=?", (placement, "Placement"))
                 if cur.rowcount == 0:
@@ -98,10 +115,10 @@ def _apply_placement(position="fill"):
                         ("Placement", placement, pid),
                     )
         con.commit()
-        return True
+        return True, True
     except Exception as e:  # noqa: BLE001
         logger.warning("设置填充方式失败: %s", e)
-        return False
+        return False, False
     finally:
         if con is not None:
             try:
@@ -111,13 +128,19 @@ def _apply_placement(position="fill"):
 
 
 def _finish(position="fill"):
-    """收尾：确保数据库存在 → 写填充方式 → 重启 Dock 统一生效。"""
+    """收尾：仅在填充方式需要变更时写库并重启 Dock。
+
+    AppleScript 设置壁纸图片**立即生效**，重启 Dock 只是为了让 Placement（填充
+    方式）生效；旧实现每次换壁纸都 killall Dock，桌面图标会闪一下，还顺带
+    阻塞主线程。现在：填充方式未变化 → 既不写库也不重启 Dock。
+    """
     if not os.path.exists(_DB_PATH):
         # 首次运行时 Dock 可能尚未建库，先重启一次让其创建，再写 Placement
         _kill_dock()
         time.sleep(1.5)
-    _apply_placement(position)
-    _kill_dock()
+    changed, _ok = _apply_placement(position)
+    if changed:
+        _kill_dock()
 
 
 def _run(cmd):

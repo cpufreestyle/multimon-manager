@@ -331,7 +331,9 @@ def enum_monitors(force=False):
     """枚举所有活跃显示器，返回 MonitorInfo 列表（带 2s 缓存）。"""
     now = time.monotonic()
     if not force and _mon_cache["data"] is not None and now - _mon_cache["ts"] < _CACHE_TTL:
-        return _mon_cache["data"]
+        # 缓存命中也必须返回深拷贝：调用方可能修改 MonitorInfo 字段，
+        # 共享对象会让"未重新枚举"的修改留在缓存里（同 settings 的教训）
+        return copy.deepcopy(_mon_cache["data"])
 
     monitors = []
 
@@ -428,7 +430,9 @@ def enum_monitors(force=False):
 
     _mon_cache["data"] = monitors
     _mon_cache["ts"] = now
-    return monitors
+    # force 枚举同样必须返回深拷贝，否则返回值与缓存共享同一批 MonitorInfo，
+    # 调用方原地修改会直接污染缓存（自测抓到过：改 width=999999 后缓存跟着变）
+    return copy.deepcopy(monitors)
 
 
 def get_virtual_screen():
