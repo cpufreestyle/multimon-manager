@@ -16,10 +16,15 @@ import snap_preview
 import rules
 import slideshow
 import taskbar
+import triggers
 import cmd_channel
 
 # 多屏任务栏：界面显示值 → 内部位置值
 TASKBAR_POS = {"底部": "bottom", "顶部": "top"}
+# 触发器：界面显示值 → 内部键值
+TRIG_EVENT_KEY = {v: k for k, v in triggers.EVENT_LABELS.items()}
+TRIG_ACTION_KEY = {v: k for k, v in triggers.ACTION_LABELS.items()}
+ZONE_KEY = {v: k for k, v in rules.ZONE_LABELS.items()}
 
 VK_LEFT = b.VK_LEFT
 VK_UP = b.VK_UP
@@ -140,6 +145,7 @@ class App:
         self._build_getting_started(self.body)
         self._build_window_tools(self.body)
         self._build_taskbar(self.body)
+        self._build_triggers(self.body)
         self._build_wallpaper(self.body)
         self._build_profiles(self.body)
         self._build_layouts(self.body)
@@ -559,6 +565,245 @@ class App:
         """跳转到系统设置的辅助功能页面。"""
         try:
             b.open_accessibility_settings()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---------- 窗口事件触发器 ----------
+    def _build_triggers(self, parent):
+        """窗口被移动（或新出现）时自动执行动作。"""
+        self._trig_last = {}    # hwnd -> (x, y, w, h) 上次几何快照
+        self._trig_fired = {}   # (hwnd, 触发器序号) -> 上次触发时刻（冷却用）
+        self._trig_rows = []
+
+        f = ttk.LabelFrame(parent, text="触发器（窗口移动自动触发动作）")
+        f.pack(fill="x", padx=6, pady=(4, 8), anchor="n")
+
+        form = ttk.Frame(f)
+        form.pack(fill="x", padx=4, pady=2)
+        self.trig_field_var = tk.StringVar(value="owner")
+        ttk.Combobox(form, textvariable=self.trig_field_var, width=6, state="readonly",
+                     values=["owner", "title"]).pack(side="left")
+        self.trig_pattern_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.trig_pattern_var, width=14).pack(side="left", padx=2)
+        self.trig_event_var = tk.StringVar(value=triggers.EVENT_LABELS["moved"])
+        ttk.Combobox(form, textvariable=self.trig_event_var, width=8, state="readonly",
+                     values=[triggers.EVENT_LABELS[e] for e in triggers.EVENTS]
+                     ).pack(side="left", padx=2)
+        self.trig_action_var = tk.StringVar(value=triggers.ACTION_LABELS["snap"])
+        act_cb = ttk.Combobox(form, textvariable=self.trig_action_var, width=12,
+                              state="readonly",
+                              values=[triggers.ACTION_LABELS[a] for a in triggers.ACTIONS])
+        act_cb.pack(side="left", padx=2)
+        act_cb.bind("<<ComboboxSelected>>", self._on_trig_action_change)
+        self.trig_param_var = tk.StringVar()
+        self.trig_param_cb = ttk.Combobox(form, textvariable=self.trig_param_var,
+                                          width=16, state="readonly")
+        self.trig_param_cb.pack(side="left", padx=2)
+        ttk.Button(form, text="添加", command=self._add_trigger).pack(side="left", padx=2)
+        ttk.Button(form, text="删除", command=self._delete_trigger).pack(side="left", padx=2)
+        ttk.Button(form, text="启/停", command=self._toggle_trigger).pack(side="left", padx=2)
+
+        ttk.Label(f,
+                  text="匹配应用名/标题的窗口「被移动」或「新出现」时自动执行动作。"
+                       "与「窗口规则」的分工：规则管新窗口归位，触发器管被移动的窗口。",
+                  foreground="#666", wraplength=720, justify="left").pack(anchor="w", padx=4)
+        self.trig_list = tk.Listbox(f, height=4, activestyle="none")
+        self.trig_list.pack(fill="x", padx=4, pady=2)
+        self._refresh_trigger_params()
+        self._refresh_trigger_list()
+
+    def _on_trig_action_change(self, event=None):
+        """动作类型变化时刷新参数候选。"""
+        self._refresh_trigger_params()
+
+    def _refresh_trigger_params(self):
+        """按当前动作类型刷新参数下拉的候选值与默认选中。"""
+        try:
+            action = TRIG_ACTION_KEY.get(self.trig_action_var.get(), "snap")
+            if action == "snap":
+                values = [rules.ZONE_LABELS[z] for z in rules.ZONES]
+            elif action == "monitor":
+                values = [self._monitor_label(m) for m in (self.monitors or [])]
+            elif action == "scenario":
+                values = self._scenario_names()
+            else:  # rules：无参数
+                values = []
+            self.trig_param_cb["values"] = values
+            if values:
+                if self.trig_param_var.get() not in values:
+                    self.trig_param_var.set(values[0])
+            else:
+                self.trig_param_var.set("")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _monitor_label(self, mon):
+        """显示器的可读名（回退设备路径）。"""
+        return getattr(mon, "device_name", None) or mon.device_path
+
+    def _scenario_names(self):
+        """情景显示名列表。"""
+        try:
+            return [(scen.get("name") or scenarios.describe(s))
+                    for s, scen in sorted(scenarios.list_scenarios().items())]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _device_path_by_label(self, label):
+        """按显示名反查显示器 device_path。"""
+        for m in (self.monitors or []):
+            if self._monitor_label(m) == label:
+                return m.device_path
+        return None
+
+    def _add_trigger(self):
+        pattern = (self.trig_pattern_var.get() or "").strip()
+        if not pattern:
+            self.status_var.set("请先填写匹配关键词")
+            return
+        action = TRIG_ACTION_KEY.get(self.trig_action_var.get(), "snap")
+        label = self.trig_param_var.get()
+        if action == "snap":
+            param = ZONE_KEY.get(label, "full")
+        elif action == "monitor":
+            param = self._device_path_by_label(label) or ""
+        elif action == "scenario":
+            param = self._signature_by_name(label) or ""
+        else:  # rules
+            param = ""
+        if action in ("monitor", "scenario") and not param:
+            self.status_var.set("请先选择有效的目标（显示器 / 情景）")
+            return
+        triggers.add_trigger({
+            "enabled": True,
+            "field": self.trig_field_var.get(),
+            "pattern": pattern,
+            "regex": False,
+            "event": TRIG_EVENT_KEY.get(self.trig_event_var.get(), "moved"),
+            "action": action,
+            "param": param,
+        })
+        self._refresh_trigger_list()
+        self.status_var.set(f"已添加触发器：{pattern}")
+
+    def _delete_trigger(self):
+        idx = self._selected_index(self.trig_list)
+        if idx is None:
+            self.status_var.set("请先在触发器列表中选中一条")
+            return
+        triggers.delete_trigger(idx)
+        self._refresh_trigger_list()
+        self.status_var.set("已删除该触发器")
+
+    def _toggle_trigger(self):
+        idx = self._selected_index(self.trig_list)
+        if idx is None:
+            self.status_var.set("请先在触发器列表中选中一条")
+            return
+        triggers.toggle_trigger(idx)
+        self._refresh_trigger_list()
+        self.status_var.set("已切换该触发器的启用状态")
+
+    def _trigger_param_label(self, t):
+        """把触发器参数（内部值）转成可读文本。"""
+        action, param = t.get("action"), t.get("param") or ""
+        if action == "snap":
+            return rules.ZONE_LABELS.get(param, param)
+        if action == "monitor":
+            for m in (self.monitors or []):
+                if m.device_path == param:
+                    return self._monitor_label(m)
+            return param
+        if action == "scenario":
+            try:
+                scen = scenarios.get(param)
+                if scen:
+                    return scen.get("name") or scenarios.describe(param)
+            except Exception:  # noqa: BLE001
+                pass
+            return param
+        return ""
+
+    def _refresh_trigger_list(self):
+        self._trig_rows = []
+        try:
+            self.trig_list.delete(0, "end")
+            for t in triggers.list_triggers():
+                label = (f'{t.get("pattern")} · '
+                         f'{triggers.EVENT_LABELS.get(t.get("event"), t.get("event"))} → '
+                         f'{triggers.ACTION_LABELS.get(t.get("action"), t.get("action"))}'
+                         f' {self._trigger_param_label(t)}')
+                if not t.get("enabled", True):
+                    label += "  [停用]"
+                self.trig_list.insert("end", label)
+                self._trig_rows.append(t)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _check_triggers(self, wins):
+        """窗口移动 / 出现时执行触发器动作（复用规则轮询的同一次枚举结果）。"""
+        items = [t for t in triggers.list_triggers() if t.get("enabled", True)]
+        if not items:
+            return
+        last = getattr(self, "_trig_last", None) or {}
+        fired = getattr(self, "_trig_fired", None) or {}
+        if not last:
+            # 首次只记录快照：否则会把已经打开的所有窗口当成「新出现」全触发一遍
+            self._trig_last = {w.get("hwnd"): (w.get("x"), w.get("y"),
+                                               w.get("w"), w.get("h"))
+                               for w in wins or []}
+            return
+        now = time.monotonic()
+        snapshot = {}
+        for w in wins or []:
+            hwnd = w.get("hwnd")
+            geo = (w.get("x"), w.get("y"), w.get("w"), w.get("h"))
+            snapshot[hwnd] = geo
+            prev = last.get(hwnd)
+            moved = triggers.is_moved(prev, geo)
+            created = prev is None
+            for i, t in enumerate(items):
+                event = t.get("event", "moved")
+                if event == "moved" and not moved:
+                    continue
+                if event == "created" and not created:
+                    continue
+                if not triggers.match(t, w):
+                    continue
+                key = (hwnd, i)
+                if now - fired.get(key, 0) < triggers.COOLDOWN_SEC:
+                    continue  # 冷却中：避免动作自身造成的位移反复触发
+                fired[key] = now
+                self._run_trigger_action(t, w)
+                break  # 一个窗口一次轮询只执行首个命中的触发器
+        self._trig_last = snapshot
+        self._trig_fired = fired
+
+    def _run_trigger_action(self, t, win):
+        """执行触发器动作。"""
+        action = t.get("action", "snap")
+        try:
+            if action == "snap":
+                mon = triggers.monitor_of_window(self.monitors, win)
+                if mon is None:
+                    return
+                zone = t.get("param") or "full"
+                rect = rules.zone_rect(mon, zone)
+                b.set_window_rect(win["hwnd"], rect[0], rect[1], rect[2], rect[3],
+                                  activate=False)
+                self.status_var.set(
+                    f'触发器：已吸附窗口到「{rules.ZONE_LABELS.get(zone, zone)}」')
+            elif action == "monitor":
+                mon = rules.find_monitor(self.monitors, t.get("param"))
+                if mon is None:
+                    return
+                b.move_to_monitor(win["hwnd"], mon)
+                self.status_var.set("触发器：已把窗口移到目标显示器")
+            elif action == "scenario":
+                self._apply_scenario_by_signature(t.get("param"))
+                self.status_var.set("触发器：已套用情景")
+            elif action == "rules":
+                self._apply_rules_now()
         except Exception:  # noqa: BLE001
             pass
 
@@ -1811,10 +2056,19 @@ class App:
         self.status_var.set(f"规则引擎：已应用规则，移动 {moved} 个窗口")
 
     def _poll_rules(self):
-        """主线程轮询：识别新出现的窗口并自动套用规则；并检查情景定时触发。"""
+        """主线程轮询：新窗口套规则；窗口移动/出现触发触发器；并检查情景定时触发。"""
         try:
-            if getattr(self, "rules_auto", None) is not None and self.rules_auto.get():
-                self._scan_new_windows()
+            auto = (getattr(self, "rules_auto", None) is not None
+                    and self.rules_auto.get())
+            has_trig = triggers.any_enabled()
+            if auto or has_trig:
+                # 一次枚举供规则与触发器共用，避免每轮重复调用窗口枚举
+                wins = [w for w in b.list_target_windows()
+                        if not self._is_own_window(w.get("owner"))]
+                if auto:
+                    self._scan_new_windows(wins)
+                if has_trig:
+                    self._check_triggers(wins)
         except Exception:  # noqa: BLE001
             pass
         # 情景定时套用：到点（分钟级）且当天未触发过则自动套用
@@ -1826,9 +2080,11 @@ class App:
             pass
         self.root.after(1500, self._poll_rules)
 
-    def _scan_new_windows(self):
-        wins = [w for w in b.list_target_windows()
-                if not self._is_own_window(w.get("owner"))]
+    def _scan_new_windows(self, wins=None):
+        """扫描新出现的窗口并套用规则；wins 可传入已枚举结果以复用（省一次枚举）。"""
+        if wins is None:
+            wins = [w for w in b.list_target_windows()
+                    if not self._is_own_window(w.get("owner"))]
         current = {w["hwnd"] for w in wins}
         if self._rule_seen is None:
             self._rule_seen = current  # 首次只记录，避免把已开窗口全移一遍
