@@ -43,6 +43,13 @@ user32.GetWindowThreadProcessId.argtypes = [
     wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 
+# GetWindowLongPtrW 只在 64 位系统存在（32 位 Python 无 Ptr 版本）。
+# 在模块加载时声明一次即可：ctypes 的 argtypes 是函数对象上的全局状态，
+# 运行时反复改写会与热键线程/托盘线程的并发调用互相干扰。
+_get_window_long = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+_get_window_long.argtypes = [wintypes.HWND, ctypes.c_int]
+_get_window_long.restype = ctypes.c_ssize_t
+
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
@@ -284,13 +291,7 @@ def front_external_window():
 def is_topmost(hwnd):
     """窗口当前是否处于置顶（WS_EX_TOPMOST）状态。"""
     try:
-        get_long = user32.GetWindowLongPtrW
-    except AttributeError:  # 32 位 Python 无 Ptr 版本
-        get_long = user32.GetWindowLongW
-    get_long.argtypes = [wintypes.HWND, ctypes.c_int]
-    get_long.restype = ctypes.c_ssize_t
-    try:
-        return bool(get_long(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
+        return bool(_get_window_long(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
     except Exception:  # noqa: BLE001
         return False
 

@@ -3,37 +3,48 @@ import os, sys, json, zipfile, urllib.parse
 import subprocess, urllib.request, urllib.error
 
 TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-TAG = "v0.2.4"
+TAG = "v0.3.0"
 REPO = "cpufreestyle/multimon-manager"
 API = f"https://api.github.com/repos/{REPO}"
 
-RELEASE_BODY = """## Multi-Monitor Manager v0.2.4
+RELEASE_BODY = """## Multi-Monitor Manager v0.3.0
 
 跨平台多屏管理器，Windows + macOS 双实现，零第三方依赖。
 
-### What's Changed
-- **修复 macOS 启动即崩溃**（`Fatal Python error: PyEval_RestoreThread: GIL is released`）：
-  移除与 Tk 主循环并存的后台 `CFRunLoop`，显示器监听改为主线程轮询，
-  全局热键的事件 tap 改挂主线程 CFRunLoop
-- **修复全局快捷键在 macOS 上从未真正生效**（三处常量错误）：
-  - `CGEventTapCreate` 的 `eventsOfInterest` 是位掩码，须传 `1 << kCGEventKeyDown`（1024），
-    此前误传 10，导致键盘事件被全部过滤
-  - `CGEventField` 字段号修正：键码 `9`、修饰键 `59`（此前误为 113 / 115，键码恒读 0）
-  - tap 位置与插入位常量修正为 `kCGSessionEventTap=1` / `kCGHeadInsertEventTap=0`
-- 显示器变化监听 `display_notify_mac` 改为主线程注册回调，彻底消除后台 runloop 隐患
-- **界面改为单页 + 垂直滚动**：原先的两个分页面板合并为一页，右侧滑块可上下滑动，
-  并支持滚轮（macOS / Windows / X11 量级自动换算）
-- 日志降噪：工作区计算日志由 INFO 降为 DEBUG，不再每 2 秒刷屏
-- 新增「竖排上中下」：把三个窗口堆叠到上 / 中 / 下三栏
-- 「并排左右」「竖排上中下」现已支持 Windows（此前仅 macOS）
-- 应用图标圆角外的白色背景改为透明
+### New Features
+- **壁纸轮换（幻灯片）**：指定图片目录 + 间隔（分钟）自动轮换壁纸。
+  「每屏不同」模式下同一时刻各屏显示不同图片，「统一单图」模式下所有屏同步切换；
+  目录与间隔会被记住。
+- **移到指定屏**：窗口工具区新增目标屏下拉与按钮，多屏时不用再"上一屏/下一屏"连点，
+  一次跳到指定显示器。
+- **布局方案绑定显示器配置**：保存布局时记录显示器指纹（数量/分辨率/相对位置），
+  配置变化后应用前会提示并确认，避免窗口按旧坐标落到错误的屏幕。
+- **配置备份 / 恢复**：一键把快捷键偏好、热插拔开关、壁纸轮换设置、窗口布局方案与
+  壁纸方案导出为单个 JSON，换机或重装后导入恢复（合并，同名覆盖）。
+
+### Fixes & Optimizations
+- **修复版本号漂移**：`build.py` 一直读不到 `version_info.py` 里的版本号（该文件是
+  PyInstaller 的 `eval()` 表达式，不含 `VERSION` 属性），macOS `Info.plist` 版本号
+  被硬编码成 0.2.3；`install.py` 的注册表版本号停留在 0.2.2。现统一以新增的
+  `app_version.py` 为唯一来源，打包前还会校验与 `version_info.py` 是否一致。
+- **统一配置存储路径**：壁纸方案原先固定写在 `%APPDATA%`，而 settings / 窗口布局在源码
+  运行时写在仓库目录，三份配置分居两处。现在统一由 `settings.data_dir()` 决定，并保留
+  一次旧位置回退读取（升级后老方案不丢）。
+- **修复 Windows 120 DPI 下界面横向截断**：窗口工具区的「并排左右」按钮与整个
+  「竖排上中下」按钮会被挤出可视区（画布只有纵向滚动）。已收窄相关下拉宽度、
+  把默认窗口调整为 820×740 并抬高最小宽度。
+- `windows.py` 的 `GetWindowLongPtr` 参数声明改为模块加载时一次性设置，避免热键线程
+  与主线程并发调用时互相改写 ctypes 的全局函数签名。
+- 仓库整洁：构建调试产物 `release.err` / `release.log` 移出版本库并加入 `.gitignore`。
 
 ### Features
-- **每屏壁纸** — 为每个显示器设置独立壁纸
-- **窗口跨屏 / 吸附** — 窗口在多屏间移动与边缘吸附
+- **每屏壁纸 / 壁纸轮换** — 为每个显示器设置独立壁纸或按目录自动轮换
+- **窗口跨屏 / 吸附** — 移动到相邻屏或指定屏，左右/上下半屏、三分屏、四象限
+- **并排左右 / 竖排上中下** — 两 / 三个窗口一键排列
+- **布局方案** — 窗口位置一键保存与还原（含显示器配置校验）
+- **配置备份** — 全部配置导出 / 导入
 - **全局快捷键** — 可自定义修饰键（macOS ⌘⌥ / Windows Ctrl+Alt）+ 数字键 1~9 与方向键
 - **系统托盘** — Windows 托盘 / macOS Dock 菜单 + 面板
-- **竖排上中下 / 并排左右** — 两 / 三个窗口排到左右半屏或上中下三栏（macOS + Windows）
 - **显示器热插拔** — 自动检测显示器变化
 - **零第三方依赖** — 纯 Python 标准库 + ctypes 实现
 
@@ -51,7 +62,11 @@ RELEASE_BODY = """## Multi-Monitor Manager v0.2.4
 | `hotkeys.py` / `hotkeys_mac.py` | 全局快捷键 |
 | `tray.py` / `tray_mac.py` | 系统托盘 |
 | `display_notify_mac.py` | 显示器变化监听（主线程） |
-| `profiles.py` | 配置管理 |
+| `profiles.py` | 壁纸方案管理 |
+| `layouts.py` | 窗口布局方案 + 显示器指纹 |
+| `config_io.py` | 配置导出 / 导入 |
+| `settings.py` | 偏好存储与配置目录定位 |
+| `app_version.py` | 版本号唯一来源 |
 | `resources.py` | 资源文件 |
 | `ui.py` | 用户界面 |
 | `main.py` | 主入口 |
@@ -98,7 +113,7 @@ else:
 # Step 2: 创建（或复用已存在的）Release
 body = {
     "tag_name": TAG,
-    "name": "v0.2.4 — Stability, Hotkeys & UI",
+    "name": "v0.3.0 — Wallpaper Rotation, Monitor Targeting & Config Backup",
     "body": RELEASE_BODY,
     "draft": False,
     "prerelease": False,

@@ -65,6 +65,28 @@ toggle_topmost = getattr(windows, "toggle_topmost", None)
 HotkeyManager = hotkeys.HotkeyManager
 register_display_callback = display_notify.register
 
+
+def move_target_to_monitor(index, use_pinned=True, activate=False):
+    """把目标/活动窗口移动到**指定索引**的显示器（跨平台统一入口）。
+
+    与 move_active_to_next_monitor 的区别：那个只能相邻屏逐个跳，多屏时很费事；
+    这里一次到位。activate=False 时只移动不激活（界面按钮模式）。
+
+    Windows 与 macOS 的 move_to_monitor 签名不同（Windows 多一个 src 快照参数），
+    故这里必须用关键字传 activate，不能按位置传。
+    """
+    try:
+        ms = monitors.enum_monitors()
+    except Exception:  # noqa: BLE001
+        return False
+    if index is None or not isinstance(index, int) or not (0 <= index < len(ms)):
+        return False
+    hwnd = windows.get_foreground_window(use_pinned)
+    if not hwnd:
+        return False
+    windows.move_to_monitor(hwnd, ms[index], activate=activate)
+    return True
+
 # 辅助功能授权（仅 macOS 有意义；Windows 始终视为已授权）
 if IS_MAC:
     is_accessibility_trusted = accessibility.is_trusted

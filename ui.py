@@ -6,6 +6,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import autostart
 import backend as b
+import config_io
 import profiles
 import settings
 import layouts
@@ -20,13 +21,40 @@ VK_DOWN = b.VK_DOWN
 AUTO_TARGET = "自动（上次活动窗口）"
 # 并排/竖排显示器下拉框的"自动"选项：按窗口当前所在屏决定
 AUTO_MON = "自动（按窗口所在屏）"
+# 壁纸轮换支持的图片扩展名
+ROTATE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif", ".tif", ".tiff")
+
+# 常见图片格式的文件头（扩展名可以骗人，损坏文件交给系统会把壁纸置空）
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"BM",
+                b"GIF87a", b"GIF89a", b"II*\x00", b"MM\x00*")
+
+
+def _looks_like_image(path):
+    """按文件头判断文件是否真的是图片，读不到或格式不符返回 False。
+
+    轮换是无人值守的：目录里混进一个空文件/半截下载的图，SetWallpaper 会
+    成功返回但把壁纸清空，用户只会看到黑屏。所以扫描时就把这类文件剔掉。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except OSError:
+        return False
+    if len(head) < 8:
+        return False
+    if any(head.startswith(magic) for magic in _IMAGE_MAGIC):
+        return True
+    return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+
 
 
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title("多屏管理器")
-        self.root.geometry("760x720")
+        # 默认宽度取 820：窗口工具里有「并排」「竖排」两组下拉，120 DPI 下
+        # 760 宽会把最右侧的按钮挤出可视区（横向没有滚动条）。
+        self.root.geometry("820x740")
         self.monitors = []
         self.mon_rows = []
         self.fit_var = tk.StringVar(value="fill")
@@ -54,7 +82,9 @@ class App:
         if self.hk_enabled.get():
             self.root.after(600, lambda: self._toggle_hk(quiet=True))
         # 窗口大小变化时防抖重绘布局图，并设最小尺寸避免控件被压坏
-        self.root.minsize(660, 520)
+        # 最小宽度按 body 的自然宽度（120 DPI 下约 773）取齐，缩到这一步即停，
+        # 再窄就会把窗口工具里的下拉/按钮挤出可视区。
+        self.root.minsize(810, 560)
         self._resize_job = None
         self.root.bind("<Configure>", self._on_window_resize)
 
@@ -113,9 +143,11 @@ class App:
         self._build_window_tools(self.body)
         self._build_wallpaper(self.body)
         self._build_profiles(self.body)
+        self._build_rotate(self.body)
         self._build_layouts(self.body)
         self._build_hotkeys(self.body)
         self._build_autostart(self.body)
+        self._build_backup(self.body)
         self._build_display_watch(self.body)
 
     # ---------- 滚动支持 ----------
@@ -268,23 +300,38 @@ class App:
                 ttk.Button(row, text=text,
                            command=self._keep_front_after(cmd)).pack(side="left", padx=3)
 
+        # 移到指定屏：只有"上一屏/下一屏"时，三屏以上要连点好几次才能到位，
+        # 这里直接选目标屏一次跳过去（下拉与并排/竖排共用同一份显示器列表）。
+        mon_row = ttk.Frame(f)
+        mon_row.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(mon_row, text="移到指定屏:").pack(side="left")
+        self.move_mon_var = tk.StringVar(value=AUTO_MON)
+        self.move_mon_cb = ttk.Combobox(mon_row, textvariable=self.move_mon_var,
+                                        state="readonly", width=18)
+        self.move_mon_cb.pack(side="left", padx=(4, 6))
+        ttk.Button(mon_row, text="移到该屏",
+                   command=self._keep_front_after(
+                       self._move_to_selected_monitor)).pack(side="left")
+
         # 并排左右：可选目标显示器 + 可指定左右两个窗口（留"自动"则由程序取最前面两个）
         sbs = ttk.Frame(f)
         sbs.pack(fill="x", padx=6, pady=(4, 2))
         ttk.Label(sbs, text="并排:").pack(side="left")
         self.sbs_mon_var = tk.StringVar(value=AUTO_MON)
+        # 下拉宽度按 120 DPI 下的实际像素收窄：原先并排/竖排整行会超出窗口，
+        # 最右侧按钮被横向截断（画布只做纵向滚动，横向溢出无法补救）。
         self.sbs_mon_cb = ttk.Combobox(sbs, textvariable=self.sbs_mon_var,
-                                       state="readonly", width=20)
+                                       state="readonly", width=13)
         self.sbs_mon_cb.pack(side="left", padx=(4, 2))
         self.sbs_left_var = tk.StringVar(value=AUTO_TARGET)
         self.sbs_right_var = tk.StringVar(value=AUTO_TARGET)
         ttk.Label(sbs, text="左").pack(side="left", padx=(8, 2))
         self.sbs_left_cb = ttk.Combobox(sbs, textvariable=self.sbs_left_var,
-                                        state="readonly", width=16)
+                                        state="readonly", width=11)
         self.sbs_left_cb.pack(side="left")
         ttk.Label(sbs, text="右").pack(side="left", padx=(8, 2))
         self.sbs_right_cb = ttk.Combobox(sbs, textvariable=self.sbs_right_var,
-                                         state="readonly", width=16)
+                                         state="readonly", width=11)
         self.sbs_right_cb.pack(side="left")
         ttk.Button(sbs, text="并排左右",
                    command=self._snap_two_side_by_side).pack(
@@ -296,22 +343,22 @@ class App:
         ttk.Label(stack, text="竖排:").pack(side="left")
         self.stack_mon_var = tk.StringVar(value=AUTO_MON)
         self.stack_mon_cb = ttk.Combobox(stack, textvariable=self.stack_mon_var,
-                                         state="readonly", width=18)
+                                         state="readonly", width=13)
         self.stack_mon_cb.pack(side="left", padx=(4, 2))
         self.stack_top_var = tk.StringVar(value=AUTO_TARGET)
         self.stack_mid_var = tk.StringVar(value=AUTO_TARGET)
         self.stack_bot_var = tk.StringVar(value=AUTO_TARGET)
         ttk.Label(stack, text="上").pack(side="left", padx=(8, 2))
         self.stack_top_cb = ttk.Combobox(stack, textvariable=self.stack_top_var,
-                                         state="readonly", width=14)
+                                         state="readonly", width=10)
         self.stack_top_cb.pack(side="left")
         ttk.Label(stack, text="中").pack(side="left", padx=(6, 2))
         self.stack_mid_cb = ttk.Combobox(stack, textvariable=self.stack_mid_var,
-                                         state="readonly", width=14)
+                                         state="readonly", width=10)
         self.stack_mid_cb.pack(side="left")
         ttk.Label(stack, text="下").pack(side="left", padx=(6, 2))
         self.stack_bot_cb = ttk.Combobox(stack, textvariable=self.stack_bot_var,
-                                         state="readonly", width=14)
+                                         state="readonly", width=10)
         self.stack_bot_cb.pack(side="left")
         ttk.Button(stack, text="竖排上中下",
                    command=self._snap_three_stack).pack(
@@ -372,11 +419,28 @@ class App:
                      + f" {m.width}x{m.height}")
             labels.append(label)
             self._monitor_map[label] = i
-        for cb, var in ((self.sbs_mon_cb, self.sbs_mon_var),
+        for cb, var in ((self.move_mon_cb, self.move_mon_var),
+                        (self.sbs_mon_cb, self.sbs_mon_var),
                         (self.stack_mon_cb, self.stack_mon_var)):
             cb["values"] = labels
             if var.get() not in self._monitor_map:
                 var.set(AUTO_MON)
+
+    def _move_to_selected_monitor(self):
+        """把目标/活动窗口一次移动到下拉框选中的显示器。"""
+        idx = self._monitor_map.get(self.move_mon_var.get())
+        if idx is None:
+            self.status_var.set("请先在下拉框选择目标显示器（「自动」无法一次定位）")
+            return
+        try:
+            ok = b.move_target_to_monitor(idx, activate=False)
+        except Exception as e:  # noqa: BLE001
+            self.status_var.set(f"移动失败：{e}")
+            return
+        if ok:
+            self.status_var.set(f"窗口已移到 {self.move_mon_var.get()}")
+        else:
+            self.status_var.set("移动失败：未找到可操作窗口")
 
     def _on_target_selected(self, _event=None):
         label = self.target_var.get()
@@ -523,7 +587,8 @@ class App:
         ttk.Label(
             f,
             text="保存当前所有窗口的位置/大小，之后一键还原（按「应用::窗口」匹配，"
-                 "标题变化会自动按应用名兜底）。",
+                 "标题变化会自动按应用名兜底）。方案会记下保存时的显示器配置，"
+                 "显示器数量或排列变化后应用会先提示。",
             justify="left", wraplength=620,
         ).pack(anchor="w", padx=4, pady=(0, 4))
         row = ttk.Frame(f)
@@ -557,13 +622,25 @@ class App:
         data = [{"hwnd": w["hwnd"], "owner": w["owner"], "name": w["name"],
                  "x": w["x"], "y": w["y"], "w": w["w"], "h": w["h"]}
                 for w in wins]
-        layouts.save_layout(name, data)
+        layouts.save_layout(name, data, monitor_sig=self._monitor_signature())
         self._refresh_layout_list()
         self.layout_var.set(name)
         s = settings.load()
         s["last_layout"] = name
         settings.save(s)
         self.status_var.set(f"已保存布局：{name}（{len(data)} 个窗口）")
+
+    def _layout_monitor_changed(self, name):
+        """布局保存时的显示器配置是否与当前不同（老方案无指纹时返回 False）。"""
+        saved = layouts.monitor_signature(name)
+        if not saved:
+            return False
+        try:
+            current = self._monitor_signature() or ()
+            return (tuple(tuple(item) for item in saved)
+                    != tuple(tuple(item) for item in current))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _apply_layout(self):
         name = self.layout_var.get()
@@ -574,6 +651,16 @@ class App:
         if not layout:
             messagebox.showwarning("提示", f"布局方案不存在：{name}")
             return
+        # 显示器配置变了（数量/分辨率/相对位置）时，按保存时的绝对坐标还原必然错位
+        if self._layout_monitor_changed(name):
+            self.show()   # 托盘触发时主窗口可能已隐藏，弹窗前先亮出来
+            if not messagebox.askyesno(
+                    "显示器配置已变化",
+                    f"布局「{name}」保存时的显示器配置与当前不一致"
+                    "（数量 / 分辨率 / 相对位置已变），\n"
+                    "还原后窗口位置可能不在预期的屏幕上。\n\n仍要继续吗？"):
+                self.status_var.set("已取消：显示器配置与布局保存时不一致")
+                return
         ok, miss = 0, 0
         current = {w["hwnd"]: w["owner"] for w in b.list_target_windows()}
         for item in layout["windows"]:
@@ -669,6 +756,83 @@ class App:
             messagebox.showerror("错误", f"设置开机自启失败:\n{e}")
             self.autostart_var.set(autostart.is_enabled())
             self.autostart_min_var.set(autostart.is_minimized())
+
+    # ---------- 配置备份 ----------
+    def _build_backup(self, parent):
+        f = ttk.LabelFrame(parent, text="配置备份")
+        f.pack(fill="x", padx=8, pady=6)
+        ttk.Label(
+            f,
+            text="把快捷键偏好、热插拔开关、壁纸轮换设置、窗口布局方案与壁纸方案"
+                 "导出为单个 JSON；换机或重装后导入即可恢复（同名覆盖，其它保留）。",
+            justify="left", wraplength=620,
+        ).pack(anchor="w", padx=4, pady=(0, 4))
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=4, pady=4)
+        ttk.Button(row, text="导出配置…", command=self._export_config).pack(side="left", padx=2)
+        ttk.Button(row, text="导入配置…", command=self._import_config).pack(side="left", padx=2)
+
+    def _export_config(self):
+        path = filedialog.asksaveasfilename(
+            title="导出配置", defaultextension=".json",
+            initialfile="multimon-config.json",
+            filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            n_layouts, n_profiles = config_io.collect_and_write(path)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("错误", f"导出配置失败:\n{e}")
+            return
+        self.status_var.set(
+            f"已导出配置：{n_layouts} 个窗口布局 / {n_profiles} 个壁纸方案")
+        messagebox.showinfo(
+            "完成",
+            f"已导出到：\n{path}\n\n"
+            f"窗口布局 {n_layouts} 个，壁纸方案 {n_profiles} 个。")
+
+    def _import_config(self):
+        path = filedialog.askopenfilename(
+            title="导入配置", filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        if not messagebox.askyesno(
+                "确认", "导入会把备份里的方案合并到当前配置（同名覆盖），继续吗？"):
+            return
+        try:
+            n_settings, n_layouts, n_profiles = config_io.read_and_restore(path)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("错误", f"导入配置失败:\n{e}")
+            return
+        self._refresh_layout_list()
+        self._refresh_profile_list()
+        self._reload_settings_into_ui()
+        self.status_var.set(
+            f"已导入配置：{n_layouts} 个布局 / {n_profiles} 个壁纸方案")
+        messagebox.showinfo(
+            "完成",
+            "配置已导入并合并：\n"
+            f"· 窗口布局 {n_layouts} 个\n"
+            f"· 壁纸方案 {n_profiles} 个\n"
+            f"· 偏好项 {n_settings} 项\n\n"
+            "开机自启属于系统设置，不随备份迁移；全局快捷键开关如已变化，"
+            "取消再勾选「启用全局快捷键」即可立即生效。")
+
+    def _reload_settings_into_ui(self):
+        """导入配置后把受影响的控件同步成新值。"""
+        s = settings.load()
+        try:
+            self.hk_enabled.set(bool(s.get("hk_enabled", self.hk_enabled.get())))
+            self.rotate_dir_var.set(s.get("rotate_dir", self.rotate_dir_var.get()) or "")
+            self.rotate_interval_var.set(
+                max(1, int(s.get("rotate_interval_min", self.rotate_interval_var.get()))))
+            self.watch_enabled.set(bool(s.get("watch_displays", self.watch_enabled.get())))
+            self.auto_apply_watch.set(
+                bool(s.get("watch_auto_apply", self.auto_apply_watch.get())))
+            self._update_rotate_status()
+            self._toggle_display_watch()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---------- 显示器热插拔 ----------
     def _build_display_watch(self, parent):
@@ -971,6 +1135,167 @@ class App:
         profiles.delete_profile(name)
         self._refresh_profile_list()
 
+    # ---------- 壁纸轮换（幻灯片） ----------
+    def _build_rotate(self, parent):
+        f = ttk.LabelFrame(parent, text="壁纸轮换（幻灯片）")
+        f.pack(fill="x", padx=8, pady=6)
+        s = settings.load()
+        self.rotate_dir_var = tk.StringVar(value=s.get("rotate_dir", "") or "")
+        try:
+            interval = int(s.get("rotate_interval_min", 10))
+        except Exception:  # noqa: BLE001
+            interval = 10
+        self.rotate_interval_var = tk.IntVar(value=max(1, interval))
+        self.rotate_status_var = tk.StringVar(value="未运行")
+        self._rotate_running = False
+        self._rotate_job = None
+        self._rotate_index = 0
+        self._rotate_count = 0
+
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Label(row, text="图片目录:").pack(side="left")
+        ttk.Entry(row, textvariable=self.rotate_dir_var, width=40).pack(
+            side="left", padx=4, fill="x", expand=True)
+        ttk.Button(row, text="选择目录", command=self._pick_rotate_dir).pack(side="left")
+
+        row2 = ttk.Frame(f)
+        row2.pack(fill="x", padx=6, pady=2)
+        ttk.Label(row2, text="间隔(分钟):").pack(side="left")
+        ttk.Spinbox(row2, from_=1, to=1440, width=6,
+                    textvariable=self.rotate_interval_var).pack(side="left", padx=4)
+        self.rotate_btn = ttk.Button(row2, text="开始轮换", command=self._toggle_rotate)
+        self.rotate_btn.pack(side="left", padx=(8, 6))
+        ttk.Label(row2, textvariable=self.rotate_status_var).pack(side="left", padx=4)
+
+        ttk.Label(
+            f,
+            text="「每屏不同」模式下同一时刻各屏显示不同图片；「统一单图」模式下所有屏"
+                 "同步切换。填充方式沿用壁纸区的设置，路径与间隔会被记住。",
+            justify="left", wraplength=620,
+        ).pack(anchor="w", padx=6, pady=(0, 6))
+
+    def _pick_rotate_dir(self):
+        d = filedialog.askdirectory(title="选择图片目录")
+        if d:
+            self.rotate_dir_var.set(d)
+            self._save_rotate_prefs()
+            self._update_rotate_status()
+
+    def _rotate_images(self):
+        """扫描轮换目录下的图片文件（按文件名排序，保证顺序稳定）。
+
+        只收真正像图片的文件（校验文件头），避免把损坏/空文件喂给系统把壁纸清空。
+        """
+        d = (self.rotate_dir_var.get() or "").strip()
+        if not d or not os.path.isdir(d):
+            return []
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            return []
+        out = []
+        for n in names:
+            p = os.path.join(d, n)
+            if (n.lower().endswith(ROTATE_EXTS) and os.path.isfile(p)
+                    and _looks_like_image(p)):
+                out.append(p)
+        return out
+
+    def _save_rotate_prefs(self):
+        s = settings.load()
+        s["rotate_dir"] = (self.rotate_dir_var.get() or "").strip()
+        try:
+            s["rotate_interval_min"] = max(1, int(self.rotate_interval_var.get()))
+        except Exception:  # noqa: BLE001
+            s["rotate_interval_min"] = 10
+        settings.save(s)
+
+    def _update_rotate_status(self):
+        if self._rotate_running:
+            return
+        n = len(self._rotate_images())
+        self.rotate_status_var.set(f"未运行（目录内 {n} 张图片）" if n else "未运行")
+
+    def _toggle_rotate(self):
+        if self._rotate_running:
+            self._stop_rotate()
+        else:
+            self._start_rotate()
+
+    def _start_rotate(self):
+        total = len(self._rotate_images())
+        if total == 0:
+            messagebox.showwarning("提示", "请先选择一个包含图片的目录")
+            return
+        self._save_rotate_prefs()
+        self._rotate_running = True
+        self._rotate_index = 0
+        self._rotate_count = 0
+        try:
+            self.rotate_btn.configure(text="停止轮换")
+        except Exception:  # noqa: BLE001
+            pass
+        self._rotate_step()
+
+    def _stop_rotate(self, quiet=False):
+        self._rotate_running = False
+        if self._rotate_job is not None:
+            try:
+                self.root.after_cancel(self._rotate_job)
+            except Exception:  # noqa: BLE001
+                pass
+            self._rotate_job = None
+        try:
+            self.rotate_btn.configure(text="开始轮换")
+        except Exception:  # noqa: BLE001
+            pass
+        if not quiet:
+            self.rotate_status_var.set(f"已停止（本次切换 {self._rotate_count} 次）")
+
+    def _rotate_step(self):
+        """定时切一张；目录为空或应用失败时自动停止并给出原因。"""
+        if not self._rotate_running:
+            return
+        # 触发本次的定时器已经消费掉，先清空句柄，避免手动调用时重复累积
+        self._rotate_job = None
+        files = self._rotate_images()
+        if not files:
+            self._stop_rotate(quiet=True)
+            self.rotate_status_var.set("目录内已无可用图片，轮换已停止")
+            return
+        try:
+            self._apply_rotate(files)
+        except Exception as e:  # noqa: BLE001
+            self._stop_rotate(quiet=True)
+            self.rotate_status_var.set(f"轮换失败已停止：{e}")
+            return
+        self._rotate_count += 1
+        self._rotate_index = (self._rotate_index + 1) % len(files)
+        self.rotate_status_var.set(
+            f"轮换中：已切换 {self._rotate_count} 次（共 {len(files)} 张）")
+        try:
+            minutes = max(1, int(self.rotate_interval_var.get()))
+        except Exception:  # noqa: BLE001
+            minutes = 10
+        self._rotate_job = self.root.after(minutes * 60000, self._rotate_step)
+
+    def _apply_rotate(self, files):
+        """按当前模式套用这一轮图片；同时把路径回填到界面，便于再保存为方案。"""
+        position = self.fit_var.get()
+        if self.mode_var.get() == "single":
+            img = files[self._rotate_index % len(files)]
+            self.single_var.set(img)
+            b.apply_single(img, position)
+            return
+        mapping = {}
+        for i, r in enumerate(self.mon_rows):
+            img = files[(self._rotate_index + i) % len(files)]
+            r["var"].set(img)
+            mapping[r["device_path"]] = img
+        if mapping:
+            b.apply_per_monitor(mapping, position)
+
     # ---------- 快捷键修饰键 ----------
     def _default_hk_mods(self):
         """读取已保存的修饰键选择，否则按平台返回默认值。"""
@@ -1087,6 +1412,13 @@ class App:
                 "双击托盘图标可重新打开，右键托盘图标可退出。")
 
     def quit(self):
+        self._stop_rotate(quiet=True)
+        if self._display_poll_id is not None:
+            try:
+                self.root.after_cancel(self._display_poll_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self._display_poll_id = None
         if self.hk:
             self.hk.stop()
         self.root.destroy()

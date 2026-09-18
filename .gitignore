@@ -17,6 +17,7 @@ app.icns
 dist/
 *.spec
 *.log
+*.err
 
 # 调试/临时产物
 *.txt
