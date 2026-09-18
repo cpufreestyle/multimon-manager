@@ -40,3 +40,4 @@ _*.py
 
 # 本地工作数据（AI 助手记忆/会话数据）
 .codebuddy/
+.workbuddy/

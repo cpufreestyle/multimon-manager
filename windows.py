@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 psapi = ctypes.windll.psapi
+try:
+    dwmapi = ctypes.windll.dwmapi
+except Exception:  # noqa: BLE001  # Vista 之前的系统没有 dwmapi
+    dwmapi = None
 
 # 64 位句柄参数必须显式声明，否则被当 32 位截断。
 user32.GetForegroundWindow.argtypes = []
@@ -42,6 +46,14 @@ user32.GetWindowTextW.restype = ctypes.c_int
 user32.GetWindowThreadProcessId.argtypes = [
     wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.IsIconic.restype = ctypes.c_bool
+if dwmapi is not None:
+    dwmapi.DwmGetWindowAttribute.argtypes = [
+        wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
 
 # GetWindowLongPtrW 只在 64 位系统存在（32 位 Python 无 Ptr 版本）。
 # 在模块加载时声明一次即可：ctypes 的 argtypes 是函数对象上的全局状态，
@@ -72,7 +84,9 @@ SW_SHOWNOACTIVATE = 0x04
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 
+GWL_STYLE = -16
 GWL_EXSTYLE = -20
+WS_MAXIMIZE = 0x01000000
 WS_EX_TOPMOST = 0x00000008
 HWND_TOPMOST = wintypes.HWND(-1)
 HWND_NOTOPMOST = wintypes.HWND(-2)
@@ -90,6 +104,122 @@ def register_own_pid(pid):
 
 
 register_own_pid(os.getpid())
+
+
+# ── 窗口筛选与几何补偿（Windows 端专有） ────────────────────────────
+
+# 系统壳窗口 / 浮层的窗口类名：它们「可见且有标题」，但不该出现在可选列表里
+_SHELL_CLASSES = {
+    "Shell_TrayWnd",                            # 主任务栏
+    "Shell_SecondaryTrayWnd",                   # 副屏任务栏
+    "Progman",                                  # 桌面
+    "WorkerW",
+    "DV2ControlHost",                           # 开始菜单 / 操作中心
+    "Windows.UI.Core.CoreWindow",
+    "ApplicationManager_DesktopShellWindow",
+    "ForegroundStaging",
+    "Xaml_WindowedPopupClass",
+    "Microsoft.Windows.Shell.RunDialog",
+    "#32768",                                   # 弹出菜单
+    "Tooltips_class32",
+    "EdgeUiInputWndClass",
+    "Shell_InputSwitchTopLevelWindow",
+    "LivePreviewWndClass",
+}
+
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
+DWMWA_CLOAKED = 14
+
+
+def _class_name(hwnd):
+    """返回窗口类名（用于过滤系统壳窗口）。"""
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        if user32.GetClassNameW(hwnd, buf, 256):
+            return buf.value
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def is_cloaked(hwnd):
+    """窗口是否被 DWM 隐藏（UWP 应用后台挂起 / 处于非当前虚拟桌面）。"""
+    if dwmapi is None:
+        return False
+    try:
+        v = ctypes.c_uint32()
+        hr = dwmapi.DwmGetWindowAttribute(
+            hwnd, DWMWA_CLOAKED, ctypes.byref(v), ctypes.sizeof(v))
+        return hr == 0 and bool(v.value)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def is_maximized(hwnd):
+    """窗口当前是否处于最大化状态。"""
+    try:
+        return bool(_get_window_long(hwnd, GWL_STYLE) & WS_MAXIMIZE)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def visible_rect(hwnd):
+    """窗口的可见矩形（不含 DWM 透明边框）；取不到时退回 GetWindowRect。"""
+    if dwmapi is not None:
+        try:
+            r = monitors.RECT()
+            hr = dwmapi.DwmGetWindowAttribute(
+                hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                ctypes.byref(r), ctypes.sizeof(r))
+            if hr == 0:
+                return r.as_tuple()
+        except Exception:  # noqa: BLE001
+            pass
+    return get_window_rect(hwnd)
+
+
+def frame_insets(hwnd):
+    """返回 GetWindowRect 相对「可见区域」的四面不可见边框厚度 (l, t, r, b)。
+
+    Windows 10/11 上普通窗口的 GetWindowRect 含一圈透明阴影边框（每边约 7px）。
+    直接按它摆放，并排的两个窗口之间会露出一条缝隙，贴边时也会离屏幕边缘一截。
+    用 DWMWA_EXTENDED_FRAME_BOUNDS 拿到真实可见矩形即可算出补偿量。
+    最大化窗口 / 取不到属性时返回 (0, 0, 0, 0)。
+    """
+    if dwmapi is None:
+        return (0, 0, 0, 0)
+    try:
+        outer = monitors.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(outer)):
+            return (0, 0, 0, 0)
+        inner = monitors.RECT()
+        hr = dwmapi.DwmGetWindowAttribute(
+            hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+            ctypes.byref(inner), ctypes.sizeof(inner))
+        if hr != 0:
+            return (0, 0, 0, 0)
+        l, t = inner.left - outer.left, inner.top - outer.top
+        r, b = outer.right - inner.right, outer.bottom - inner.bottom
+        # 异常值（第三方主题 / 极端缩放）直接放弃补偿，避免把窗口放歪
+        if not (0 <= l <= 64 and 0 <= t <= 64 and 0 <= r <= 64 and 0 <= b <= 64):
+            return (0, 0, 0, 0)
+        return (l, t, r, b)
+    except Exception:  # noqa: BLE001
+        return (0, 0, 0, 0)
+
+
+def _verify_visible(hwnd, x, y, w, h, tol=2):
+    """校验窗口可见矩形是否真的落到期望位置。
+
+    最小尺寸限制、UIPI（目标进程权限更高）拦截时，SetWindowPos 仍会返回成功
+    但窗口不动，这里用于识别这种情况并记日志。
+    """
+    try:
+        rx, ry, rw, rh = visible_rect(hwnd)
+    except Exception:  # noqa: BLE001
+        return True
+    return (abs(rx - x) <= tol and abs(ry - y) <= tol
+            and abs(rw - w) <= tol and abs(rh - h) <= tol)
 
 
 def get_foreground_window(use_pinned=True):
@@ -118,7 +248,8 @@ def is_window(hwnd):
 def list_windows():
     """枚举当前可见的顶层窗口，返回 [(hwnd, title), ...]。
 
-    仅保留可见且有标题的窗口，隐藏/无标题的系统窗口会被过滤掉。
+    仅保留可见且有标题的窗口；隐藏、最小化的窗口以及系统壳窗口
+    （任务栏 / 桌面 / 开始菜单 / UWP 挂起窗口）会被过滤掉。
     """
     items = []
 
@@ -129,6 +260,10 @@ def list_windows():
         except (TypeError, ValueError):
             return True
         if not h or not user32.IsWindowVisible(h):
+            return True
+        if user32.IsIconic(h) or is_cloaked(h):
+            return True
+        if _class_name(h) in _SHELL_CLASSES:
             return True
         n = user32.GetWindowTextLengthW(h)
         if n <= 0:
@@ -150,13 +285,22 @@ def get_window_rect(hwnd):
     return rect.as_tuple()
 
 
-def set_window_rect(hwnd, x, y, w, h, activate=True):
+def set_window_rect(hwnd, x, y, w, h, activate=True, exact=False):
+    """摆放窗口，返回 True 表示 SetWindowPos 成功。
+
+    exact=True 时按「可见区域」对齐：补偿 Windows 10/11 的 DWM 透明阴影边框，
+    让并排 / 贴边的窗口真正贴合（见 frame_insets）。
+    """
+    if exact:
+        l, t, r, b = frame_insets(hwnd)
+        x, y, w, h = x - l, y - t, w + l + r, h + t + b
     flags = SWP_NOZORDER | SWP_FRAMECHANGED
     if not activate:
         flags |= SWP_NOACTIVATE
-    user32.SetWindowPos(hwnd, None, int(x), int(y), int(w), int(h), flags)
+    ok = user32.SetWindowPos(hwnd, None, int(x), int(y), int(w), int(h), flags)
     if activate:
         user32.SetForegroundWindow(hwnd)
+    return bool(ok)
 
 
 def _monitor_by_relative(monitors_list, src_hwnd):
@@ -170,21 +314,38 @@ def _monitor_by_relative(monitors_list, src_hwnd):
 
 
 def move_to_monitor(hwnd, monitor, src=None, activate=True):
-    """将窗口移动到目标显示器，保持相对位置比例。
+    """将窗口移动到目标显示器，保持相对位置比例。返回是否成功。
 
     src 为显示器列表快照；缺省时自动枚举（已有列表时应传入避免重复调用）。
     activate=False 时只移动不激活（界面按钮模式，管理器不会被挤到后面）。
+
+    最大化窗口：先落到目标屏再重新最大化，跨屏后仍是最大化状态——此前直接
+    SetWindowPos 会把最大化「打破」成一个铺满的普通大窗口。
     """
     x, y, w, h = get_window_rect(hwnd)
     if src is None:
         src = monitors_list_snapshot()
     idx = _monitor_by_relative(src, hwnd)
     src_m = src[idx] if idx < len(src) else src[0]
-    rel_x = (x - src_m.left) / max(src_m.width, 1)
-    rel_y = (y - src_m.top) / max(src_m.height, 1)
+    if is_maximized(hwnd):
+        prev = user32.GetForegroundWindow() if not activate else None
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        set_window_rect(hwnd, monitor.work_left, monitor.work_top, w, h,
+                        activate=False)
+        user32.ShowWindow(hwnd, SW_MAXIMIZE)
+        if prev:
+            user32.SetForegroundWindow(prev)
+        return True
+    # 相对位置源与目标都用工作区：此前混用「全屏矩形」与「工作区」，
+    # 任务栏占据的那条会被当成可移动范围，导致跨屏后位置整体偏移。
+    rel_x = (x - src_m.work_left) / max(src_m.work_width, 1)
+    rel_y = (y - src_m.work_top) / max(src_m.work_height, 1)
     new_x = monitor.work_left + rel_x * max(monitor.work_width - w, 0)
     new_y = monitor.work_top + rel_y * max(monitor.work_height - h, 0)
-    set_window_rect(hwnd, new_x, new_y, w, h, activate=activate)
+    ok = set_window_rect(hwnd, new_x, new_y, w, h, activate=activate)
+    if not ok:
+        logger.warning("move_to_monitor: SetWindowPos 失败 (hwnd=%s)", hwnd)
+    return ok
 
 
 def snap(hwnd, monitor, zone, activate=True):
@@ -192,50 +353,72 @@ def snap(hwnd, monitor, zone, activate=True):
     left/right/top/bottom/maximize/center，三分屏 left-third/middle-third/right-third，
     四等分 quad-tl/quad-tr/quad-bl/quad-br。
 
-    activate=False 时只移动不激活目标窗口（界面按钮模式）：还原改用
-    SW_SHOWNOACTIVATE，「最大化」退化为铺满工作区（真最大化会抢焦点）。
+    activate=False 时只移动不激活目标窗口（界面按钮模式）：「最大化」退化为
+    铺满工作区（真最大化会抢焦点）。
+
+    摆放一律带 exact=True：补偿 Windows 10/11 的 DWM 透明边框，分屏无缝贴合。
     """
     wl, wt, ww, wh = monitor.work_rect
     x, y, w, h = get_window_rect(hwnd)
+    # 最大化 / 最小化的窗口必须先还原，否则 SetWindowPos 不会改变它的几何
+    need_restore = is_maximized(hwnd) or bool(user32.IsIconic(hwnd))
+    # SW_RESTORE 会抢焦点；不激活模式先记下原前台窗口，摆放完再还回去
+    prev = user32.GetForegroundWindow() if (need_restore and not activate) else None
+
     if zone == "maximize":
         if activate:
             # 真正最大化（含任务栏避让、动画与双击标题栏还原行为）
             user32.ShowWindow(hwnd, SW_MAXIMIZE)
-        else:
-            user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
-            set_window_rect(hwnd, wl, wt, ww, wh, activate=False)
-        return
-    # 非最大化区域前先还原窗口，否则已最大化的窗口不会被正确缩放/移动
-    user32.ShowWindow(hwnd, SW_RESTORE if activate else SW_SHOWNOACTIVATE)
+            return True
+        if need_restore:
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        ok = set_window_rect(hwnd, wl, wt, ww, wh, activate=False, exact=True)
+        if prev:
+            user32.SetForegroundWindow(prev)
+        return ok
+
+    if need_restore:
+        user32.ShowWindow(hwnd, SW_RESTORE)
+    ok = False
     if zone == "left":
-        set_window_rect(hwnd, wl, wt, ww // 2, wh, activate=activate)
+        ok = set_window_rect(hwnd, wl, wt, ww // 2, wh, activate=activate, exact=True)
     elif zone == "right":
-        set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh, activate=activate)
+        ok = set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh,
+                             activate=activate, exact=True)
     elif zone == "top":
-        set_window_rect(hwnd, wl, wt, ww, wh // 2, activate=activate)
+        ok = set_window_rect(hwnd, wl, wt, ww, wh // 2, activate=activate, exact=True)
     elif zone == "bottom":
-        set_window_rect(hwnd, wl, wt + wh // 2, ww, wh - wh // 2, activate=activate)
+        ok = set_window_rect(hwnd, wl, wt + wh // 2, ww, wh - wh // 2,
+                             activate=activate, exact=True)
     elif zone == "center":
-        set_window_rect(hwnd, wl + (ww - w) // 2, wt + (wh - h) // 2, w, h,
-                        activate=activate)
+        ok = set_window_rect(hwnd, wl + (ww - w) // 2, wt + (wh - h) // 2, w, h,
+                             activate=activate, exact=True)
     elif zone == "left-third":
-        set_window_rect(hwnd, wl, wt, ww // 3, wh, activate=activate)
+        ok = set_window_rect(hwnd, wl, wt, ww // 3, wh, activate=activate, exact=True)
     elif zone == "middle-third":
-        set_window_rect(hwnd, wl + ww // 3, wt, ww // 3, wh, activate=activate)
+        ok = set_window_rect(hwnd, wl + ww // 3, wt, ww // 3, wh,
+                             activate=activate, exact=True)
     elif zone == "right-third":
-        set_window_rect(hwnd, wl + 2 * (ww // 3), wt, ww - 2 * (ww // 3), wh,
-                        activate=activate)
+        ok = set_window_rect(hwnd, wl + 2 * (ww // 3), wt, ww - 2 * (ww // 3), wh,
+                             activate=activate, exact=True)
     elif zone == "quad-tl":
-        set_window_rect(hwnd, wl, wt, ww // 2, wh // 2, activate=activate)
+        ok = set_window_rect(hwnd, wl, wt, ww // 2, wh // 2,
+                             activate=activate, exact=True)
     elif zone == "quad-tr":
-        set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh // 2,
-                        activate=activate)
+        ok = set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh // 2,
+                             activate=activate, exact=True)
     elif zone == "quad-bl":
-        set_window_rect(hwnd, wl, wt + wh // 2, ww // 2, wh - wh // 2,
-                        activate=activate)
+        ok = set_window_rect(hwnd, wl, wt + wh // 2, ww // 2, wh - wh // 2,
+                             activate=activate, exact=True)
     elif zone == "quad-br":
-        set_window_rect(hwnd, wl + ww // 2, wt + wh // 2, ww - ww // 2, wh - wh // 2,
-                        activate=activate)
+        ok = set_window_rect(hwnd, wl + ww // 2, wt + wh // 2, ww - ww // 2,
+                             wh - wh // 2, activate=activate, exact=True)
+    else:
+        logger.warning("snap: 未知区域 %s", zone)
+        return False
+    if prev:
+        user32.SetForegroundWindow(prev)
+    return ok
 
 
 def monitors_list_snapshot():
@@ -249,8 +432,8 @@ def move_window_to_next_monitor(hwnd, direction=1, activate=True):
         return False
     idx = _monitor_by_relative(ms, hwnd)
     n = len(ms)
-    move_to_monitor(hwnd, ms[(idx + direction) % n], src=ms, activate=activate)
-    return True
+    return move_to_monitor(hwnd, ms[(idx + direction) % n], src=ms,
+                           activate=activate)
 
 
 def snap_window(hwnd, zone, activate=True):
@@ -259,8 +442,7 @@ def snap_window(hwnd, zone, activate=True):
     if not ms or not hwnd:
         return False
     idx = _monitor_by_relative(ms, hwnd)
-    snap(hwnd, ms[idx], zone, activate=activate)
-    return True
+    return snap(hwnd, ms[idx], zone, activate=activate)
 
 
 def move_active_to_next_monitor(direction=1, use_pinned=True, activate=True):
@@ -316,35 +498,56 @@ def toggle_topmost(hwnd=None, use_pinned=True):
     return make_top
 
 
+_proc_name_cache = {}
+
+
 def _proc_name(pid):
-    """返回进程可执行文件名（用于窗口 label），失败返回 None。"""
+    """返回进程可执行文件名（用于窗口 label），失败返回 None。结果按 PID 缓存。
+
+    每次枚举窗口都对每个窗口 OpenProcess 一遍开销不小（界面刷新列表时会
+    频繁调用），进程名在运行期内不变，缓存即可。
+    """
+    if pid in _proc_name_cache:
+        return _proc_name_cache[pid]
+    name = None
     try:
         h = kernel32.OpenProcess(
             PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
-        if not h:
-            return None
-        buf = ctypes.create_unicode_buffer(260)
-        psapi.GetModuleBaseNameW(h, None, buf, 260)
-        kernel32.CloseHandle(h)
-        return buf.value or None
+        if h:
+            buf = ctypes.create_unicode_buffer(260)
+            psapi.GetModuleBaseNameW(h, None, buf, 260)
+            kernel32.CloseHandle(h)
+            name = buf.value or None
     except Exception:  # noqa: BLE001
-        return None
+        name = None
+    # 进程退出后 PID 可能被复用，设上限避免长期运行无限增长
+    if len(_proc_name_cache) > 512:
+        _proc_name_cache.clear()
+    _proc_name_cache[pid] = name
+    return name
 
 
-def list_windows_front_to_back(min_size=80):
+def list_windows_front_to_back(min_size=80, include_minimized=False):
     """返回按 z 序（最前在前）排列的屏幕窗口列表。
 
     每项: {"hwnd"(int), "pid", "owner", "name", "x", "y", "w", "h"}
-    仅保留可见、有标题、尺寸合理的窗口，并排除本程序自身 PID。
+    仅保留可见、有标题、尺寸合理的窗口，并排除本程序自身 PID、系统壳窗口
+    （任务栏 / 桌面 / 开始菜单）以及被 DWM 隐藏的挂起窗口（UWP 后台应用）。
+    默认还排除最小化窗口——它们并不在屏幕上，分屏对它们没有意义；
+    include_minimized=True 可以把它们列出来。
     """
     results = []
 
     def cb(hwnd, _lparam):
         if not user32.IsWindowVisible(hwnd):
             return True
+        if user32.IsIconic(hwnd) and not include_minimized:
+            return True
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         if pid.value in _OWN_PIDS:
+            return True
+        if _class_name(hwnd) in _SHELL_CLASSES or is_cloaked(hwnd):
             return True
         length = user32.GetWindowTextLengthW(hwnd)
         if length <= 0:
@@ -404,13 +607,30 @@ def list_target_windows():
 
 
 def _find_window(hwnd):
-    """按整数 HWND 重新定位窗口，拿到最新几何；不存在则返回 None。"""
-    if not hwnd:
+    """按整数 HWND 重新定位窗口，拿到最新几何；不存在则返回 None。
+
+    不走 list_windows_front_to_back：那个列表会过滤掉最小化窗口，而固定目标
+    被最小化后用户仍应能对它做分屏 / 跨屏操作，否则固定目标会「消失」。
+    """
+    if not hwnd or not user32.IsWindow(hwnd):
         return None
-    for w in list_windows_front_to_back():
-        if w["hwnd"] == hwnd:
-            return w
-    return None
+    rect = monitors.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    length = user32.GetWindowTextLengthW(hwnd)
+    title = ""
+    if length > 0:
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value
+    return {
+        "hwnd": int(hwnd), "pid": pid.value,
+        "owner": _proc_name(pid.value), "name": title,
+        "x": rect.left, "y": rect.top,
+        "w": rect.right - rect.left, "h": rect.bottom - rect.top,
+    }
 
 
 def _monitor_index_by_rect(monitors_list, x, y, w, h):
@@ -423,9 +643,13 @@ def _monitor_index_by_rect(monitors_list, x, y, w, h):
 
 
 def _place_window(hwnd, x, y, w, h):
-    """先还原（退出最大化）再移动到目标矩形并激活到最前。"""
-    user32.ShowWindow(hwnd, SW_RESTORE)
-    set_window_rect(hwnd, x, y, w, h, activate=True)
+    """先还原（退出最大化 / 最小化）再移动到目标矩形并激活到最前。"""
+    if is_maximized(hwnd) or user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+    ok = set_window_rect(hwnd, x, y, w, h, activate=True, exact=True)
+    if ok and not _verify_visible(hwnd, x, y, w, h):
+        logger.warning("_place_window: 窗口未按预期摆放 (hwnd=%s)", hwnd)
+    return ok
 
 
 def _resolve_pair(left_hwnd, right_hwnd, use_pinned, cands, by_hwnd):
@@ -480,8 +704,7 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, moni
     ms = monitors.enum_monitors()
     if not ms:
         return False
-    cands = [w for w in list_windows_front_to_back()
-             if w["pid"] not in _OWN_PIDS]
+    cands = list_windows_front_to_back()
     by_hwnd = {w["hwnd"]: w for w in cands}
 
     left_w, right_w = _resolve_pair(
@@ -517,8 +740,7 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
     ms = monitors.enum_monitors()
     if not ms:
         return False
-    cands = [w for w in list_windows_front_to_back()
-             if w["pid"] not in _OWN_PIDS]
+    cands = list_windows_front_to_back()
     by_hwnd = {w["hwnd"]: w for w in cands}
 
     # 顶部窗口

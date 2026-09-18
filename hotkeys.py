@@ -87,6 +87,12 @@ class HotkeyManager:
     def register(self, modifiers, vk, callback):
         hid = 1 + len(self.hotkeys)
         self.hotkeys[hid] = (modifiers, vk, callback)
+        # 消息线程已在跑时（界面中途勾选新键位）必须即时补注册：否则新键
+        # 只进了字典、永远收不到 WM_HOTKEY（原先要重启程序才生效）。
+        if self._running and self.hwnd:
+            if not user32.RegisterHotKey(self.hwnd, hid, modifiers, vk):
+                print(f"[hotkeys] 补注册失败 id={hid}"
+                      f" (mod={modifiers}, vk={vk})")
         return hid
 
     def start(self):
