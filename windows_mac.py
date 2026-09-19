@@ -451,22 +451,27 @@ def get_window_rect(hwnd):
 
 
 def set_window_rect(hwnd, x, y, w, h, activate=True):
+    """移动/缩放窗口，闭环补偿以精确命中目标（统一为 content 坐标系）。
+
+    坐标系约定：传入的 (x, y, w, h) 视为窗口**内容区（content）**目标坐标，与 CG
+    读取、zone_rect / snap 计算保持一致。底层用 System Events 的 position/size
+    （作用于 frame 层）写入，而 frame↔content 之间存在 App 特有的标题栏/边框/阴影
+    偏移，且系统对屏边距有硬约束，故写完后用 CG 读回实测偏差并**反向补偿**，最多
+    迭代 4 次，使内容区坐标收敛到目标（真机验证：此前 31px 偏差即源于此未补偿）。
+    """
+    if not hwnd:
+        return
     if not _suppress_undo:
         try:
             push_undo(hwnd, get_window_rect(hwnd))
         except Exception:  # noqa: BLE001
             pass
-    """移动/缩放窗口。用 position + size（bounds 属性在当前 macOS 不可用）。
-
-    部分 App 在 zoomed/全屏态或 Auto Layout 约束下会忽略 `set size`，故先退出
-    zoom；改为先定位到目标位置再设尺寸（在正确位置更容易被 App 接受），最后读回
-    实际几何校验，偏差过大时再补一次 size。
-    """
-    if not hwnd:
-        return
     app, _win = hwnd.split("::", 1)
-    x, y, w, h = int(round(x)), int(round(y)), int(round(w)), int(round(h))
-    logger.info("移动窗口: 进程=%s -> x=%d y=%d w=%d h=%d", app, x, y, w, h)
+    # 原始目标（content 坐标），闭环全程以此为基准，偏差按「实测 - 原始目标」累计
+    tx, ty, tw, th = (int(round(v)) for v in (x, y, w, h))
+    dx_acc = dy_acc = dw_acc = dh_acc = 0
+    pdx = pdy = pdw = pdh = None  # 上一轮偏差，用于停滞检测
+    logger.info("移动窗口: 进程=%s -> content x=%d y=%d w=%d h=%d", app, tx, ty, tw, th)
     # 退出 zoom/全屏态，否则 size 变更可能被忽略
     _osa(
         f'tell application "System Events"\n'
@@ -479,30 +484,36 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
         f'  end tell\n'
         f'end tell\n'
     )
-    # 先定位到目标位置，再调整尺寸（避免 App 在越界/缩放态拒绝 size）
-    _osa(
-        f'tell application "System Events"\n'
-        f'  tell process "{app}"\n'
-        f'    set position of window 1 to {{{x}, {y}}}\n'
-        f'    set size of window 1 to {{{w}, {h}}}\n'
-        f'  end tell\n'
-        f'end tell\n'
-    )
-    # 读回实际几何校验；偏差过大则再补一次 size
-    _last_rect.pop(hwnd, None)
-    try:
-        _, _, aw, ah = get_window_rect(hwnd)
-    except Exception:  # noqa: BLE001
-        aw = ah = None
-    if aw is not None and (abs(aw - w) > 8 or abs(ah - h) > 8):
-        logger.warning("尺寸未生效(期望 %dx%d 实际 %dx%d)，重试 size", w, h, aw, ah)
+    for attempt in range(4):
+        # 期望 frame = 原始目标 - 已观测到的（content - frame）偏差，使 content 命中目标
+        fx, fy, fw, fh = tx - dx_acc, ty - dy_acc, tw - dw_acc, th - dh_acc
         _osa(
             f'tell application "System Events"\n'
             f'  tell process "{app}"\n'
-            f'    set size of window 1 to {{{w}, {h}}}\n'
+            f'    set position of window 1 to {{{fx}, {fy}}}\n'
+            f'    set size of window 1 to {{{fw}, {fh}}}\n'
             f'  end tell\n'
             f'end tell\n'
         )
+        # 读回实测（CG 内容坐标），与原始目标比较
+        _last_rect.pop(hwnd, None)
+        try:
+            c = get_window_rect(hwnd)
+        except Exception:  # noqa: BLE001
+            c = None
+        if not c or c == (0, 0, 0, 0):
+            break
+        cx, cy, cw, ch = c
+        dx_acc, dy_acc, dw_acc, dh_acc = cx - tx, cy - ty, cw - tw, ch - th
+        if abs(dx_acc) <= 2 and abs(dy_acc) <= 2 and abs(dw_acc) <= 2 and abs(dh_acc) <= 2:
+            break
+        # 停滞检测：偏差几乎不再变化 → 已被系统/App 约束到可达边界，提前停止重试
+        if (pdx is not None and abs(dx_acc - pdx) <= 1 and abs(dy_acc - pdy) <= 1
+                and abs(dw_acc - pdw) <= 1 and abs(dh_acc - pdh) <= 1):
+            break
+        pdx, pdy, pdw, pdh = dx_acc, dy_acc, dw_acc, dh_acc
+        logger.info("闭环补偿 实测偏差=(%d,%d,%d,%d) 下一帧=(%d,%d,%d,%d)",
+                    dx_acc, dy_acc, dw_acc, dh_acc, fx, fy, fw, fh)
     if activate:
         _osa(f'tell application "{app}" to activate')
 
