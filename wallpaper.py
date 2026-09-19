@@ -116,11 +116,21 @@ class DesktopWallpaper:
 
     def set_position(self, name):
         pos = POSITION.get(name, 4)
-        self._SetPosition(self.pv, ctypes.c_uint(pos))
+        hr = self._SetPosition(self.pv, ctypes.c_uint(pos))
+        if hr < 0:
+            print("[wallpaper] SetPosition 失败 hr=0x%08X"
+                  % (hr & 0xFFFFFFFF))
+            return False
+        return True
 
     def set_wallpaper(self, monitor_id, path):
         """monitor_id 为设备路径（如 \\\\.\\DISPLAY1）；None 表示所有显示器。"""
-        self._SetWallpaper(self.pv, monitor_id, path)
+        hr = self._SetWallpaper(self.pv, monitor_id, path)
+        if hr < 0:
+            print("[wallpaper] SetWallpaper 失败 hr=0x%08X (%s)"
+                  % (hr & 0xFFFFFFFF, path))
+            return False
+        return True
 
     def close(self):
         """释放 COM 资源。"""
@@ -161,16 +171,24 @@ def close():
 
 
 def apply_per_monitor(mapping, position="fill"):
-    """mapping: {device_path: image_path}。position 为全局填充方式。"""
+    """mapping: {device_path: image_path}。position 为全局填充方式。
+
+    返回 True 表示 COM 路径全部成功；任一显示器失败（路径不可读、接口
+    异常等）会退回 SystemParametersInfoW 的单屏方案兜底。
+    """
     dw = get_desktop_wallpaper()
     if not dw.available():
         if mapping:
             _set_legacy(next(iter(mapping.values())), position)
         return False
     dw.set_position(position)
+    ok = True
     for dev_path, img in mapping.items():
-        dw.set_wallpaper(dev_path, img)
-    return True
+        if not dw.set_wallpaper(dev_path, img):
+            ok = False
+    if not ok:
+        _set_legacy(next(iter(mapping.values())), position)
+    return ok
 
 
 def apply_single(image_path, position="fill"):
@@ -179,8 +197,10 @@ def apply_single(image_path, position="fill"):
         _set_legacy(image_path, position)
         return False
     dw.set_position(position)
-    dw.set_wallpaper(None, image_path)
-    return True
+    if dw.set_wallpaper(None, image_path):
+        return True
+    _set_legacy(image_path, position)
+    return False
 
 
 def _set_legacy(path, position):

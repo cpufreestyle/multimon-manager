@@ -17,6 +17,7 @@ app.icns
 dist/
 *.spec
 *.log
+*.err
 
 # 调试/临时产物
 *.txt
@@ -39,3 +40,4 @@ _*.py
 
 # 本地工作数据（AI 助手记忆/会话数据）
 .codebuddy/
+.workbuddy/

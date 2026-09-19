@@ -65,12 +65,36 @@ set_window_rect = windows.set_window_rect
 move_to_monitor = getattr(windows, "move_to_monitor", lambda *a, **k: False)
 snap_two_side_by_side = getattr(windows, "snap_two_side_by_side", lambda *a, **k: False)
 snap_three_stack = getattr(windows, "snap_three_stack", lambda *a, **k: False)
+# 窗口置顶切换（Windows 实现；macOS 暂无对应实现时为 None，UI 自动隐藏入口）
+toggle_topmost = getattr(windows, "toggle_topmost", None)
 HotkeyManager = hotkeys.HotkeyManager
 # 拖拽吸附监听（F3；macOS 为真实实现，Windows 为占位）
 DragSnapWatcher = dragsnap.DragSnapWatcher
 register_display_callback = display_notify.register
 # 撤销上一次窗口移动（F7）
 undo_last_move = windows.undo_last_move
+
+
+def move_target_to_monitor(index, use_pinned=True, activate=False):
+    """把目标/活动窗口移动到**指定索引**的显示器（跨平台统一入口）。
+
+    与 move_active_to_next_monitor 的区别：那个只能相邻屏逐个跳，多屏时很费事；
+    这里一次到位。activate=False 时只移动不激活（界面按钮模式）。
+
+    Windows 与 macOS 的 move_to_monitor 签名不同（Windows 多一个 src 快照参数），
+    故这里必须用关键字传 activate，不能按位置传。
+    """
+    try:
+        ms = monitors.enum_monitors()
+    except Exception:  # noqa: BLE001
+        return False
+    if index is None or not isinstance(index, int) or not (0 <= index < len(ms)):
+        return False
+    hwnd = windows.get_foreground_window(use_pinned)
+    if not hwnd:
+        return False
+    windows.move_to_monitor(hwnd, ms[index], activate=activate)
+    return True
 
 # 辅助功能授权（仅 macOS 有意义；Windows 始终视为已授权）
 if IS_MAC:

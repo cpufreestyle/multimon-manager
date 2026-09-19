@@ -1,14 +1,39 @@
-"""轻量设置存储（单个 JSON 文件，与 profiles.json 同目录）。
+"""轻量设置存储（单个 JSON 文件）。
 
-用于持久化用户偏好（如全局快捷键的修饰键组合），读写失败时静默降级，
-不影响主流程。
+存放位置：
+- 源码运行：与代码同目录（仓库内，便于开发调试，向后兼容旧行为）；
+- 打包运行（PyInstaller frozen）：__file__ 指向每次启动都会清空的临时解包
+  目录 _MEIPASS，直接写在那里配置会丢，因此改用用户数据目录
+  （Windows %APPDATA%\MultiMonManager，macOS ~/Library/Application Support/MultiMonManager）。
+
+用于持久化用户偏好（全局快捷键开关/修饰键、热插拔开关、启动选项等），
+读写失败时静默降级，不影响主流程。
 """
 import copy
 import json
 import os
 import tempfile
+import sys
 
-_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+
+def data_dir():
+    """用户配置目录（settings.json / layouts.json 等的存放位置）。"""
+    if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            base = os.path.join(os.path.expanduser("~"), "Library",
+                                "Application Support")
+        else:
+            base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        d = os.path.join(base, "MultiMonManager")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:  # noqa: BLE001
+            d = os.path.expanduser("~")
+        return d
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_PATH = os.path.join(data_dir(), "settings.json")
 
 # 读缓存：(mtime_ns, size) -> 已解析数据。
 # UI 轮询（1.5s）里频繁调用 load()，缓存可避免反复读盘/解析；用 (mtime_ns, size)

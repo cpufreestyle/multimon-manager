@@ -13,7 +13,10 @@ import sys
 import tempfile
 
 APP_NAME = "MultiMonManager"
-VERSION = "0.2.2"
+try:
+    from app_version import VERSION
+except Exception:  # noqa: BLE001  # 单独分发安装器时不带 app_version.py
+    VERSION = "0.0.0"
 
 
 def _meipass_or_here(name):

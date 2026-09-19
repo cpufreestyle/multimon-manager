@@ -110,6 +110,20 @@ exec "$PY" main.py "$@"
 
 
 def _version():
+    """返回应用版本号。
+
+    以 `app_version.VERSION` 为唯一来源（build.py / install.py 共用）；
+    兼容旧写法：若该模块缺失，再退回 `version_info.py` 里的 `VERSION` /
+    `version` / `__version__` 属性。注意 `version_info.py` 本身是 PyInstaller
+    的版本资源文件（单表达式，供 eval 解析），正常情况下不含这些属性。
+    """
+    try:
+        import app_version
+        v = getattr(app_version, "VERSION", None)
+        if v:
+            return str(v)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         import version_info
         for attr in ("VERSION", "version", "__version__"):
@@ -118,7 +132,27 @@ def _version():
                 return str(v)
     except Exception:  # noqa: BLE001
         pass
-    return "0.2.3"
+    return "0.0.0"
+
+
+def _check_version_consistency():
+    """校验 version_info.py 里的版本号与 app_version.VERSION 一致。
+
+    version_info.py 必须保持单表达式，无法 import 常量，版本号只能重复书写；
+    这里在打包前提示，避免 exe 属性里的版本号和程序自身版本号对不上。
+    """
+    version = _version()
+    path = os.path.join(HERE, "version_info.py")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return True
+    if version not in text:
+        print(f"[warn] version_info.py 中的版本号与 app_version.VERSION={version} "
+              f"不一致，请同步更新（否则 exe 属性里的版本号会错）")
+        return False
+    return True
 
 
 def build_macos(icon_png):
@@ -221,7 +255,18 @@ def build_windows(icon_png):
         return None
     ico = _make_ico(icon_png, os.path.join(HERE, "app.ico"))
     cmd = [sys.executable, "-m", "PyInstaller", "--noconsole", "--onefile",
-           f"--icon={ico}", f"--name={EXE_NAME}", "main.py"]
+           f"--icon={ico}", f"--name={EXE_NAME}"]
+    # 版本信息文件（exe 属性里的版本号）；文件存在才加，避免老环境构建失败
+    version_file = os.path.join(HERE, "version_info.py")
+    if os.path.exists(version_file):
+        cmd.append(f"--version-file={version_file}")
+    # 排除运行时不需要的第三方大包：resources.py 对 PIL 是可选导入（未装时
+    # 自动降级），numpy/psutil/charset_normalizer 由 PIL（或构建环境）连带
+    # 引入。本程序零第三方运行时依赖；不排除会让 exe 从 ~12MB 涨到 ~29MB，
+    # 也会拖慢每次启动的解包速度。
+    for mod in ("numpy", "psutil", "charset_normalizer", "PIL"):
+        cmd.append(f"--exclude-module={mod}")
+    cmd.append("main.py")
     print("[win]", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True, cwd=HERE)
@@ -248,6 +293,8 @@ def main():
         clean()
         return
     os.makedirs(DIST, exist_ok=True)
+    print(f"[build] 版本 {_version()}")
+    _check_version_consistency()
     icon = prepare_icon()
     if sys.platform == "darwin":
         if "--frozen" in sys.argv:

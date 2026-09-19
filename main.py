@@ -30,6 +30,7 @@ def _setup_logging():
 _setup_logging()
 
 import backend
+import cmd_channel
 import resources
 import ui
 
@@ -143,6 +144,10 @@ def main():
 
     logging.getLogger(__name__).info("启动: frozen=%s argv=%s",
                                      getattr(sys, "frozen", False), sys.argv[1:])
+    # 清掉上次运行可能残留的托盘命令，避免新实例启动即执行旧的 open/exit
+    cmd_channel.take()
+    # --minimized：开机自启静默模式（启动后不显示主窗口，仅托盘）
+    start_minimized = "--minimized" in sys.argv
     _set_dpi_aware()
     if not _single_instance():
         logging.getLogger(__name__).info("已有实例在运行，退出")
@@ -186,14 +191,21 @@ def main():
     app = ui.App(root)
     logging.getLogger(__name__).info("界面构建完成")
 
-    # 启动即显示主界面（否则后台启动的窗口会被压在其它窗口后面）
-    _activate_frontmost(root)
+    if start_minimized:
+        # 静默启动：隐藏主窗口，只留托盘（双击托盘图标再打开）
+        try:
+            root.withdraw()
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        # 启动即显示主界面（否则后台启动的窗口会被压在其它窗口后面）
+        _activate_frontmost(root)
 
     # macOS 首次运行需辅助功能授权；未授权时主动引导授权。
     # 注意：系统授权框（AXIsProcessTrustedWithOptions(prompt)）在很多场景下不会弹
     # （非用户点击触发 / 曾被拒绝 / 打包解释器），故额外直接打开设置页 + 界面提示，
     # 确保用户一定被引导到要开启的开关（最可靠）。
-    if sys.platform == "darwin":
+    if sys.platform == "darwin" and not start_minimized:
         def _maybe_prompt_accessibility():
             try:
                 if not backend.is_accessibility_trusted():
@@ -209,12 +221,16 @@ def main():
     # 托盘运行在独立 Tk 子进程，避免与主窗口共用事件循环导致 macOS 黑屏
     os.environ["MAIN_PID"] = str(os.getpid())
     t = backend.tray.TrayIcon()
+    # 托盘动作统一走命令通道：Windows 托盘回调在托盘消息线程里执行，直接调
+    # Tk 方法跨线程不安全；macOS 托盘是独立子进程，同样依赖该通道。命令由
+    # 主界面 _poll_command 在 Tk 主线程消费（open/refresh/apply_layout/exit）。
     t.create(
         icon_path,
         "多屏管理器",
-        on_open=app.show,
-        on_exit=app.quit,
-        on_refresh=app.refresh_monitors,
+        on_open=lambda: cmd_channel.send("open"),
+        on_exit=lambda: cmd_channel.send("exit"),
+        on_refresh=lambda: cmd_channel.send("refresh"),
+        on_apply_layout=lambda: cmd_channel.send("apply_layout"),
     )
     # 托盘面板也是本应用的窗口，登记后窗口工具会跳过它，避免误操作自己
     if getattr(t, "proc", None) is not None:

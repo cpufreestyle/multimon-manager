@@ -1,127 +1,150 @@
 #!/usr/bin/env python3
-import os, sys, json, zipfile, urllib.parse
-import subprocess, urllib.request, urllib.error
+"""发布脚本：打 tag + 创建 GitHub Release + 上传附件。
+
+用法（仓库根目录）：
+    set GITHUB_TOKEN=<token>      # Windows
+    export GITHUB_TOKEN=<token>   # macOS / Linux
+    python _release.py
+
+说明：
+- tag 通过 GitHub API 在远端创建（绕开本机 git 凭证/keychain），本地也会打一份；
+- Release body 沿用线上既有风格（`## vX.Y.Z 更新内容` + `### 小节`）；
+- 附件按存在性上传：dist/MultiMonManager.exe、dist/MultiMonManager-Setup.exe、
+  dist/多屏管理器.app.zip；同名附件会先删除再上传，脚本可重复执行（幂等）。
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+import subprocess
 
 TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-TAG = "v0.2.4"
+TAG = "v0.3.2"
+TITLE = "v0.3.2 — 跨屏尺寸自适应 / 缩放比显示"
 REPO = "cpufreestyle/multimon-manager"
+BRANCH = "master"
 API = f"https://api.github.com/repos/{REPO}"
 
-RELEASE_BODY = """## Multi-Monitor Manager v0.2.4
+# 代理：沙箱/墙内直连 GitHub 常不可达，按顺序探测本地端口
+PROXY_CANDIDATES = [os.environ.get("HTTPS_PROXY"), os.environ.get("https_proxy"),
+                    "http://127.0.0.1:7897", "http://127.0.0.1:10809", None]
 
-跨平台多屏管理器，Windows + macOS 双实现，零第三方依赖。
+RELEASE_BODY = """## v0.3.2 更新内容
 
-### What's Changed
-- **修复 macOS 启动即崩溃**（`Fatal Python error: PyEval_RestoreThread: GIL is released`）：
-  移除与 Tk 主循环并存的后台 `CFRunLoop`，显示器监听改为主线程轮询，
-  全局热键的事件 tap 改挂主线程 CFRunLoop
-- **修复全局快捷键在 macOS 上从未真正生效**（三处常量错误）：
-  - `CGEventTapCreate` 的 `eventsOfInterest` 是位掩码，须传 `1 << kCGEventKeyDown`（1024），
-    此前误传 10，导致键盘事件被全部过滤
-  - `CGEventField` 字段号修正：键码 `9`、修饰键 `59`（此前误为 113 / 115，键码恒读 0）
-  - tap 位置与插入位常量修正为 `kCGSessionEventTap=1` / `kCGHeadInsertEventTap=0`
-- 显示器变化监听 `display_notify_mac` 改为主线程注册回调，彻底消除后台 runloop 隐患
-- **界面改为单页 + 垂直滚动**：原先的两个分页面板合并为一页，右侧滑块可上下滑动，
-  并支持滚轮（macOS / Windows / X11 量级自动换算）
-- 日志降噪：工作区计算日志由 INFO 降为 DEBUG，不再每 2 秒刷屏
-- 新增「竖排上中下」：把三个窗口堆叠到上 / 中 / 下三栏
-- 「并排左右」「竖排上中下」现已支持 Windows（此前仅 macOS）
-- 应用图标圆角外的白色背景改为透明
+> 接着 v0.3.1 把「窗口挪到另一块屏」这件事做完整：缩放比不同的屏之间保持肉眼大小，
+> 分辨率差太多时自动缩小，顺便修掉一个会让窗口每次跨屏都缩一圈的问题。
 
-### Features
-- **每屏壁纸** — 为每个显示器设置独立壁纸
-- **窗口跨屏 / 吸附** — 窗口在多屏间移动与边缘吸附
-- **全局快捷键** — 可自定义修饰键（macOS ⌘⌥ / Windows Ctrl+Alt）+ 数字键 1~9 与方向键
-- **系统托盘** — Windows 托盘 / macOS Dock 菜单 + 面板
-- **竖排上中下 / 并排左右** — 两 / 三个窗口排到左右半屏或上中下三栏（macOS + Windows）
-- **显示器热插拔** — 自动检测显示器变化
-- **零第三方依赖** — 纯 Python 标准库 + ctypes 实现
+### 新增（Windows）
+- **跨屏缩放比自适应**：壁纸可视化现在会标出每块屏的缩放比（`1920x1080 @125%`）。
+  窗口跨屏移动时，若目标屏缩放比不同、且该窗口是 per-monitor DPI aware
+  （这类窗口的物理尺寸不随缩放变化），会按 DPI 比例缩放，**保持肉眼大小一致**。
+  DPI-unaware / system-aware 的窗口由系统自己做拉伸，程序不干预，避免双重缩放
+- **装不下就缩小**：目标屏工作区比窗口小（例如从 4K 屏挪到 1080p 笔记本屏），
+  会等比缩到留 4% 边距，不再让窗口溢出到屏幕外
 
-### Download
-- **macOS**：`多屏管理器.app.zip`（已作为下方附件，解压即用）
-- **Windows**：在 Windows 上执行 `python3 build.py`（需 PyInstaller）自行打包 exe
+### 修复
+- **修掉跨屏累积缩小**：`move_to_monitor` 原来用 `GetWindowRect` 判断窗口是否装得进
+  目标屏。但 `GetWindowRect` 含一圈透明阴影边框（v0.3.1 已确认约 8px），铺满工作区的
+  窗口用它比大小会「高」出几个像素，于是每次跨屏都被判定装不下而缩一圈——
+  实测一个半屏窗口 `976x1028 → 929x979`，连挪几次会越来越小。
+  现在位置与尺寸统一在**可见矩形**空间里计算，不再累积缩小
 
-### Files
-| 模块 | 说明 |
-|------|------|
-| `backend.py` | 平台分发入口 |
-| `wallpaper.py` / `wallpaper_mac.py` | 壁纸管理 |
-| `windows.py` / `windows_mac.py` | 窗口管理 |
-| `monitors.py` / `monitors_mac.py` | 显示器信息 |
-| `hotkeys.py` / `hotkeys_mac.py` | 全局快捷键 |
-| `tray.py` / `tray_mac.py` | 系统托盘 |
-| `display_notify_mac.py` | 显示器变化监听（主线程） |
-| `profiles.py` | 配置管理 |
-| `resources.py` | 资源文件 |
-| `ui.py` | 用户界面 |
-| `main.py` | 主入口 |
+### 实现要点
+- `monitors.py`：记录每块屏的 `HMONITOR` 与有效 DPI（`GetDpiForMonitor`），
+  新增 `effective_dpi()` 与 `MonitorInfo.scale_percent`
+- `windows.py`：新增 `window_is_per_monitor_aware()`、`fit_size_for_monitor()`，
+  以及开关 `set_resize_on_monitor_change()`（默认开启）
+
+### 附件
+- MultiMonManager.exe：主程序（单文件，可直接运行）
+- MultiMonManager-Setup.exe：安装包（安装到 `%LOCALAPPDATA%\\MultiMonManager`，含开始菜单 / 桌面快捷方式与卸载项）
+
+> Windows 版「每屏不同壁纸」需 Windows 8+；macOS 需在「系统设置 → 隐私与安全性 → 辅助功能」中授权，否则窗口控制与全局快捷键不可用。
+> 本版改动集中在 Windows 端；macOS 侧逻辑未变动，待真机回归后再一并验证。
 """
 
 
-def gh(method, url, data=None):
+def _opener(proxy):
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    else:
+        handlers.append(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers)
+
+
+def _pick_proxy():
+    """返回第一个能访问 GitHub API 的代理（None 表示直连可用）。"""
+    for cand in PROXY_CANDIDATES:
+        try:
+            req = urllib.request.Request(f"{API}/releases?per_page=1")
+            req.add_header("Accept", "application/vnd.github+json")
+            req.add_header("User-Agent", "mmm-release")
+            with _opener(cand).open(req, timeout=15) as r:
+                if r.status == 200:
+                    print(f"[proxy] 使用 {cand or '直连'}")
+                    return cand
+        except Exception as e:  # noqa: BLE001
+            print(f"[proxy] {cand or '直连'} 不可用: {str(e)[:80]}")
+    return None
+
+
+def gh(method, url, data=None, proxy=None):
     """统一 GitHub API 调用，出错也返回 (status, json)。"""
     req = urllib.request.Request(url, method=method)
     req.add_header("Authorization", f"Bearer {TOKEN}")
-    req.add_header("User-Agent", "deploy")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", "mmm-release")
     if data is not None:
         req.add_header("Content-Type", "application/json")
         req.data = json.dumps(data).encode()
-    op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with op.open(req, timeout=30) as resp:
+        with _opener(proxy).open(req, timeout=60) as resp:
             raw = resp.read().decode()
             return resp.status, (json.loads(raw) if raw else {})
     except urllib.error.HTTPError as e:
         raw = e.read().decode()
         try:
             return e.code, json.loads(raw)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return e.code, {"message": raw}
 
 
-# Step 1: 本地打 tag + 通过 GitHub API 在远程创建 tag（绕过本机 git 凭证/keychain）
-print(f"[git] git tag {TAG}")
-t = subprocess.run(["git", "tag", TAG], capture_output=True, text=True, timeout=30)
-if t.stderr and "already exists" not in t.stderr:
-    print(t.stderr.strip(), file=sys.stderr)
+def upload_asset(upload_base, data, path, label, proxy):
+    name = os.path.basename(path)
+    for a in data.get("assets", []):
+        if a.get("name") == name:
+            gh("DELETE", f"{API}/releases/assets/{a['id']}", proxy=proxy)
+            print(f"[asset] 已删除同名旧附件 {name}")
+            break
+    url = upload_base + "?" + urllib.parse.urlencode({"name": name, "label": label})
+    with open(path, "rb") as f:
+        blob = f.read()
+    req = urllib.request.Request(url, method="POST", data=blob)
+    req.add_header("Authorization", f"Bearer {TOKEN}")
+    req.add_header("User-Agent", "mmm-release")
+    req.add_header("Content-Type", "application/octet-stream")
+    try:
+        with _opener(proxy).open(req, timeout=600) as resp:
+            ad = json.loads(resp.read().decode())
+        print(f"[asset] OK {name} ({len(blob)/1048576:.2f} MB) -> {ad.get('browser_download_url')}")
+        return True
+    except urllib.error.HTTPError as e:
+        print(f"[asset] ERROR {name} {e.code}: {e.read().decode()[:200]}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        print(f"[asset] ERROR {name}: {e}", file=sys.stderr)
+    return False
 
-sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-s1, rd = gh("POST", f"{API}/git/refs", {"ref": f"refs/tags/{TAG}", "sha": sha})
-if s1 == 201:
-    print(f"[git] 远程 tag {TAG} 已创建 (sha {sha[:8]})")
-elif s1 == 422:
-    print(f"[git] 远程 tag {TAG} 已存在，跳过")
-else:
-    print(f"[git] 远程 tag 创建失败 status={s1}: {rd.get('message')}", file=sys.stderr)
-    sys.exit(1)
 
-# Step 2: 创建（或复用已存在的）Release
-body = {
-    "tag_name": TAG,
-    "name": "v0.2.4 — Stability, Hotkeys & UI",
-    "body": RELEASE_BODY,
-    "draft": False,
-    "prerelease": False,
-}
-status, data = gh("POST", f"{API}/releases", body)
-if status == 201:
-    print(f"\n[release] OK: {data.get('html_url')}")
-elif status == 422:
-    s2, existing = gh("GET", f"{API}/releases/tags/{TAG}")
-    data = existing
-    print(f"\n[release] 已存在，复用: {data.get('html_url')}")
-else:
-    print(f"[release] ERROR {status}: {data.get('message')}", file=sys.stderr)
-    sys.exit(1)
-
-# Step 3: 打包 .app 并作为附件上传（GitHub 不支持直接上传目录，需先压成 zip）
-upload_base = data["upload_url"].split("{")[0]
-app_dir = "dist/多屏管理器.app"
-zip_name = "多屏管理器.app.zip"
-if not os.path.isdir(app_dir):
-    print(f"[asset] 跳过：未找到 {app_dir}", file=sys.stderr)
-else:
-    zip_path = os.path.join("dist", zip_name)
+def zip_app():
+    """把 macOS .app 目录压成 zip（GitHub 不支持上传目录）。返回路径或 None。"""
+    app_dir = "dist/多屏管理器.app"
+    if not os.path.isdir(app_dir):
+        return None
+    zip_path = "dist/多屏管理器.app.zip"
     if os.path.exists(zip_path):
         os.remove(zip_path)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -130,24 +153,57 @@ else:
                 fp = os.path.join(root, f)
                 zf.write(fp, os.path.relpath(fp, "dist"))
     print(f"[asset] 已打包 {zip_path} ({os.path.getsize(zip_path)//1024} KB)")
-    # 若同名资产已存在则先删除，避免重复上传 422
-    for a in data.get("assets", []):
-        if a.get("name") == zip_name:
-            gh("DELETE", f"{API}/releases/assets/{a['id']}")
-            print(f"[asset] 已删除旧资产 {zip_name}")
-            break
-    asset_url = (upload_base + "?" +
-                 urllib.parse.urlencode({"name": zip_name, "label": "macOS 应用 (.app.zip)"}))
-    with open(zip_path, "rb") as f:
-        blob = f.read()
-    req = urllib.request.Request(asset_url, method="POST", data=blob)
-    req.add_header("Authorization", f"Bearer {TOKEN}")
-    req.add_header("User-Agent", "deploy")
-    req.add_header("Content-Type", "application/zip")
-    op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    try:
-        with op.open(req, timeout=120) as resp:
-            ad = json.loads(resp.read().decode())
-        print(f"[asset] OK: {ad.get('browser_download_url')}")
-    except urllib.error.HTTPError as e:
-        print(f"[asset] ERROR {e.code}: {e.read().decode()}", file=sys.stderr)
+    return zip_path
+
+
+def main():
+    if not TOKEN:
+        print("缺少 GITHUB_TOKEN 环境变量", file=sys.stderr)
+        return 1
+    proxy = _pick_proxy()
+
+    # 幂等检查：已存在则停下，不重复创建
+    st, existing = gh("GET", f"{API}/releases/tags/{TAG}", proxy=proxy)
+    if st == 200:
+        print(f"[release] {TAG} 已存在：{existing.get('html_url')}")
+        print("如需更新正文，请用 PATCH /releases/<id>；本脚本不覆盖已发布内容。")
+        return 0
+
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                         text=True).stdout.strip()
+    print(f"[git] HEAD = {sha}")
+    t = subprocess.run(["git", "tag", TAG], capture_output=True, text=True)
+    if t.stderr and "already exists" not in t.stderr:
+        print(t.stderr.strip(), file=sys.stderr)
+
+    st, data = gh("POST", f"{API}/releases", {
+        "tag_name": TAG,
+        "target_commitish": BRANCH,
+        "name": TITLE,
+        "body": RELEASE_BODY,
+        "draft": False,
+        "prerelease": False,
+    }, proxy=proxy)
+    if st != 201:
+        print(f"[release] ERROR {st}: {data.get('message')}", file=sys.stderr)
+        return 1
+    print(f"[release] OK: {data.get('html_url')}")
+
+    upload_base = data["upload_url"].split("{")[0]
+    uploads = [
+        ("dist/MultiMonManager.exe", "Windows 主程序（单文件）"),
+        ("dist/MultiMonManager-Setup.exe", "Windows 安装包"),
+    ]
+    mac_zip = zip_app()
+    if mac_zip:
+        uploads.append((mac_zip, "macOS 应用 (.app.zip)"))
+    for path, label in uploads:
+        if os.path.exists(path):
+            upload_asset(upload_base, data, path, label, proxy)
+        else:
+            print(f"[asset] 跳过（不存在）: {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
