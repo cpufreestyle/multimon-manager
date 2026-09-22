@@ -22,7 +22,8 @@ FORMAT = 1
 _MIGRATABLE_KEYS = (
     "hk_enabled", "hk_mods",
     "watch_displays", "watch_auto_apply",
-    "rotate_dir", "rotate_interval_min",
+    "rotate_dir", "rotate_interval_sec", "rotate_shuffle", "rotate_running",
+    "slideshow",
 )
 
 

@@ -104,15 +104,17 @@ class TrayIcon:
         self.on_exit = None
         self.on_refresh = None
         self.on_apply_layout = None
+        self.on_toggle_rotate = None
         self._wndproc = None
         self._clsname = "MultiMonTrayWnd"
 
     def create(self, icon_path, tip="多屏管理器", on_open=None, on_exit=None,
-               on_refresh=None, on_apply_layout=None):
+               on_refresh=None, on_apply_layout=None, on_toggle_rotate=None):
         self.on_open = on_open
         self.on_exit = on_exit
         self.on_refresh = on_refresh
         self.on_apply_layout = on_apply_layout
+        self.on_toggle_rotate = on_toggle_rotate
         if icon_path and os.path.exists(icon_path):
             try:
                 self.hicon = user32.LoadImageW(
@@ -140,6 +142,8 @@ class TrayIcon:
                     self.on_refresh()
                 elif cmd == 1004 and self.on_apply_layout:
                     self.on_apply_layout()
+                elif cmd == 1005 and self.on_toggle_rotate:
+                    self.on_toggle_rotate()
                 return 0
             return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
@@ -183,6 +187,7 @@ class TrayIcon:
         hmenu = user32.CreatePopupMenu()
         user32.AppendMenuW(hmenu, 0x0000, 1001, "打开主界面")
         user32.AppendMenuW(hmenu, 0x0000, 1004, "应用最近窗口布局")
+        user32.AppendMenuW(hmenu, 0x0000, 1005, "开始/停止轮换")
         user32.AppendMenuW(hmenu, 0x0000, 1003, "刷新显示器")
         user32.AppendMenuW(hmenu, 0x0000 | 0x0800, 0, None)  # MF_SEPARATOR
         user32.AppendMenuW(hmenu, 0x0000, 1002, "退出")
@@ -222,6 +227,7 @@ class TrayIcon:
         self.on_exit = None
         self.on_refresh = None
         self.on_apply_layout = None
+        self.on_toggle_rotate = None
 
     # close 与 destroy 等价，供 App.on_exit 调用
     close = destroy

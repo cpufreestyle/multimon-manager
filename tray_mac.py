@@ -18,7 +18,7 @@ class TrayIcon:
         self.tip = "多屏管理器"
 
     def create(self, icon_path, tip="多屏管理器", on_open=None, on_exit=None,
-               on_refresh=None, on_apply_layout=None):
+               on_refresh=None, on_apply_layout=None, on_toggle_rotate=None):
         """启动独立托盘子进程。
 
         on_open / on_exit 是主进程回调，这里仅用于提示，真正动作由主进程

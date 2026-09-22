@@ -2318,6 +2318,11 @@ class App:
             self._apply_last_layout()
         elif cmd == "open":
             self.show()
+        elif cmd == "toggle_slideshow":
+            # 托盘「开始/停止幻灯片」：走 UI 开关，无模态框（状态栏反馈结果）
+            enabled = not bool(slideshow.get_config()["enabled"])
+            self.slideshow_enabled_var.set(enabled)
+            self._slideshow_toggle()
         elif cmd.startswith("apply_scenario:"):
             self._apply_scenario_by_signature(cmd.split(":", 1)[1])
         elif cmd == "exit":

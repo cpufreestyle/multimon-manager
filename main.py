@@ -231,6 +231,7 @@ def main():
         on_exit=lambda: cmd_channel.send("exit"),
         on_refresh=lambda: cmd_channel.send("refresh"),
         on_apply_layout=lambda: cmd_channel.send("apply_layout"),
+        on_toggle_rotate=lambda: cmd_channel.send("toggle_rotate"),
     )
     # 托盘面板也是本应用的窗口，登记后窗口工具会跳过它，避免误操作自己
     if getattr(t, "proc", None) is not None:
