@@ -327,6 +327,18 @@ def invalidate_monitors_cache():
     _mon_cache["data"] = None
 
 
+def _cg_is_builtin(did, default=False):
+    """CGDisplayIsBuiltin 的安全包装；调用失败时返回 default。
+
+    单独抽出来是因为「是否内建屏」只影响显示名称，绝不该因为它抛异常而拖垮
+    整个枚举（调用链 refresh_monitors → enum_monitors 上没有 try）。
+    """
+    try:
+        return bool(_cg.CGDisplayIsBuiltin(did))
+    except Exception:  # noqa: BLE001
+        return default
+
+
 def enum_monitors(force=False, work=True):
     """枚举所有活跃显示器，返回 MonitorInfo 列表（带 2s 缓存）。
 
@@ -346,38 +358,72 @@ def enum_monitors(force=False, work=True):
         return monitors
 
     # 1. 通过 CoreGraphics 获取所有显示器的 bounds
+    cg_displays = []
     count = ctypes.c_uint32(0)
     _cg.CGGetActiveDisplayList(0, None, ctypes.byref(count))
+
+    # 原实现只在 count>0 分支里取主屏 ID（count==0 时提前 return 了）。
+    # 现在 count==0 也要用它兜底，所以必须保护住：调用链
+    # refresh_monitors → enum_monitors 上没有 try，异常会直接崩到启动流程。
+    main_id = None
+    try:
+        main_id = _cg.CGMainDisplayID()
+    except Exception:  # noqa: BLE001
+        logger.warning("CGMainDisplayID 调用失败，将按可用信息回退判定主屏",
+                       exc_info=True)
+
     if count.value == 0:
-        return monitors
-
-    display_ids = (ctypes.c_uint32 * count.value)()
-    _cg.CGGetActiveDisplayList(count.value, display_ids, ctypes.byref(count))
-
-    main_id = _cg.CGMainDisplayID()
-
-    cg_displays = []
-    for i in range(count.value):
-        did = display_ids[i]
-        bounds = _cg.CGDisplayBounds(did)
-        w = int(bounds.size.width)
-        h = int(bounds.size.height)
-        x = int(bounds.origin.x)
-        y = int(bounds.origin.y)
-        is_builtin = False
+        if main_id is None:
+            return monitors  # 既无活跃显示器、又拿不到主屏 ID，无法兜底
+        # CG 报告「没有活跃显示器」：锁屏 / 显示器休眠 / 无图形会话时会出现。
+        # 此前这里静默返回空列表，会让分区、任务栏、触发器、壁纸等一系列功能
+        # 全部无声失效且毫无提示，故改为：记日志 + 用主屏 bounds 兜底，
+        # 保证至少主屏可用（真机 2026-09-20 复现：锁屏后 count=0 但主屏 ID 有效）。
+        logger.error(
+            "CoreGraphics 报告 0 个活跃显示器（可能已锁屏 / 显示器休眠 / "
+            "无图形会话）；尝试用主屏 bounds 兜底")
         try:
-            is_builtin = bool(_cg.CGDisplayIsBuiltin(did))
-        except Exception:
+            bounds = _cg.CGDisplayBounds(main_id)
+            bw = int(bounds.size.width)
+            bh = int(bounds.size.height)
+            if bw > 0 and bh > 0:
+                cg_displays.append({
+                    "id": main_id,
+                    "x": int(bounds.origin.x), "y": int(bounds.origin.y),
+                    "width": bw, "height": bh,
+                    # 不硬编码 True：外接显示器作主屏很常见（Mac mini / 台式机），
+                    # 写死会把外接屏错标成内建屏（显示名会变成 "Built-in Display"）
+                    "is_builtin": _cg_is_builtin(main_id, default=True),
+                    "is_main": True,
+                })
+        except Exception:  # noqa: BLE001
             pass
-        is_main = did == main_id
+        if not cg_displays:
+            return monitors
+    else:
+        display_ids = (ctypes.c_uint32 * count.value)()
+        _cg.CGGetActiveDisplayList(count.value, display_ids, ctypes.byref(count))
+        if main_id is None:
+            # 拿不到主屏 ID 时按第一块屏当主屏，避免所有屏都丢失 is_primary 标记
+            main_id = display_ids[0] if count.value else None
 
-        cg_displays.append({
-            "id": did,
-            "x": x, "y": y,
-            "width": w, "height": h,
-            "is_builtin": is_builtin,
-            "is_main": is_main,
-        })
+        for i in range(count.value):
+            did = display_ids[i]
+            bounds = _cg.CGDisplayBounds(did)
+            w = int(bounds.size.width)
+            h = int(bounds.size.height)
+            x = int(bounds.origin.x)
+            y = int(bounds.origin.y)
+            is_builtin = _cg_is_builtin(did)
+            is_main = did == main_id
+
+            cg_displays.append({
+                "id": did,
+                "x": x, "y": y,
+                "width": w, "height": h,
+                "is_builtin": is_builtin,
+                "is_main": is_main,
+            })
 
     # 2. 解析 system_profiler 获取显示器名称
     names_info = _parse_display_names()

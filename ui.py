@@ -885,8 +885,17 @@ class App:
                 b.move_to_monitor(win["hwnd"], mon)
                 self.status_var.set("触发器：已把窗口移到目标显示器")
             elif action == "scenario":
-                self._apply_scenario_by_signature(t.get("param"))
-                self.status_var.set("触发器：已套用情景")
+                sig = t.get("param")
+                if not scenarios.get(sig):
+                    # 情景不存在时不能报"已套用"，那是误导
+                    self.status_var.set(
+                        f"触发器：情景不存在（{scenarios.describe(sig)}）")
+                elif self._apply_scenario_by_signature(sig):
+                    self.status_var.set("触发器：已套用情景")
+                else:
+                    # 情景存在但壁纸方案/布局都被删了：实际什么都没套用
+                    self.status_var.set(
+                        "触发器：情景无可用预设（壁纸方案/布局可能已被删除）")
             elif action == "rules":
                 self._apply_rules_now()
         except Exception:  # noqa: BLE001
@@ -2340,13 +2349,16 @@ class App:
         self._apply_layout()
 
     def _apply_scenario_by_signature(self, signature):
-        """套用指定签名对应的情景（供托盘"切换情景"调用）。"""
+        """套用指定签名对应的情景（供托盘"切换情景"与触发器调用）。
+
+        返回实际应用的描述列表（为空表示情景存在但没有可用预设）。
+        """
         scen = scenarios.get(signature)
         if not scen:
             self.status_var.set(
                 f"托盘：情景不存在（{scenarios.describe(signature)}）")
-            return
-        self._apply_scenario(signature, scen)
+            return []
+        return self._apply_scenario(signature, scen)
 
     # ---------- 逻辑 ----------
     def refresh_monitors(self):
