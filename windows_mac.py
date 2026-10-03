@@ -20,6 +20,7 @@ import logging
 import os
 import subprocess
 import threading
+import time
 
 import monitors_mac as monitors
 from monitors_mac import CGRect
@@ -450,14 +451,57 @@ def get_window_rect(hwnd):
     return rect
 
 
-def set_window_rect(hwnd, x, y, w, h, activate=True):
-    """移动/缩放窗口，闭环补偿以精确命中目标（统一为 content 坐标系）。
+def _wait_rect_stable(hwnd, timeout=1.5, interval=0.08, need=3):
+    """等窗口几何稳定后再读回；始终不稳时返回最后一次读数。
 
-    坐标系约定：传入的 (x, y, w, h) 视为窗口**内容区（content）**目标坐标，与 CG
-    读取、zone_rect / snap 计算保持一致。底层用 System Events 的 position/size
-    （作用于 frame 层）写入，而 frame↔content 之间存在 App 特有的标题栏/边框/阴影
-    偏移，且系统对屏边距有硬约束，故写完后用 CG 读回实测偏差并**反向补偿**，最多
-    迭代 4 次，使内容区坐标收敛到目标（真机验证：此前 31px 偏差即源于此未补偿）。
+    System Events 写入 position/size 后系统会播放移动 / 缩放动画，此时 CG 读到
+    的是**动画中间帧**。闭环若把中间帧当实测值，会高估偏差并反向补偿过头，
+    把窗口越推越远，4 次重试很快耗尽，最终落位偏差可达数百 px。
+
+    竖屏（portrait）尤其明显：纵向跨度 2000+px，一次「上半屏 → 下半屏」要移动
+    近千 px，动画时间长、中间帧与目标相差极远，这就是「竖屏上中下不准」的根因。
+    小位移（主屏内微调）动画短，才显得准。
+
+    判定方式：连续 need 次读回完全一致才认为动画结束。只要求「连续 2 次」是不够的——
+    动画卡顿时会连续采到同一个中间帧而误判稳定，闭环随即按中间帧大幅反向补偿，
+    窗口被越推越远（实测下半屏会被推到屏幕外）。
+    """
+    last = None
+    same = 0
+    waited = 0.0
+    while waited < timeout:
+        _last_rect.pop(hwnd, None)
+        try:
+            cur = get_window_rect(hwnd)
+        except Exception:  # noqa: BLE001
+            return last
+        if cur and cur != (0, 0, 0, 0):
+            if cur == last:
+                same += 1
+                if same >= need:
+                    return cur
+            else:
+                same = 1
+            last = cur
+        time.sleep(interval)
+        waited += interval
+    return last
+
+
+def set_window_rect(hwnd, x, y, w, h, activate=True):
+    """移动/缩放窗口：反复写入同一目标值推进到位（幂等重设），而非反向补偿。
+
+    坐标系约定：传入的 (x, y, w, h) 是窗口应占据的屏幕矩形，与 zone_rect / snap
+    的分区计算保持一致。
+
+    早期实现是「读回实测偏差后反向补偿」，但 System Events 对一次写入只做部分应用
+    （变化量越大动画越长），读回值取决于写入前的窗口状态、并不稳定，据此补偿会把
+    窗口推飞——竖屏（小米 portrait 1152x2048）上「上半屏 / 整屏高度」就是这么跑偏
+    数百 px 的（用户反馈「竖屏上中下不准」）。
+
+    现改为幂等重设：每次都写入同一个目标值，等动画结束后读回，只要还在变好就继续；
+    读回不再变化即认为已触达系统 / App 可达边界（例如标题栏占住的顶部约 30px，
+    窗口永远贴不到 work_top），此时停止，不再徒劳补偿。
     """
     if not hwnd:
         return
@@ -469,8 +513,11 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
     app, _win = hwnd.split("::", 1)
     # 原始目标（content 坐标），闭环全程以此为基准，偏差按「实测 - 原始目标」累计
     tx, ty, tw, th = (int(round(v)) for v in (x, y, w, h))
-    dx_acc = dy_acc = dw_acc = dh_acc = 0
-    pdx = pdy = pdw = pdh = None  # 上一轮偏差，用于停滞检测
+    # 幂等重设次数上限：下半屏约 3 次命中；整屏高度类（变化量最大）需更多次才触顶
+    max_retry = 16
+    prev = None
+    best_dev = None
+    stall = 0
     logger.info("移动窗口: 进程=%s -> content x=%d y=%d w=%d h=%d", app, tx, ty, tw, th)
     # 退出 zoom/全屏态，否则 size 变更可能被忽略
     _osa(
@@ -484,36 +531,45 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
         f'  end tell\n'
         f'end tell\n'
     )
-    for attempt in range(4):
-        # 期望 frame = 原始目标 - 已观测到的（content - frame）偏差，使 content 命中目标
-        fx, fy, fw, fh = tx - dx_acc, ty - dy_acc, tw - dw_acc, th - dh_acc
+    # 幂等重设推进：System Events 对一次写入只「部分应用」——变化量越大动画越长，
+    # 单次写入常常只走一部分（竖屏整屏高度实测只到 1465/2002）。反复写入同一个目标
+    # 会持续推进，直到命中或触到系统上限（下半屏实测 3 次即精确命中）。
+    #
+    # 早期实现是「按读回偏差反向补偿」，但读回值依赖写入前的窗口状态、并不稳定，
+    # 据此算出的补偿量会把窗口推飞（竖屏实测偏差被放大到数百 px），故改为幂等重设：
+    # 每次都写同一个目标值，只判断「是否还在变好」，不做数值补偿。
+    for attempt in range(max_retry):
         _osa(
             f'tell application "System Events"\n'
             f'  tell process "{app}"\n'
-            f'    set position of window 1 to {{{fx}, {fy}}}\n'
-            f'    set size of window 1 to {{{fw}, {fh}}}\n'
+            f'    set position of window 1 to {{{tx}, {ty}}}\n'
+            f'    set size of window 1 to {{{tw}, {th}}}\n'
             f'  end tell\n'
             f'end tell\n'
         )
-        # 读回实测（CG 内容坐标），与原始目标比较
-        _last_rect.pop(hwnd, None)
-        try:
-            c = get_window_rect(hwnd)
-        except Exception:  # noqa: BLE001
-            c = None
+        # 必须等动画结束再读，否则读到中间帧会误判。这里用较短的超时：重设是「反复
+        # 推进」，每轮只需判断是否还在变好，不必等到完全静止，好把时间留给下一轮
+        c = _wait_rect_stable(hwnd, timeout=0.5)
         if not c or c == (0, 0, 0, 0):
             break
-        cx, cy, cw, ch = c
-        dx_acc, dy_acc, dw_acc, dh_acc = cx - tx, cy - ty, cw - tw, ch - th
-        if abs(dx_acc) <= 2 and abs(dy_acc) <= 2 and abs(dw_acc) <= 2 and abs(dh_acc) <= 2:
+        dev = max(abs(a - t) for a, t in zip(c, (tx, ty, tw, th)))
+        if dev <= 2:
             break
-        # 停滞检测：偏差几乎不再变化 → 已被系统/App 约束到可达边界，提前停止重试
-        if (pdx is not None and abs(dx_acc - pdx) <= 1 and abs(dy_acc - pdy) <= 1
-                and abs(dw_acc - pdw) <= 1 and abs(dh_acc - pdh) <= 1):
-            break
-        pdx, pdy, pdw, pdh = dx_acc, dy_acc, dw_acc, dh_acc
-        logger.info("闭环补偿 实测偏差=(%d,%d,%d,%d) 下一帧=(%d,%d,%d,%d)",
-                    dx_acc, dy_acc, dw_acc, dh_acc, fx, fy, fw, fh)
+        # 停止条件用「偏差是否还在改善」而不是「读回是否变化」：整屏高度这类大变化
+        # 每次推进都很小，读回看着像没动，其实仍在靠近；提前停会卡在半路。
+        if best_dev is None or dev < best_dev - 1:
+            best_dev = dev
+            stall = 0
+        else:
+            stall += 1
+            if stall >= 2:
+                # 连续两次都没再改善 → 已触达系统/App 可达边界（例如标题栏占住的
+                # 顶部约 30px，窗口永远贴不到 work_top），再写也只是白等
+                logger.info("已达可达边界：实测=%s 目标=(%d,%d,%d,%d) 偏差=%d",
+                            c, tx, ty, tw, th, dev)
+                break
+        prev = c
+        logger.info("幂等重设 第%d次 实测=%s 偏差=%d", attempt + 1, c, dev)
     if activate:
         _osa(f'tell application "{app}" to activate')
 
