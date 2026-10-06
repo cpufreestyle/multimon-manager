@@ -1,5 +1,7 @@
 # 多屏管理器（跨平台）
 
+> michaelqiu 出品
+
 一个用纯 Python 实现的多显示器管理小工具，主要能力包括：
 **每屏不同壁纸与壁纸轮换、窗口跨屏移动（含跳到指定屏）、分屏吸附（含三分屏/四等分）、
 壁纸与窗口布局方案、配置备份恢复、全局快捷键、显示器热插拔响应、托盘/菜单栏**。
@@ -91,6 +93,8 @@ python3 build.py --clean  # 清理构建产物
   时（例如从 4K 屏挪到 1080p 笔记本屏）会等比缩小到留 4% 边距。
 
 ### macOS
+- **窗口置顶切换（Windows 独有）**：Windows 用 SetWindowPos(HWND_TOPMOST) 实现；macOS 的 AXFloating 写入被系统拒绝（错误 -10006），SkyLight/CGS 接口从非 WindowServer 客户端调用同样无效，故 macOS 端不提供该按钮。
+- **托盘按钮**：macOS 常驻面板与 Windows 托盘菜单项一一对应：打开主界面 / 应用窗口布局 / 切换情景 / 开始·停止幻灯片 / 刷新显示器 / 退出。
 - **首次运行需授权辅助功能**：系统设置 → 隐私与安全性 → 辅助功能，把运行本程序的
   Python/终端加入列表，否则全局快捷键与窗口控制不可用。
 - 每屏不同壁纸通过直接写 `~/Library/Application Support/Dock/desktoppicture.db` 实现，

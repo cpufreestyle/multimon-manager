@@ -8,3 +8,5 @@
 """
 
 VERSION = "0.3.2"
+
+AUTHOR = "michaelqiu 出品"

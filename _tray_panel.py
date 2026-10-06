@@ -1,6 +1,6 @@
 """托盘快速访问面板（独立 Tk 进程运行，避免影响主窗口渲染）。
 
-提供：打开主界面 / 应用窗口布局 / 切换情景 / 刷新显示器 / 退出。
+提供：打开主界面 / 应用窗口布局 / 切换情景 / 开始·停止幻灯片 / 刷新显示器 / 退出。
 除"打开主界面"外都通过命令文件通知主进程执行（见 cmd_channel）；退出直接终止
 主进程。主进程 PID 通过环境变量 MAIN_PID 传入；若未传入则仅退出本面板。
 """
@@ -37,7 +37,7 @@ def main(tip=None):
 
     root = tk.Tk()
     root.title(tip)
-    root.geometry("220x235+1400+20")
+    root.geometry("220x270+1400+20")
     root.resizable(False, False)
 
     tk.Label(root, text=tip, font=("Arial", 12, "bold")).pack(pady=6)
@@ -89,6 +89,8 @@ def main(tip=None):
     if not scen_rows:
         scen_btn.configure(state="disabled")
 
+    tk.Button(root, text="开始/停止幻灯片",
+              command=lambda: send_and_activate("toggle_slideshow")).pack(fill="x", padx=14, pady=2)
     tk.Button(root, text="刷新显示器",
               command=lambda: send_and_activate("refresh")).pack(fill="x", padx=14, pady=2)
     tk.Button(root, text="退出", command=do_exit).pack(fill="x", padx=14, pady=2)

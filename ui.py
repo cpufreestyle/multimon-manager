@@ -72,7 +72,7 @@ def _looks_like_image(path):
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("多屏管理器")
+        self.root.title("多屏管理器 · michaelqiu 出品")
         # 默认宽度取 820：窗口工具里有「并排」「竖排」两组下拉，120 DPI 下
         # 760 宽会把最右侧的按钮挤出可视区（横向没有滚动条）。
         self.root.geometry("820x740")
@@ -134,9 +134,12 @@ class App:
 
         top = ttk.Frame(self.content)
         top.pack(fill="x", padx=8, pady=(6, 2))
-        ttk.Button(top, text="刷新显示器", command=self.refresh_monitors).pack(side="left")
+        rm_btn = ttk.Button(top, text="刷新显示器", command=self.refresh_monitors)
+        rm_btn.pack(side="left")
+        self._tooltip(rm_btn, "重新检测当前连接的显示器（插拔屏幕后点这里）")
         self.status_var = tk.StringVar(value="")
         ttk.Label(top, textvariable=self.status_var).pack(side="left", padx=10)
+        ttk.Label(top, text="michaelqiu 出品", foreground="#666666").pack(side="right", padx=(4, 2))
 
         # 辅助功能授权提示（默认隐藏，未授权时由 main 调用 show 显示）
         self._perm_frame = ttk.Frame(self.content)
@@ -331,6 +334,56 @@ class App:
         """显示器展示名：优先别名，否则回退系统名。"""
         return self.aliases.get(m.device_path) or m.device_name
 
+    def _tooltip(self, widget, text):
+        """给控件加悬停提示（tk 无内置 tooltip，用 Toplevel 实现）。
+
+        悬停 ~0.5s 后在控件下方弹出淡黄色说明气泡，移开即消失。
+        """
+        tip = {"win": None, "job": None}
+
+        def _show(_e=None):
+            if tip["win"] is not None:
+                return
+            w = tk.Toplevel(widget)
+            tip["win"] = w
+            w.wm_overrideredirect(True)
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            w.wm_geometry(f"+{x}+{y}")
+            lbl = tk.Label(
+                w, text=text, justify="left", background="#ffffe0",
+                foreground="#333333", relief="solid", borderwidth=1,
+                font=("Arial", 11), padx=8, pady=5, wraplength=360,
+            )
+            lbl.pack()
+
+        def _hide(_e=None):
+            if tip["job"] is not None:
+                try:
+                    widget.after_cancel(tip["job"])
+                except Exception:  # noqa: BLE001
+                    pass
+                tip["job"] = None
+            if tip["win"] is not None:
+                try:
+                    tip["win"].destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+                tip["win"] = None
+
+        def _schedule(_e=None):
+            _hide()
+            tip["job"] = widget.after(500, _show)
+
+        widget.bind("<Enter>", _schedule)
+        widget.bind("<Leave>", _hide)
+        widget.bind("<ButtonPress>", _hide)
+
+    def _tip(self, widget, text):
+        """_tooltip 的简短别名，返回传入的 widget 便于链式调用。"""
+        self._tooltip(widget, text)
+        return widget
+
     def _on_alias_change(self, device_path, var):
         """显示器别名变更：更新内存与 settings.json，并刷新相关展示。"""
         val = (var.get() or "").strip()
@@ -374,44 +427,74 @@ class App:
                                       state="readonly", width=34)
         self.target_cb.pack(side="left", fill="x", expand=True, padx=4)
         self.target_cb.bind("<<ComboboxSelected>>", self._on_target_selected)
-        ttk.Button(sel, text="刷新列表", command=self._refresh_targets).pack(side="left")
-        ttk.Checkbutton(sel, text="常驻置顶", variable=self.topmost,
-                        command=self._apply_topmost).pack(side="left", padx=(8, 0))
+        self._tooltip(
+            self.target_cb,
+            "选择要操作的窗口。「自动」取上次活动窗口；同名窗口（如多个 UU远程）"
+            "按 #序号 区分，可分别选中。下面所有移动/分屏按钮都作用在这里选中的窗口上。")
+        rf_btn = ttk.Button(sel, text="刷新列表", command=self._refresh_targets)
+        rf_btn.pack(side="left")
+        self._tooltip(rf_btn, "重新枚举当前所有可选窗口（新开/关闭窗口后点这里）")
+        topmost_cb = ttk.Checkbutton(sel, text="常驻置顶", variable=self.topmost,
+                                     command=self._apply_topmost)
+        topmost_cb.pack(side="left", padx=(8, 0))
+        self._tooltip(
+            topmost_cb,
+            "勾选后本管理器窗口始终浮在最前，操作别的窗口时不会被盖住。")
 
         # activate=False：只移动窗口、不激活它，管理器才不会被挤到后面
         btns = [
-            ("移到上一屏", lambda: b.move_active_to_next_monitor(-1, activate=False)),
-            ("移到下一屏", lambda: b.move_active_to_next_monitor(1, activate=False)),
-            ("左半", lambda: b.snap_active("left", activate=False)),
-            ("右半", lambda: b.snap_active("right", activate=False)),
-            ("上半", lambda: b.snap_active("top", activate=False)),
-            ("下半", lambda: b.snap_active("bottom", activate=False)),
-            ("最大化", lambda: b.snap_active("maximize", activate=False)),
-            ("居中", lambda: b.snap_active("center", activate=False)),
-            ("左1/3", lambda: b.snap_active("left-third", activate=False)),
-            ("中1/3", lambda: b.snap_active("middle-third", activate=False)),
-            ("右1/3", lambda: b.snap_active("right-third", activate=False)),
-            ("左上", lambda: b.snap_active("quad-tl", activate=False)),
-            ("右上", lambda: b.snap_active("quad-tr", activate=False)),
-            ("左下", lambda: b.snap_active("quad-bl", activate=False)),
-            ("右下", lambda: b.snap_active("quad-br", activate=False)),
+            ("移到上一屏", lambda: b.move_active_to_next_monitor(-1, activate=False),
+             "把目标窗口按相对位置移到上一块显示器"),
+            ("移到下一屏", lambda: b.move_active_to_next_monitor(1, activate=False),
+             "把目标窗口按相对位置移到下一块显示器"),
+            ("左半", lambda: b.snap_active("left", activate=False),
+             "目标窗口贴到当前屏幕的左半屏"),
+            ("右半", lambda: b.snap_active("right", activate=False),
+             "目标窗口贴到当前屏幕的右半屏"),
+            ("上半", lambda: b.snap_active("top", activate=False),
+             "目标窗口贴到当前屏幕的上半屏"),
+            ("下半", lambda: b.snap_active("bottom", activate=False),
+             "目标窗口贴到当前屏幕的下半屏"),
+            ("最大化", lambda: b.snap_active("maximize", activate=False),
+             "目标窗口铺满当前屏幕的工作区"),
+            ("居中", lambda: b.snap_active("center", activate=False),
+             "目标窗口在当前屏幕居中，尺寸不变"),
+            ("左1/3", lambda: b.snap_active("left-third", activate=False),
+             "目标窗口占当前屏幕左三分之一"),
+            ("中1/3", lambda: b.snap_active("middle-third", activate=False),
+             "目标窗口占当前屏幕中间三分之一"),
+            ("右1/3", lambda: b.snap_active("right-third", activate=False),
+             "目标窗口占当前屏幕右三分之一"),
+            ("左上", lambda: b.snap_active("quad-tl", activate=False),
+             "目标窗口占当前屏幕左上角四分之一"),
+            ("右上", lambda: b.snap_active("quad-tr", activate=False),
+             "目标窗口占当前屏幕右上角四分之一"),
+            ("左下", lambda: b.snap_active("quad-bl", activate=False),
+             "目标窗口占当前屏幕左下角四分之一"),
+            ("右下", lambda: b.snap_active("quad-br", activate=False),
+             "目标窗口占当前屏幕右下角四分之一"),
         ]
         # 窗口置顶切换（当前仅 Windows 提供实现，其它平台自动隐藏入口）
         if getattr(b, "toggle_topmost", None) is not None:
-            btns.append(("置顶切换", lambda: self._toggle_topmost_action()))
+            btns.append(("置顶切换", lambda: self._toggle_topmost_action(),
+                         "切换目标窗口是否置顶显示"))
         # 15 个按钮分三行排列（6 + 6 + 3），避免超出窗口宽度被截断。
         for group in (btns[:6], btns[6:12], btns[12:]):
             row = ttk.Frame(f)
             row.pack(fill="x", pady=2)
-            for text, cmd in group:
-                ttk.Button(row, text=text,
-                           command=self._keep_front_after(cmd)).pack(side="left", padx=3)
+            for text, cmd, tip in group:
+                btn = ttk.Button(row, text=text,
+                                 command=self._keep_front_after(cmd))
+                btn.pack(side="left", padx=3)
+                self._tooltip(btn, tip)
 
         # 撤销：回退上一次窗口移动/缩放（F7）
         undo_row = ttk.Frame(f)
         undo_row.pack(fill="x", pady=2)
-        ttk.Button(undo_row, text="撤销移动",
-                   command=self._undo_move).pack(side="left", padx=3)
+        undo_btn = ttk.Button(undo_row, text="撤销移动",
+                              command=self._undo_move)
+        undo_btn.pack(side="left", padx=3)
+        self._tooltip(undo_btn, "回退上一次窗口的移动/缩放（快捷键 F7）")
         # 移到指定屏：只有"上一屏/下一屏"时，三屏以上要连点好几次才能到位，
         # 这里直接选目标屏一次跳过去（下拉与并排/竖排共用同一份显示器列表）。
         mon_row = ttk.Frame(f)
@@ -421,9 +504,15 @@ class App:
         self.move_mon_cb = ttk.Combobox(mon_row, textvariable=self.move_mon_var,
                                         state="readonly", width=18)
         self.move_mon_cb.pack(side="left", padx=(4, 6))
-        ttk.Button(mon_row, text="移到该屏",
-                   command=self._keep_front_after(
-                       self._move_to_selected_monitor)).pack(side="left")
+        self._tooltip(
+            self.move_mon_cb,
+            "选择目标显示器。「自动」按窗口当前所在屏；要跨屏一次跳到位时，"
+            "在这里选定具体某块屏，再点右侧「移到该屏」。")
+        mv_btn = ttk.Button(mon_row, text="移到该屏",
+                            command=self._keep_front_after(
+                                self._move_to_selected_monitor))
+        mv_btn.pack(side="left")
+        self._tooltip(mv_btn, "把目标窗口一次移动到左侧下拉框选中的显示器")
 
         # 并排左右：可选目标显示器 + 可指定左右两个窗口（留"自动"则由程序取最前面两个）
         sbs = ttk.Frame(f)
@@ -435,19 +524,26 @@ class App:
         self.sbs_mon_cb = ttk.Combobox(sbs, textvariable=self.sbs_mon_var,
                                        state="readonly", width=13)
         self.sbs_mon_cb.pack(side="left", padx=(4, 2))
+        self._tooltip(self.sbs_mon_cb, "并排到哪块屏。「自动」按左窗口当前所在屏。")
         self.sbs_left_var = tk.StringVar(value=AUTO_TARGET)
         self.sbs_right_var = tk.StringVar(value=AUTO_TARGET)
         ttk.Label(sbs, text="左").pack(side="left", padx=(8, 2))
         self.sbs_left_cb = ttk.Combobox(sbs, textvariable=self.sbs_left_var,
                                         state="readonly", width=11)
         self.sbs_left_cb.pack(side="left")
+        self._tooltip(self.sbs_left_cb, "并排的左窗口。竖屏时改作上半屏。")
         ttk.Label(sbs, text="右").pack(side="left", padx=(8, 2))
         self.sbs_right_cb = ttk.Combobox(sbs, textvariable=self.sbs_right_var,
                                          state="readonly", width=11)
         self.sbs_right_cb.pack(side="left")
-        ttk.Button(sbs, text="并排左右",
-                   command=self._snap_two_side_by_side).pack(
-            side="left", padx=(10, 0))
+        self._tooltip(self.sbs_right_cb, "并排的右窗口。竖屏时改作下半屏。")
+        sbs_btn = ttk.Button(sbs, text="并排左右",
+                             command=self._snap_two_side_by_side)
+        sbs_btn.pack(side="left", padx=(10, 0))
+        self._tooltip(
+            sbs_btn,
+            "把「左」「右」两个窗口并排到同一屏。竖屏上自动改成上/下各半屏堆叠。"
+            "留「自动」时取最前面的两个窗口。")
 
         # 竖排上中下：可选目标显示器 + 可指定上/中/下三个窗口（留"自动"则由程序取最前面三个）
         stack = ttk.Frame(f)
@@ -457,24 +553,32 @@ class App:
         self.stack_mon_cb = ttk.Combobox(stack, textvariable=self.stack_mon_var,
                                          state="readonly", width=13)
         self.stack_mon_cb.pack(side="left", padx=(4, 2))
+        self._tooltip(self.stack_mon_cb, "竖排到哪块屏。「自动」按上窗口当前所在屏。")
         self.stack_top_var = tk.StringVar(value=AUTO_TARGET)
         self.stack_mid_var = tk.StringVar(value=AUTO_TARGET)
         self.stack_bot_var = tk.StringVar(value=AUTO_TARGET)
         ttk.Label(stack, text="上").pack(side="left", padx=(8, 2))
         self.stack_top_cb = ttk.Combobox(stack, textvariable=self.stack_top_var,
-                                         state="readonly", width=10)
+                                         state="readonly", width=16)
         self.stack_top_cb.pack(side="left")
+        self._tooltip(self.stack_top_cb, "竖排最上面的窗口。同名窗口按 #序号 选。")
         ttk.Label(stack, text="中").pack(side="left", padx=(6, 2))
         self.stack_mid_cb = ttk.Combobox(stack, textvariable=self.stack_mid_var,
-                                         state="readonly", width=10)
+                                         state="readonly", width=16)
         self.stack_mid_cb.pack(side="left")
+        self._tooltip(self.stack_mid_cb, "竖排中间的窗口。同名窗口按 #序号 选。")
         ttk.Label(stack, text="下").pack(side="left", padx=(6, 2))
         self.stack_bot_cb = ttk.Combobox(stack, textvariable=self.stack_bot_var,
-                                         state="readonly", width=10)
+                                         state="readonly", width=16)
         self.stack_bot_cb.pack(side="left")
-        ttk.Button(stack, text="竖排上中下",
-                   command=self._snap_three_stack).pack(
-            side="left", padx=(10, 0))
+        self._tooltip(self.stack_bot_cb, "竖排最下面的窗口。同名窗口按 #序号 选。")
+        stack_btn = ttk.Button(stack, text="竖排上中下",
+                               command=self._snap_three_stack)
+        stack_btn.pack(side="left", padx=(10, 0))
+        self._tooltip(
+            stack_btn,
+            "把「上」「中」「下」三个窗口竖向堆叠到同一屏，各占三分之一。"
+            "同名窗口（如多个 UU远程）请在下拉框按 #序号 选不同窗口。")
 
         # 台前调度开启时，两个不同 App 的窗口必须处于同一个"台前组"才会同时显示，
         # 而 macOS 无公开 API 建组，只能用户先手动拖到一起。
@@ -520,6 +624,28 @@ class App:
         if self.target_var.get() not in self._target_map:
             self.target_var.set(AUTO_TARGET)
             b.set_target(None)
+        self._refresh_trigger_pattern_candidates(wins)
+
+    def _refresh_trigger_pattern_candidates(self, wins=None):
+        """刷新触发器「匹配文字」下拉的候选：按匹配依据列出当前应用名或窗口标题。"""
+        cb = getattr(self, "trig_pattern_cb", None)
+        if cb is None:
+            return
+        if wins is None:
+            try:
+                wins = b.list_target_windows()
+            except Exception:  # noqa: BLE001
+                wins = []
+        field = getattr(self, "trig_field_var", None)
+        by_title = field is not None and field.get() == "title"
+        seen, vals = set(), []
+        for w in wins:
+            v = (w.get("name") or "") if by_title else (w.get("owner") or "")
+            v = v.strip()
+            if v and v not in seen:
+                seen.add(v)
+                vals.append(v)
+        cb["values"] = vals
 
     def _refresh_monitor_choices(self):
         """刷新并排/竖排所用的显示器下拉（含"自动"），尽量保留当前选择。"""
@@ -579,7 +705,13 @@ class App:
         mon_idx = self._monitor_map.get(self.sbs_mon_var.get())
         mon_label = self.sbs_mon_var.get()
         if b.snap_two_side_by_side(left_hwnd=left, right_hwnd=right, monitor=mon_idx):
-            self.status_var.set("已并排左右" + (f"（{mon_label}）" if mon_idx is not None else ""))
+            # 竖屏上自动变成上下堆叠，状态栏如实反映
+            mon = (self.monitors[mon_idx]
+                   if mon_idx is not None and mon_idx < len(self.monitors) else None)
+            if mon is not None and mon.height > mon.width:
+                self.status_var.set(f"竖屏已上下堆叠（{mon_label}）")
+            else:
+                self.status_var.set("已并排左右" + (f"（{mon_label}）" if mon_idx is not None else ""))
         else:
             self.status_var.set("并排失败：需要至少两个可操作窗口")
 
@@ -666,14 +798,29 @@ class App:
         form = ttk.Frame(f)
         form.pack(fill="x", padx=4, pady=2)
         self.trig_field_var = tk.StringVar(value="owner")
-        ttk.Combobox(form, textvariable=self.trig_field_var, width=6, state="readonly",
-                     values=["owner", "title"]).pack(side="left")
+        trig_field_cb = ttk.Combobox(form, textvariable=self.trig_field_var, width=6,
+                                     state="readonly", values=["owner", "title"])
+        trig_field_cb.pack(side="left")
+        trig_field_cb.bind("<<ComboboxSelected>>",
+                           lambda _e: self._refresh_trigger_pattern_candidates())
+        self._tooltip(trig_field_cb,
+                      "匹配依据：owner=应用名，title=窗口标题。")
         self.trig_pattern_var = tk.StringVar()
-        ttk.Entry(form, textvariable=self.trig_pattern_var, width=14).pack(side="left", padx=2)
+        # 用可编辑下拉框替代纯文本框：下拉列出当前各应用名/标题便于直接选，
+        # 也可手动输入（如要匹配尚未打开的窗口）。候选在刷新窗口列表时更新。
+        self.trig_pattern_cb = ttk.Combobox(form, textvariable=self.trig_pattern_var,
+                                            width=14)
+        self.trig_pattern_cb.pack(side="left", padx=2)
+        self._tooltip(self.trig_pattern_cb,
+                      "要匹配的文字（包含即可）。下拉列出当前应用名可直接选，"
+                      "也可手动输入；留空则匹配所有窗口。")
         self.trig_event_var = tk.StringVar(value=triggers.EVENT_LABELS["moved"])
-        ttk.Combobox(form, textvariable=self.trig_event_var, width=8, state="readonly",
-                     values=[triggers.EVENT_LABELS[e] for e in triggers.EVENTS]
-                     ).pack(side="left", padx=2)
+        trig_ev_cb = ttk.Combobox(form, textvariable=self.trig_event_var, width=8,
+                                  state="readonly",
+                                  values=[triggers.EVENT_LABELS[e] for e in triggers.EVENTS])
+        trig_ev_cb.pack(side="left", padx=2)
+        self._tooltip(trig_ev_cb,
+                      "触发时机：「被移动」= 窗口被拖动后；「新出现」= 窗口刚打开。")
         self.trig_action_var = tk.StringVar(value=triggers.ACTION_LABELS["snap"])
         act_cb = ttk.Combobox(form, textvariable=self.trig_action_var, width=12,
                               state="readonly",
@@ -696,6 +843,7 @@ class App:
         self.trig_list.pack(fill="x", padx=4, pady=2)
         self._refresh_trigger_params()
         self._refresh_trigger_list()
+        self._refresh_trigger_pattern_candidates()
 
     def _on_trig_action_change(self, event=None):
         """动作类型变化时刷新参数候选。"""
@@ -915,16 +1063,29 @@ class App:
 
         f = ttk.LabelFrame(parent, text="多屏任务栏")
         f.pack(fill="x", padx=6, pady=(4, 8), anchor="n")
-        ttk.Checkbutton(f, text="启用（每块显示器显示一条窗口列表）",
-                        variable=self.taskbar_enabled_var,
-                        command=self._taskbar_toggle).pack(anchor="w", padx=4, pady=2)
+        tb_cb = ttk.Checkbutton(f, text="启用（每块显示器显示一条窗口列表）",
+                                variable=self.taskbar_enabled_var,
+                                command=self._taskbar_toggle)
+        tb_cb.pack(anchor="w", padx=4, pady=2)
+        self._tooltip(
+            tb_cb,
+            "勾选后，每块显示器边缘各显示一条该屏的窗口列表，"
+            "点窗口名可直接把它提到最前。")
         row = ttk.Frame(f)
         row.pack(fill="x", padx=4, pady=2)
         ttk.Label(row, text="位置:").pack(side="left")
-        ttk.Combobox(row, textvariable=self.taskbar_pos_var, width=6, state="readonly",
-                     values=list(TASKBAR_POS)).pack(side="left", padx=2)
-        ttk.Label(row, text="点窗口名激活；◀ ▶ 把选中窗口移到相邻显示器",
-                  foreground="#666").pack(side="left", padx=8)
+        pos_cb = ttk.Combobox(row, textvariable=self.taskbar_pos_var, width=6,
+                              state="readonly", values=list(TASKBAR_POS))
+        pos_cb.pack(side="left", padx=2)
+        self._tooltip(pos_cb, "任务栏贴在屏幕的底部还是顶部。")
+        hint_lbl = ttk.Label(
+            row, text="点窗口名激活；◀ ▶ 把选中窗口移到相邻显示器",
+            foreground="#666")
+        hint_lbl.pack(side="left", padx=8)
+        self._tooltip(
+            hint_lbl,
+            "任务栏用法：点窗口名把它激活到最前；点 ◀ ▶ 箭头把该窗口"
+            "移到相邻的显示器。")
         if enabled:
             self._taskbar_toggle()
         # 轮询刷新（仅启用时才真正枚举窗口）

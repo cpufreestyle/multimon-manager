@@ -258,6 +258,7 @@ def list_windows_front_to_back(min_size=80):
                 "pid": _cfnumber_to_int(_dict_get(d, "kCGWindowOwnerPID")),
                 "owner": owner,
                 "name": _cfstring_to_str(_dict_get(d, "kCGWindowName")),
+                "wid": _cfnumber_to_int(_dict_get(d, "kCGWindowNumber")),
                 "x": int(r.origin.x),
                 "y": int(r.origin.y),
                 "w": w,
@@ -292,7 +293,40 @@ def front_external_window(min_reasonable=(160, 120)):
 
 # ── 对外接口 ─────────────────────────────────────────────────────────
 
-_last_rect = {}  # "app::winname" -> (x, y, w, h)，来自 CG 的精确几何
+# hwnd 格式：「应用名::窗口名#序号」。
+# 序号是该应用同名窗口按 z 序的 1 基编号（唯一时省略，向后兼容旧格式
+# 「应用名::窗口名」）。UU远程 这类应用所有窗口同名（多为空串），只靠
+# 「应用::窗口名」会全部撞成一个标识：枚举去重后 6 个窗口只剩 1 个，
+# 且 set_window_rect 的 AppleScript 永远写 window 1——这就是"自动排列
+# 不准 / 只显示一个窗口"的根因。带序号后，规则引擎 / 并排 / 三栏 / 任务栏
+# 都能区分并精确操作每个窗口。
+
+def make_hwnd(owner, name, seq=None):
+    """生成窗口标识；seq 为同名窗口的 1 基序号（唯一/首个时不带 #n）。"""
+    base = f"{owner}::{name}"
+    return f"{base}#{seq}" if seq and seq > 1 else base
+
+
+def parse_hwnd(hwnd):
+    """拆出 (应用名, 窗口名, 序号)；旧格式（无 #n）序号返回 None。"""
+    app, _, rest = hwnd.partition("::")
+    seq = None
+    if "#" in rest:
+        rest, _, tail = rest.rpartition("#")
+        try:
+            seq = int(tail)
+        except ValueError:  # noqa: BLE001
+            rest = f"{rest}#{tail}"  # 标题本身含 #，原样保留
+    return app, rest, seq
+
+
+def _same_name_windows(app, name):
+    """该应用下同窗口名的全部窗口（z 序），按 hwnd 序号语义排列。"""
+    return [w for w in list_windows_front_to_back()
+            if w["owner"] == app and (w["name"] or "") == (name or "")]
+
+
+_last_rect = {}  # "app::winname#seq" -> (x, y, w, h)，来自 CG 的精确几何
 
 # 界面上固定的目标窗口。自动判断（"最前面的非本程序窗口"）经常猜错：
 # 例如用户停在 IDE 聊天窗口时点按钮，最前面的就是 IDE，结果把 IDE 分屏了。
@@ -315,29 +349,45 @@ def list_target_windows():
     """列出可选窗口（供界面下拉框），已排除本程序与系统浮层。
 
     返回 [{"hwnd", "label", "owner", "name", "x", "y", "w", "h"}, ...]
+
+    同名窗口（如 UU远程 的多个会话窗口）按 z 序编号区分，不再被去重吞掉。
     """
     out = []
-    seen = set()
-    for w in list_windows_front_to_back():
-        hwnd = f'{w["owner"]}::{w["name"]}'
-        if hwnd in seen:
-            continue
-        seen.add(hwnd)
+    name_count = {}
+    name_seen = {}
+    raw = list_windows_front_to_back()
+    for w in raw:
+        key = (w["owner"], w["name"] or "")
+        name_count[key] = name_count.get(key, 0) + 1
+    for w in raw:
+        key = (w["owner"], w["name"] or "")
+        n = name_seen.get(key, 0) + 1
+        name_seen[key] = n
+        seq = n if name_count[key] > 1 else None
+        hwnd = make_hwnd(w["owner"], w["name"] or "", seq)
         title = f'{w["owner"]} — {w["name"]}' if w["name"] else w["owner"]
         # 带上尺寸，便于区分同名/小窗口
         label = f'{title}  ({w["w"]}×{w["h"]})'
-        out.append({**w, "hwnd": hwnd, "label": label})
+        if seq:
+            # 序号放最前：下拉框宽度有限会截尾，放前面才看得到区分
+            label = f"#{seq} {label}"
+        out.append({**w, "hwnd": hwnd, "seq": seq, "label": label})
     return out
 
 
 def _find_window(hwnd):
-    """按 "app::name" 重新定位窗口，拿到最新几何（窗口可能被移动过）。"""
+    """按 hwnd 重新定位窗口，拿到最新几何（窗口可能被移动过）。
+
+    兼容旧格式「app::name」：同名多窗口时取最前面那个。
+    """
     if not hwnd:
         return None
-    for w in list_windows_front_to_back():
-        if f'{w["owner"]}::{w["name"]}' == hwnd:
-            return w
-    return None
+    app, name, seq = parse_hwnd(hwnd)
+    same = _same_name_windows(app, name)
+    if not same:
+        return None
+    idx = min((seq or 1) - 1, len(same) - 1)
+    return same[idx]
 
 
 def get_foreground_window(use_pinned=True):
@@ -358,7 +408,15 @@ def get_foreground_window(use_pinned=True):
 
     w = front_external_window()
     if w:
-        key = f'{w["owner"]}::{w["name"]}'
+        # 同名多窗口时补上 z 序编号，避免后续操作落到别的同名窗口上
+        same = _same_name_windows(w["owner"], w["name"] or "")
+        seq = None
+        if len(same) > 1:
+            for i, s in enumerate(same, 1):
+                if s.get("wid") is not None and s.get("wid") == w.get("wid"):
+                    seq = i
+                    break
+        key = make_hwnd(w["owner"], w["name"] or "", seq)
         _last_rect[key] = (w["x"], w["y"], w["w"], w["h"])
         logger.info("目标窗口: %s  几何=%s", key, _last_rect[key])
         return key
@@ -408,33 +466,44 @@ def get_window_rect(hwnd):
     if hwnd in _last_rect:
         return _last_rect[hwnd]
 
-    app, name = hwnd.split("::", 1)
-    # 优先走 CG：按 owner 匹配，精确匹配窗口名；同时记录该 App 最前的窗口作后备，
-    # 避免标题含特殊字符/空格差异导致完全匹配不到。
+    app, name, seq = parse_hwnd(hwnd)
+    # 优先走 CG：按 owner 匹配，精确匹配窗口名。
+    # 带序号的 hwnd 只认「同名第 N 个」，绝不回退到该应用最前面的窗口——
+    # 同名多窗口（UU远程）时回退会让不同 hwnd 都读成同一个窗口的几何，
+    # 闭环读回/写入全乱，表现为"几个窗口跟着一起动"。
     try:
-        front = None
+        ordinal = 0
         for w in list_windows_front_to_back():
             if w["owner"] != app:
                 continue
-            if front is None:
-                front = w
-            if w["name"] == name:
+            if (w["name"] or "") == (name or ""):
+                ordinal += 1
+                if seq and ordinal != seq:
+                    continue  # 带序号的 hwnd 只认对应那个同名窗口
                 rect = (w["x"], w["y"], w["w"], w["h"])
                 _last_rect[hwnd] = rect
                 return rect
-        if front is not None:
-            rect = (front["x"], front["y"], front["w"], front["h"])
-            _last_rect[hwnd] = rect
-            return rect
+        if seq:
+            # 序号牌没匹配到（窗口可能已关闭/改名），不拿别的窗口顶替
+            logger.warning("序号牌 %s 未匹配到同名窗口，返回零几何", hwnd)
+            return (0, 0, 0, 0)
+        # 无序号（唯一窗口）：允许按 owner 兜底到该应用最前窗口
+        for w in list_windows_front_to_back():
+            if w["owner"] == app:
+                rect = (w["x"], w["y"], w["w"], w["h"])
+                _last_rect[hwnd] = rect
+                return rect
     except Exception:  # noqa: BLE001
         pass
 
     # 回退：System Events 的 position+size（注意 bounds 在 macOS 当前不可用，恒报 -1728）
+    # 带序号时按「同名第 N 个」选择窗口，避免总是读到 window 1
+    win_sel = _ax_window_selector(hwnd)
     script = (
         f'tell application "System Events"\n'
         f'  tell process "{app}"\n'
-        f'    set p to position of window 1\n'
-        f'    set s to size of window 1\n'
+        f'    set p to position of {win_sel}\n'
+        f'    set s to size of {win_sel}\n'
         f'    return (item 1 of p & "," & item 2 of p & "," '
         f'& item 1 of s & "," & item 2 of s)\n'
         f'  end tell\n'
@@ -449,6 +518,19 @@ def get_window_rect(hwnd):
         return (0, 0, 0, 0)
     _last_rect[hwnd] = rect
     return rect
+
+
+def _ax_window_selector(hwnd):
+    """按 hwnd 生成 AppleScript 的窗口选择子。
+
+    默认是 "window 1"；同名多窗口的 hwnd 带 #n 序号时用 "window N"。
+    AX 窗口顺序与 CG z 序一致（实测 UU远程 6 个窗口），因此 z 序第 N 个
+    同名窗口就是 AX 的 window N。
+    """
+    _app, _name, seq = parse_hwnd(hwnd)
+    if not seq:
+        return "window 1"
+    return f"window {seq}"
 
 
 def _wait_rect_stable(hwnd, timeout=1.5, interval=0.08, need=3):
@@ -510,7 +592,8 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
             push_undo(hwnd, get_window_rect(hwnd))
         except Exception:  # noqa: BLE001
             pass
-    app, _win = hwnd.split("::", 1)
+    app, _name, _seq = parse_hwnd(hwnd)
+    win_sel = _ax_window_selector(hwnd)
     # 原始目标（content 坐标），闭环全程以此为基准，偏差按「实测 - 原始目标」累计
     tx, ty, tw, th = (int(round(v)) for v in (x, y, w, h))
     # 幂等重设次数上限：下半屏约 3 次命中；整屏高度类（变化量最大）需更多次才触顶
@@ -525,7 +608,7 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
         f'  tell process "{app}"\n'
         f'    if (count of windows) > 0 then\n'
         f'      try\n'
-        f'        tell window 1 to if zoomed then set zoomed to false\n'
+        f'        tell {win_sel} to if zoomed then set zoomed to false\n'
         f'      end try\n'
         f'    end if\n'
         f'  end tell\n'
@@ -542,8 +625,8 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
         _osa(
             f'tell application "System Events"\n'
             f'  tell process "{app}"\n'
-            f'    set position of window 1 to {{{tx}, {ty}}}\n'
-            f'    set size of window 1 to {{{tw}, {th}}}\n'
+            f'    set position of {win_sel} to {{{tx}, {ty}}}\n'
+            f'    set size of {win_sel} to {{{tw}, {th}}}\n'
             f'  end tell\n'
             f'end tell\n'
         )
@@ -679,14 +762,17 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, moni
     窗口（左侧优先用界面固定的目标窗口）。monitor 可指定目标显示器
     （int 索引或 device_name 字符串）；为 None 时以左侧窗口当前所在屏幕为准。
     并排完成后把左右窗口激活到最前，确保并排结果可见、不被其他窗口遮挡。
+
+    竖屏（portrait，高>宽）上自动改为「上/下各半屏」堆叠：竖屏宽度有限，
+    左右并排两个窗口会挤成窄条、几乎不可用；上下堆叠才是竖屏的自然用法。
     """
     ms = monitors.enum_monitors()
     if not ms:
         return False
 
-    cands = [w for w in list_windows_front_to_back()
+    cands = [w for w in list_target_windows()
              if w["pid"] not in _OWN_PIDS and w["owner"]]
-    cands_by_hwnd = {f'{w["owner"]}::{w["name"]}': w for w in cands}
+    cands_by_hwnd = {w["hwnd"]: w for w in cands}
 
     # 解析左窗口：显式指定 > 界面固定目标 > 最前面窗口
     left_w = None
@@ -699,7 +785,7 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, moni
             logger.warning("没有可用于并排的窗口")
             return False
         left_w = cands[0]
-    left_hwnd = f'{left_w["owner"]}::{left_w["name"]}'
+    left_hwnd = left_w.get("hwnd") or make_hwnd(left_w["owner"], left_w["name"] or "")
 
     # 解析右窗口：显式指定 > 与左窗口不同的最前面窗口
     right_w = None
@@ -707,13 +793,13 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, moni
         right_w = cands_by_hwnd.get(right_hwnd) or _find_window(right_hwnd)
     if right_w is None:
         for w in cands:
-            if f'{w["owner"]}::{w["name"]}' != left_hwnd:
+            if w["hwnd"] != left_hwnd:
                 right_w = w
                 break
     if right_w is None:
         logger.warning("只找到一个可用窗口，无法并排")
         return False
-    right_hwnd = f'{right_w["owner"]}::{right_w["name"]}'
+    right_hwnd = right_w.get("hwnd") or make_hwnd(right_w["owner"], right_w["name"] or "")
 
     # 以左侧窗口当前所在的屏幕为准；若显式指定了显示器则用指定的
     idx = _resolve_monitor_index(ms, monitor)
@@ -726,12 +812,20 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, moni
     _last_rect[right_hwnd] = (right_w["x"], right_w["y"], right_w["w"], right_w["h"])
 
     wl, wt, ww, wh = mon.work_rect
-    half = ww // 2
-    # 并排后激活左右两个窗口，让它们显示到所有窗口最前面（可见、不被遮挡）
-    set_window_rect(left_hwnd, wl, wt, half, wh, activate=True)
-    set_window_rect(right_hwnd, wl + half, wt, ww - half, wh, activate=True)
-    logger.info("并排完成: 左=%s 右=%s（屏幕 %s）", left_hwnd, right_hwnd,
-                mon.device_name)
+    if mon.height > mon.width:
+        # 竖屏：左右并排改为上/下堆叠（上半屏 / 下半屏）
+        half_h = wh // 2
+        set_window_rect(left_hwnd, wl, wt, ww, half_h, activate=True)
+        set_window_rect(right_hwnd, wl, wt + half_h, ww, wh - half_h, activate=True)
+        logger.info("竖屏并排(上下堆叠): 上=%s 下=%s（屏幕 %s）",
+                    left_hwnd, right_hwnd, mon.device_name)
+    else:
+        half = ww // 2
+        # 并排后激活左右两个窗口，让它们显示到所有窗口最前面（可见、不被遮挡）
+        set_window_rect(left_hwnd, wl, wt, half, wh, activate=True)
+        set_window_rect(right_hwnd, wl + half, wt, ww - half, wh, activate=True)
+        logger.info("并排完成: 左=%s 右=%s（屏幕 %s）", left_hwnd, right_hwnd,
+                    mon.device_name)
     return True
 
 
@@ -747,9 +841,9 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
     if not ms:
         return False
 
-    cands = [w for w in list_windows_front_to_back()
+    cands = [w for w in list_target_windows()
              if w["pid"] not in _OWN_PIDS and w["owner"]]
-    cands_by_hwnd = {f'{w["owner"]}::{w["name"]}': w for w in cands}
+    cands_by_hwnd = {w["hwnd"]: w for w in cands}
 
     # 解析顶部窗口：显式指定 > 界面固定目标 > 最前面窗口
     top_w = None
@@ -762,7 +856,7 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
             logger.warning("没有可用于三栏排列的窗口")
             return False
         top_w = cands[0]
-    top_hwnd = f'{top_w["owner"]}::{top_w["name"]}'
+    top_hwnd = top_w.get("hwnd") or make_hwnd(top_w["owner"], top_w["name"] or "")
 
     # 解析中部窗口：显式指定 > 与顶部不同的最前面窗口
     mid_w = None
@@ -770,13 +864,13 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
         mid_w = cands_by_hwnd.get(mid_hwnd) or _find_window(mid_hwnd)
     if mid_w is None:
         for w in cands:
-            if f'{w["owner"]}::{w["name"]}' != top_hwnd:
+            if w["hwnd"] != top_hwnd:
                 mid_w = w
                 break
     if mid_w is None:
         logger.warning("只找到一个可用窗口，无法三栏排列")
         return False
-    mid_hwnd = f'{mid_w["owner"]}::{mid_w["name"]}'
+    mid_hwnd = mid_w.get("hwnd") or make_hwnd(mid_w["owner"], mid_w["name"] or "")
 
     # 解析底部窗口：显式指定 > 与顶部/中部都不同的最前面窗口
     bot_w = None
@@ -784,14 +878,14 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
         bot_w = cands_by_hwnd.get(bot_hwnd) or _find_window(bot_hwnd)
     if bot_w is None:
         for w in cands:
-            h = f'{w["owner"]}::{w["name"]}'
+            h = w["hwnd"]
             if h != top_hwnd and h != mid_hwnd:
                 bot_w = w
                 break
     if bot_w is None:
         logger.warning("只找到两个可用窗口，无法三栏排列")
         return False
-    bot_hwnd = f'{bot_w["owner"]}::{bot_w["name"]}'
+    bot_hwnd = bot_w.get("hwnd") or make_hwnd(bot_w["owner"], bot_w["name"] or "")
 
     # 以顶部窗口当前所在的屏幕为准；若显式指定了显示器则用指定的
     idx = _resolve_monitor_index(ms, monitor)
@@ -812,6 +906,89 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
 
 def monitors_list_snapshot():
     return monitors.enum_monitors()
+
+
+def distribute_app_windows(owner_pattern, counts=None, activate=True):
+    """把指定应用的所有窗口分配到各显示器，每屏内上下等分堆叠。
+
+    owner_pattern: 应用名（不区分大小写子串匹配），如 "UU远程"。
+    counts: 每屏分几个窗口（按显示器枚举顺序），如 [3, 3] 表示
+            第 1 块屏 3 个、第 2 块屏 3 个；为 None 时按窗口数平均分配。
+    返回 (移动成功的窗口数, 失败的窗口数)。
+
+    每屏内部的堆叠方向按屏幕朝向自动选择：
+    - 竖屏（高>宽）：上下等分（一列多行）
+    - 横屏：左右等分（一行多列）
+    """
+    ms = monitors.enum_monitors()
+    if not ms:
+        return 0, 0
+    pat = (owner_pattern or "").lower()
+    wins = [w for w in list_target_windows()
+            if w["owner"] and pat in w["owner"].lower()
+            and w["pid"] not in _OWN_PIDS]
+    if not wins:
+        logger.warning("没有找到应用 %r 的窗口", owner_pattern)
+        return 0, 0
+
+    # 分配每屏窗口数
+    if counts is None:
+        n = len(wins)
+        base, extra = divmod(n, len(ms))
+        counts = [base + (1 if i < extra else 0) for i in range(len(ms))]
+    counts = list(counts)
+
+    ok, miss = 0, 0
+    wi = 0
+    for mi, mon in enumerate(ms):
+        if wi >= len(wins):
+            break
+        k = counts[mi] if mi < len(counts) else 0
+        group = wins[wi:wi + k]
+        wi += k
+        if not group:
+            continue
+        wl, wt, ww, wh = mon.work_rect
+        portrait = mon.height > mon.width
+        n = len(group)
+        rects = []
+        for j, w in enumerate(group):
+            if portrait:
+                # 竖屏：上下等分（第 j 行）
+                slot_h = wh // n
+                y = wt + j * slot_h
+                h = slot_h if j < n - 1 else wh - j * slot_h
+                rects.append((wl, y, ww, h))
+            else:
+                # 横屏：左右等分（第 j 列）
+                slot_w = ww // n
+                x = wl + j * slot_w
+                wid = slot_w if j < n - 1 else ww - j * slot_w
+                rects.append((x, wt, wid, wh))
+        # 分两轮写：先统一改尺寸、再统一改位置。
+        # 一次写入里 position+size 同时下发时，系统按写入前的旧位置/旧尺寸
+        # 做边界钳制（例如窗口在屏外时宽度钳到 680、贴边后没再拉到目标宽），
+        # 导致竖屏整宽 1152 落到 680、横屏 504 落到最小宽度 698。拆开两轮后
+        # 第二轮写入时窗口已在新位置/新尺寸，钳制基准正确。
+        for w, rect in zip(group, rects):
+            try:
+                set_window_rect(w["hwnd"], w["x"], w["y"], rect[2], rect[3],
+                                activate=False)
+            except Exception:  # noqa: BLE001
+                pass
+        for w, rect in zip(group, rects):
+            try:
+                set_window_rect(w["hwnd"], rect[0], rect[1], rect[2], rect[3],
+                                activate=False)
+                ok += 1
+            except Exception:  # noqa: BLE001
+                miss += 1
+    if activate and wins:
+        app = wins[0]["owner"]
+        _osa(f'tell application "{app}" to activate')
+    logger.info("跨屏分配: 应用=%s 分配=%s 成功=%d 失败=%d",
+                owner_pattern, counts, ok, miss)
+    return ok, miss
 
 
 def move_active_to_next_monitor(direction=1, use_pinned=True, activate=True):
