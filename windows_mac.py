@@ -895,10 +895,24 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
 
     wl, wt, ww, wh = mon.work_rect
     third = wh // 3
-    # 三栏排列后激活三个窗口，让它们显示到所有窗口最前面（可见、不被遮挡）
-    set_window_rect(top_hwnd, wl, wt, ww, third, activate=True)
-    set_window_rect(mid_hwnd, wl, wt + third, ww, third, activate=True)
-    set_window_rect(bot_hwnd, wl, wt + 2 * third, ww, wh - 2 * third, activate=True)
+    set_window_rect(top_hwnd, wl, wt, ww, third, activate=False)
+    # 实测闭环：System Events 对窗口几何有系统级钳制（标题栏占住的顶部约 30px
+    # 让窗口永远贴不到 work_top，竖屏大高度变化也常只应用一部分）。若按理想
+    # thirds 继续写中/下两栏，三栏之间会出现缝隙或重叠——表现为「竖排不准」。
+    # 因此上栏写完后读回实测几何，用它推导中/下栏的真实起点。
+    t_rect = get_window_rect(top_hwnd)
+    t_y = t_rect[1] if (t_rect and t_rect != (0, 0, 0, 0)) else wt
+    t_h = t_rect[3] if (t_rect and t_rect[3] > 0) else third
+    used = max(1, (t_y + t_h) - wt)
+    m_y = wt + used + 1
+    m_h = max(1, third - 1)
+    set_window_rect(mid_hwnd, wl, m_y, ww, m_h, activate=False)
+    m_rect = get_window_rect(mid_hwnd)
+    m_h_used = m_rect[3] if (m_rect and m_rect[3] > 0) else m_h
+    b_y = m_y + m_h_used + 1
+    b_h = max(1, (wt + wh) - b_y)
+    set_window_rect(bot_hwnd, wl, b_y, ww, b_h, activate=False)
+    _osa('tell application "' + top_w['owner'] + '" to activate')
     logger.info("三栏排列完成: 上=%s 中=%s 下=%s（屏幕 %s）", top_hwnd, mid_hwnd,
                 bot_hwnd, mon.device_name)
     return True
