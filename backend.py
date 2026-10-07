@@ -65,6 +65,7 @@ set_window_rect = windows.set_window_rect
 move_to_monitor = getattr(windows, "move_to_monitor", lambda *a, **k: False)
 snap_two_side_by_side = getattr(windows, "snap_two_side_by_side", lambda *a, **k: False)
 snap_three_stack = getattr(windows, "snap_three_stack", lambda *a, **k: False)
+snap_four_quad = getattr(windows, "snap_four_quad", lambda *a, **k: False)
 # 窗口置顶切换（Windows 实现；macOS 暂无对应实现时为 None，UI 自动隐藏入口）
 toggle_topmost = getattr(windows, "toggle_topmost", None)
 HotkeyManager = hotkeys.HotkeyManager

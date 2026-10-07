@@ -580,6 +580,39 @@ class App:
             "把「上」「中」「下」三个窗口竖向堆叠到同一屏，各占三分之一。"
             "同名窗口（如多个 UU远程）请在下拉框按 #序号 选不同窗口。")
 
+        # 四宫格 2×2：四个窗口一次排满一屏（左上/右上/左下/右下）
+        quad = ttk.Frame(f)
+        quad.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(quad, text="四宫格:").pack(side="left")
+        self.quad_mon_var = tk.StringVar(value=AUTO_MON)
+        self.quad_mon_cb = ttk.Combobox(quad, textvariable=self.quad_mon_var,
+                                        state="readonly", width=13)
+        self.quad_mon_cb.pack(side="left", padx=(4, 2))
+        self._tooltip(self.quad_mon_cb, "四宫格排到哪块屏。「自动」按左上窗口当前所在屏。")
+        self.quad_tl_var = tk.StringVar(value=AUTO_TARGET)
+        self.quad_tr_var = tk.StringVar(value=AUTO_TARGET)
+        self.quad_bl_var = tk.StringVar(value=AUTO_TARGET)
+        self.quad_br_var = tk.StringVar(value=AUTO_TARGET)
+        for label, var, tip in (
+            ("左上", self.quad_tl_var, "四宫格左上角的窗口。"),
+            ("右上", self.quad_tr_var, "四宫格右上角的窗口。"),
+            ("左下", self.quad_bl_var, "四宫格左下角的窗口。"),
+            ("右下", self.quad_br_var, "四宫格右下角的窗口。"),
+        ):
+            ttk.Label(quad, text=label).pack(side="left", padx=(8, 2))
+            cb = ttk.Combobox(quad, textvariable=var, state="readonly", width=10)
+            cb.pack(side="left")
+            self._tooltip(cb, tip)
+            setattr(self, "quad_%s_cb" % {"左上": "tl", "右上": "tr",
+                                         "左下": "bl", "右下": "br"}[label], cb)
+        quad_btn = ttk.Button(quad, text="2×2 排列",
+                              command=self._snap_four_quad)
+        quad_btn.pack(side="left", padx=(10, 0))
+        self._tooltip(
+            quad_btn,
+            "把四个窗口按 2×2 四宫格排到同一屏（即上下左右四分屏）。"
+            "留「自动」时取最前面的四个窗口。")
+
         # 台前调度开启时，两个不同 App 的窗口必须处于同一个"台前组"才会同时显示，
         # 而 macOS 无公开 API 建组，只能用户先手动拖到一起。
         if b.stage_manager_enabled():
@@ -617,7 +650,11 @@ class App:
                             (self.sbs_right_cb, self.sbs_right_var),
                             (self.stack_top_cb, self.stack_top_var),
                             (self.stack_mid_cb, self.stack_mid_var),
-                            (self.stack_bot_cb, self.stack_bot_var)):
+                            (self.stack_bot_cb, self.stack_bot_var),
+                            (self.quad_tl_cb, self.quad_tl_var),
+                            (self.quad_tr_cb, self.quad_tr_var),
+                            (self.quad_bl_cb, self.quad_bl_var),
+                            (self.quad_br_cb, self.quad_br_var)):
                 cb["values"] = labels
                 if var.get() and var.get() not in self._target_map:
                     var.set(AUTO_TARGET)
@@ -660,7 +697,8 @@ class App:
             self._monitor_map[label] = i
         for cb, var in ((self.move_mon_cb, self.move_mon_var),
                         (self.sbs_mon_cb, self.sbs_mon_var),
-                        (self.stack_mon_cb, self.stack_mon_var)):
+                        (self.stack_mon_cb, self.stack_mon_var),
+                        (self.quad_mon_cb, self.quad_mon_var)):
             cb["values"] = labels
             if var.get() not in self._monitor_map:
                 var.set(AUTO_MON)
@@ -739,6 +777,34 @@ class App:
             self.status_var.set("已竖排上中下" + (f"（{mon_label}）" if mon_idx is not None else ""))
         else:
             self.status_var.set("竖排失败：需要至少三个可操作窗口")
+
+    def _snap_four_quad(self):
+        """按选择的左上/右上/左下/右下窗口做 2×2 四宫格排列。
+
+        排列后四个窗口需要显示到最前面，故临时取消主窗口置顶（若开启），
+        与并排 / 竖排一致，不沿用 _keep_front_after。
+        """
+        if self.topmost.get():
+            try:
+                self.root.attributes("-topmost", False)
+            except Exception:  # noqa: BLE001
+                pass
+        quad_vars = (self.quad_tl_var, self.quad_tr_var,
+                     self.quad_bl_var, self.quad_br_var)
+        chosen = [self._target_map.get(v.get()) for v in quad_vars]
+        filled = [x for x in chosen if x]
+        if len(set(filled)) < len(filled):
+            messagebox.showwarning("提示", "四宫格四个窗口不能重复选择")
+            return
+        mon_idx = self._monitor_map.get(self.quad_mon_var.get())
+        mon_label = self.quad_mon_var.get()
+        if b.snap_four_quad(tl_hwnd=chosen[0], tr_hwnd=chosen[1],
+                            bl_hwnd=chosen[2], br_hwnd=chosen[3],
+                            monitor=mon_idx):
+            self.status_var.set("已 2×2 四宫格排列"
+                                + (f"（{mon_label}）" if mon_idx is not None else ""))
+        else:
+            self.status_var.set("四宫格失败：需要至少四个可操作窗口")
 
     def _toggle_topmost_action(self):
         """切换目标窗口的置顶（always-on-top）状态并反馈。"""

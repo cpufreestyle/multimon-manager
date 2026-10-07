@@ -918,6 +918,81 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
     return True
 
 
+def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
+                   use_pinned=True, monitor=None):
+    """把四个窗口排到同一屏的 2×2 四宫格（左上/右上/左下/右下）。
+
+    与单窗的四等分吸附（snap 的 quad-*）配套：那四个按钮一次只动一个窗口，
+    本函数一次摆四个窗口。
+
+    四宫格在横屏上就是上下左右四等分；竖屏不做特殊处理——用户明确要求
+    横屏上下左右 = 2×2 四等分，两块窄竖格并不好用。
+
+    四个 hwnd 均可显式指定；未指定时自动取最前面的四个窗口（左上优先用界面
+    固定的目标窗口）。monitor 可指定目标显示器（int 索引或 device_name 字符串）；
+    为 None 时以左上窗口当前所在屏幕为准。
+    """
+    ms = monitors.enum_monitors()
+    if not ms:
+        return False
+
+    cands = [w for w in list_target_windows()
+             if w["pid"] not in _OWN_PIDS and w["owner"]]
+    cands_by_hwnd = {w["hwnd"]: w for w in cands}
+
+    picked, seen = [], set()
+    for want in (tl_hwnd, tr_hwnd, bl_hwnd, br_hwnd):
+        w = None
+        if want:
+            w = cands_by_hwnd.get(want) or _find_window(want)
+        elif use_pinned and _pinned_target and _pinned_target not in seen:
+            w = _find_window(_pinned_target)
+        if w is None:
+            for c in cands:
+                h = c.get("hwnd") or make_hwnd(c["owner"], c["name"] or "")
+                if h not in seen:
+                    w = c
+                    break
+        if w is None:
+            logger.warning("可用窗口不足四个，无法四宫格排列")
+            return False
+        h = w.get("hwnd") or make_hwnd(w["owner"], w["name"] or "")
+        picked.append((h, w))
+        seen.add(h)
+
+    tl_hwnd, tl_w = picked[0]
+    idx = _resolve_monitor_index(ms, monitor)
+    if idx is None:
+        idx = _monitor_index_by_rect(ms, tl_w["x"], tl_w["y"], tl_w["w"], tl_w["h"])
+    mon = ms[idx]
+    wl, wt, ww, wh = mon.work_rect
+    half_w, half_h = ww // 2, wh // 2
+    # 上排先按理想四等分摆放
+    set_window_rect(picked[0][0], wl, wt, half_w, half_h, activate=False)
+    set_window_rect(picked[1][0], wl + half_w, wt, ww - half_w, half_h,
+                    activate=False)
+    # 实测闭环：System Events 对窗口几何有系统级钳制，且部分 App（Electron 类）
+    # 有最小窗口高度，可能根本缩不到理想 half_h——实测笔记本竖半屏仅 447px，
+    # ChatGPT 最小高 600px、CodeBuddy 570px。上排缩不下去时若仍按理想 half_h
+    # 写下排，两排会重叠上百 px。因此上排写完后读回实测高度，用它推导下排起点，
+    # 保证两排不重叠（与三栏排列的处理同源）。
+    bot_y = wt + half_h
+    for h, _w in picked[:2]:
+        rect = get_window_rect(h)
+        if rect and rect != (0, 0, 0, 0) and rect[3] > 0:
+            bot_y = max(bot_y, rect[1] + rect[3] + 1)
+    # 读回值异常时（窗口刚被销毁 / 读到别的窗口）也要留在屏内
+    bot_y = min(max(bot_y, wt + 1), max(wt + 1, (wt + wh) - 1))
+    bot_h = max(1, (wt + wh) - bot_y)
+    set_window_rect(picked[2][0], wl, bot_y, half_w, bot_h, activate=False)
+    set_window_rect(picked[3][0], wl + half_w, bot_y, ww - half_w, bot_h,
+                    activate=False)
+    logger.info("四宫格排列完成: 左上=%s 右上=%s 左下=%s 右下=%s（屏幕 %s）",
+                picked[0][0], picked[1][0], picked[2][0], picked[3][0],
+                mon.device_name)
+    return True
+
+
 def monitors_list_snapshot():
     return monitors.enum_monitors()
 

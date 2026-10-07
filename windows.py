@@ -908,5 +908,66 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
     return True
 
 
+def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
+                   use_pinned=True, monitor=None):
+    """把四个窗口排到同一屏的 2×2 四宫格（左上/右上/左下/右下，整数 HWND）。
+
+    与 snap 的 quad-* 四等分吸附配套：那四个一次只动一个窗口，本函数一次摆四个。
+
+    四个 hwnd 均可显式指定；未指定时自动取最前面的四个窗口（左上优先用界面
+    固定的目标窗口）。monitor 可指定目标显示器；为 None 时以左上窗口所在屏为准。
+    """
+    ms = monitors.enum_monitors()
+    if not ms:
+        return False
+    cands = list_windows_front_to_back()
+    by_hwnd = {w["hwnd"]: w for w in cands}
+
+    picked, seen = [], set()
+    for want in (tl_hwnd, tr_hwnd, bl_hwnd, br_hwnd):
+        w = None
+        if want:
+            w = by_hwnd.get(want) or _find_window(want)
+        elif use_pinned and _pinned_target and _pinned_target not in seen:
+            w = _find_window(_pinned_target)
+        if w is None:
+            for c in cands:
+                if c["hwnd"] not in seen:
+                    w = c
+                    break
+        if w is None:
+            logger.warning("可用窗口不足四个，无法四宫格排列")
+            return False
+        picked.append((w["hwnd"], w))
+        seen.add(w["hwnd"])
+
+    tl_hwnd, tl_w = picked[0]
+    idx = _resolve_monitor_index(ms, monitor)
+    if idx is None:
+        idx = _monitor_index_by_rect(ms, tl_w["x"], tl_w["y"],
+                                     tl_w["w"], tl_w["h"])
+    mon = ms[idx]
+    wl, wt, ww, wh = mon.work_rect
+    half_w, half_h = ww // 2, wh // 2
+    # 上排先按理想四等分摆放
+    _place_window(picked[0][0], wl, wt, half_w, half_h)
+    _place_window(picked[1][0], wl + half_w, wt, ww - half_w, half_h)
+    # 实测闭环：部分 App 有最小窗口高度，上排可能缩不到理想 half_h；此时仍按
+    # 理想值写下排会让两排重叠。摆放完读回实测高度推导下排起点，保证不重叠。
+    bot_y = wt + half_h
+    for h, _w in picked[:2]:
+        rect = get_window_rect(h)
+        if rect and rect != (0, 0, 0, 0) and rect[3] > 0:
+            bot_y = max(bot_y, rect[1] + rect[3] + 1)
+    bot_y = min(max(bot_y, wt + 1), max(wt + 1, (wt + wh) - 1))
+    bot_h = max(1, (wt + wh) - bot_y)
+    _place_window(picked[2][0], wl, bot_y, half_w, bot_h)
+    _place_window(picked[3][0], wl + half_w, bot_y, ww - half_w, bot_h)
+    logger.info("四宫格排列完成(Windows): 左上=%s 右上=%s 左下=%s 右下=%s（屏幕 %s）",
+                picked[0][0], picked[1][0], picked[2][0], picked[3][0],
+                mon.device_name)
+    return True
+
+
 if __name__ == "__main__":
     print("当前显示器:", [m.device_name for m in monitors.enum_monitors()])
