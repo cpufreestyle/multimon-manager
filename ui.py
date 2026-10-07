@@ -613,6 +613,74 @@ class App:
             "把四个窗口按 2×2 四宫格排到同一屏（即上下左右四分屏）。"
             "留「自动」时取最前面的四个窗口。")
 
+        # 四宫格可视化：把「左上/右上/左下/右下」四个下拉对应到一块 2×2 网格，
+        # 点格子直接填/清空那一格，不用记住下拉框和方位的对应关系。
+        # 下拉框与网格双向同步：点格子会改动同一批 StringVar。
+        self._quad_pick_order = ["AUTO", "TL", "TR", "BL", "BR"]
+        grid = ttk.Frame(f)
+        grid.pack(fill="x", padx=6, pady=(2, 4))
+        ttk.Label(grid, text="点格填充:").pack(side="left", anchor="n")
+        self.quad_grid_canvas = tk.Canvas(
+            grid, width=196, height=124, bg="#fafafa",
+            relief="sunken", borderwidth=1, highlightthickness=0)
+        self.quad_grid_canvas.pack(side="left", padx=(4, 6))
+        self._quad_cells = {}
+        for key, x0, y0 in (("TL", 0, 0), ("TR", 98, 0),
+                            ("BL", 0, 62), ("BR", 98, 62)):
+            rid = self.quad_grid_canvas.create_rectangle(
+                x0 + 2, y0 + 2, x0 + 96, y0 + 60,
+                fill="#e9e9e9", outline="#5a5a5a", width=1.2,
+                activefill="#d0d0d0")
+            self.quad_grid_canvas.tag_bind(
+                rid, "<Button-1>",
+                lambda e, k=key: self._on_quad_cell_click(k))
+            self._quad_cells[key] = rid
+        self._quad_labels = {}
+        for key, cx, cy in (("TL", 48, 22), ("TR", 146, 22),
+                            ("BL", 48, 80), ("BR", 146, 80)):
+            self._quad_labels[key] = self.quad_grid_canvas.create_text(
+                cx, cy, text="空", font=("Helvetica", 8), fill="#333")
+        self._quad_title_id = self.quad_grid_canvas.create_text(
+            98, 5, text="", font=("Helvetica", 7), fill="#777", anchor="n")
+        self.quad_grid_canvas.bind("<Configure>", self._on_quad_grid_resize)
+        self._refresh_quad_grid()
+        tip_grid = ttk.Frame(grid)
+        tip_grid.pack(side="left", fill="y")
+        ttk.Label(tip_grid, text="点格子 = 把最靠前的未占用窗口放进该方位",
+                  foreground="#666", wraplength=200,
+                  justify="left").pack(anchor="nw")
+        ttk.Label(tip_grid, text="再点一次 = 清空该方位",
+                  foreground="#666", wraplength=200,
+                  justify="left").pack(anchor="nw")
+        ttk.Label(tip_grid, text="已填的格子会显示窗口名；四格齐了再点「2×2 排列」",
+                  foreground="#666", wraplength=200,
+                  justify="left").pack(anchor="nw")
+
+        # 跨屏铺满：若干窗口分别铺满各自的屏（一个窗口一块屏）
+        # 单屏环境做不了跨屏（只有一块屏，铺满即最大化），故隐藏入口
+        if len(self.monitors) >= 2:
+            spread = ttk.Frame(f)
+            spread.pack(fill="x", padx=6, pady=(4, 2))
+            ttk.Label(spread, text="跨屏铺满:").pack(side="left")
+            n_mon = len(self.monitors)
+            self.spread_mode_var = tk.StringVar(value="每屏整屏最大化")
+            self.spread_mode_cb = ttk.Combobox(
+                spread, textvariable=self.spread_mode_var, state="readonly",
+                width=14,
+                values=["每屏整屏最大化", "每屏左上角四分之一"])
+            self.spread_mode_cb.pack(side="left", padx=(4, 2))
+            self._tooltip(self.spread_mode_cb,
+                         "铺到每块屏的方式：整屏铺满工作区，或只占左上四分之一。")
+            spread_btn = ttk.Button(spread, text="逐屏铺满",
+                                    command=self._fill_all_monitors)
+            spread_btn.pack(side="left", padx=(10, 0))
+            self._tooltip(
+                spread_btn,
+                f"把最前面的 {n_mon} 个窗口分别铺到 {n_mon} 块屏，"
+                "第 1 个窗口去第 1 块屏、依此类推（顺序同上方显示器列表）。"
+                "窗口不够则有多少铺多少，多出来的屏不动。")
+
+
         # 台前调度开启时，两个不同 App 的窗口必须处于同一个"台前组"才会同时显示，
         # 而 macOS 无公开 API 建组，只能用户先手动拖到一起。
         if b.stage_manager_enabled():
@@ -658,6 +726,9 @@ class App:
                 cb["values"] = labels
                 if var.get() and var.get() not in self._target_map:
                     var.set(AUTO_TARGET)
+        # 窗口列表变了：网格上显示的窗口名可能已失效，按新选择重画
+        if hasattr(self, "quad_grid_canvas"):
+            self._refresh_quad_grid()
         if self.target_var.get() not in self._target_map:
             self.target_var.set(AUTO_TARGET)
             b.set_target(None)
@@ -781,8 +852,8 @@ class App:
     def _snap_four_quad(self):
         """按选择的左上/右上/左下/右下窗口做 2×2 四宫格排列。
 
-        排列后四个窗口需要显示到最前面，故临时取消主窗口置顶（若开启），
-        与并排 / 竖排一致，不沿用 _keep_front_after。
+       排列后四个窗口需要显示到最前面，故临时取消主窗口置顶（若开启），
+       与并排 / 竖排一致，不沿用 _keep_front_after。
         """
         if self.topmost.get():
             try:
@@ -801,10 +872,126 @@ class App:
         if b.snap_four_quad(tl_hwnd=chosen[0], tr_hwnd=chosen[1],
                             bl_hwnd=chosen[2], br_hwnd=chosen[3],
                             monitor=mon_idx):
+            # 摆完清空四方格，下次点格子重新取材（避免旧窗口名误导）
+            for v in quad_vars:
+                v.set(AUTO_TARGET)
             self.status_var.set("已 2×2 四宫格排列"
                                 + (f"（{mon_label}）" if mon_idx is not None else ""))
         else:
             self.status_var.set("四宫格失败：需要至少四个可操作窗口")
+
+    # ---------- 四宫格可视化 ----------
+    _QUAD_KEYS = ("TL", "TR", "BL", "BR")
+
+    def _quad_var(self, key):
+        return {"TL": self.quad_tl_var, "TR": self.quad_tr_var,
+                "BL": self.quad_bl_var, "BR": self.quad_br_var}[key]
+
+    @staticmethod
+    def _quad_key_names():
+        return {"TL": "左上", "TR": "右上", "BL": "左下", "BR": "右下"}
+
+    def _on_quad_cell_click(self, key):
+        """点格子：未填则把最靠前的未占用窗口放进该方位，已填则清空。
+
+        与下拉框共用同一批 StringVar，这里改完下拉框同步跟着变，
+        「2×2 排列」按钮读的还是同一份状态。
+        """
+        var = self._quad_var(key)
+        cur = var.get()
+        if cur and cur != AUTO_TARGET:
+            var.set(AUTO_TARGET)          # 再点一次 = 清空该方位
+            self._refresh_quad_grid()
+            return
+        taken = set()
+        for k in self._QUAD_KEYS:
+            v = self._quad_var(k).get()
+            if v and v != AUTO_TARGET:
+                taken.add(v)
+        # 按界面窗口列表顺序取第一个未被其它方位占用的窗口
+        pick = None
+        for label, hwnd in getattr(self, "_target_map", {}).items():
+            if label == AUTO_TARGET or not hwnd or label in taken:
+                continue
+            pick = label
+            break
+        if pick is None:
+            self.status_var.set("没有更多窗口可填了（先清空某一格）")
+            return
+        var.set(pick)
+        self._refresh_quad_grid()
+        self.status_var.set(f"{self._quad_key_names()[key]} ← {pick}")
+
+    def _refresh_quad_grid(self):
+        """按四个方位的当前选择重画网格：填了的显示窗口名并高亮。"""
+        cv = getattr(self, "quad_grid_canvas", None)
+        if cv is None:
+            return
+        for key in self._QUAD_KEYS:
+            val = self._quad_var(key).get()
+            filled = bool(val) and val != AUTO_TARGET
+            rid = self._quad_cells.get(key)
+            if rid is not None:
+                cv.itemconfigure(rid,
+                                 fill="#d8e6ff" if filled else "#e9e9e9")
+            lid = self._quad_labels.get(key)
+            if lid is not None:
+                cv.itemconfigure(lid,
+                                 text=(self._short_label(val) if filled else "空"),
+                                 fill="#1a3d6d" if filled else "#999")
+        n = sum(1 for k in self._QUAD_KEYS
+                if self._quad_var(k).get() not in ("", AUTO_TARGET, None))
+        cv.itemconfigure(self._quad_title_id, text=f"已填 {n}/4")
+
+    @staticmethod
+    def _short_label(label):
+        """把窗口标签压短，让 96px 宽的格子里放得下。
+
+        标签形如「ChatGPT — ChatGPT  (1512×895)」或「#1 UU远程  (1080×647)」。
+        先去掉末尾的分辨率后缀，再只留「应用 — 窗口」里的应用名；同名窗口的
+        #序号 要保留——它正是区分多个同类窗口的依据。
+        """
+        s = (label or "").strip()
+        if not s:
+            return "空"
+        # 去掉末尾的「(宽×高)」后缀
+        s = s.split("(", 1)[0].strip()
+        # 只留「应用 — 窗口」里的应用名
+        if "—" in s:
+            s = s.split("—", 1)[0].strip() or s
+        s = s.replace("::", " ").strip() or s
+        return s if len(s) <= 11 else s[:10] + "…"
+
+    def _on_quad_grid_resize(self, _event=None):
+        """格子是固定像素网格，尺寸变化不影响布局，只需重画内容。"""
+        self._refresh_quad_grid()
+    def _fill_all_monitors(self):
+        """把最前面的若干窗口分别铺满各自的屏（一个窗口一块屏）。
+        窗口数不足屏幕数时有多少铺多少、多出来的屏不动——开着 3 个应用
+        却有 4 块屏是常见情况，不当作失败，状态栏如实说明铺了几块。
+        """
+        if self.topmost.get():
+            try:
+                self.root.attributes("-topmost", False)
+            except Exception:  # noqa: BLE001
+                pass
+        mode = ("quad" if self.spread_mode_var.get() == "每屏左上角四分之一"
+                else "max")
+        try:
+            done = b.fill_all_monitors(mode=mode)
+        except Exception as e:  # noqa: BLE001
+            self.status_var.set(f"逐屏铺满失败：{e}")
+            return
+        if not done:
+            self.status_var.set("逐屏铺满失败：没有可操作的窗口")
+            return
+        total = len(self.monitors)
+        if done < total:
+            self.status_var.set(
+                f"已铺 {done} 屏：窗口不足 {total} 个，剩下的屏未动")
+        else:
+            self.status_var.set(f"已逐屏铺满 {done} 块屏")
+
 
     def _toggle_topmost_action(self):
         """切换目标窗口的置顶（always-on-top）状态并反馈。"""
