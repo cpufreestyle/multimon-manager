@@ -478,32 +478,36 @@ class App:
         if getattr(b, "toggle_topmost", None) is not None:
             btns.append(("置顶切换", lambda: self._toggle_topmost_action(),
                          "切换目标窗口是否置顶显示"))
-        # 15 个按钮分三行排列（6 + 6 + 3），避免超出窗口宽度被截断。
-        for group in (btns[:6], btns[6:12], btns[12:]):
+        # 吸附按钮分两行排列（8 + 8）：原先 6+6+3 三行，加上撤销独占一行、
+        # 以及后面的指定屏/并排/竖排/四宫格/网格/跨屏铺满各占一行，整个窗口
+        # 要滚 3000px 才能看完，四宫格和跨屏铺满都落在首屏外。改成两行后
+        # 每行 8 个仍能排在 820px 窗口内（按钮按文字长度自适应宽度）。
+        for group in (btns[:8], btns[8:]):
             row = ttk.Frame(f)
-            row.pack(fill="x", pady=2)
+            row.pack(fill="x", pady=1)
             for text, cmd, tip in group:
                 btn = ttk.Button(row, text=text,
                                  command=self._keep_front_after(cmd))
-                btn.pack(side="left", padx=3)
+                btn.pack(side="left", padx=2)
                 self._tooltip(btn, tip)
 
-        # 撤销：回退上一次窗口移动/缩放（F7）
+        # 撤销：回退上一次窗口移动/缩放（F7）。与上面的吸附按钮放同一行逻辑
+        # 不成立（每行已排满 8 个），故单独占一行但去掉上下留白。
         undo_row = ttk.Frame(f)
-        undo_row.pack(fill="x", pady=2)
+        undo_row.pack(fill="x", pady=1)
         undo_btn = ttk.Button(undo_row, text="撤销移动",
                               command=self._undo_move)
-        undo_btn.pack(side="left", padx=3)
+        undo_btn.pack(side="left", padx=2)
         self._tooltip(undo_btn, "回退上一次窗口的移动/缩放（快捷键 F7）")
         # 移到指定屏：只有"上一屏/下一屏"时，三屏以上要连点好几次才能到位，
         # 这里直接选目标屏一次跳过去（下拉与并排/竖排共用同一份显示器列表）。
         mon_row = ttk.Frame(f)
-        mon_row.pack(fill="x", padx=6, pady=(4, 2))
-        ttk.Label(mon_row, text="移到指定屏:").pack(side="left")
+        mon_row.pack(fill="x", padx=6, pady=(2, 1))
+        ttk.Label(mon_row, text="指定屏:").pack(side="left")
         self.move_mon_var = tk.StringVar(value=AUTO_MON)
         self.move_mon_cb = ttk.Combobox(mon_row, textvariable=self.move_mon_var,
-                                        state="readonly", width=18)
-        self.move_mon_cb.pack(side="left", padx=(4, 6))
+                                        state="readonly", width=13)
+        self.move_mon_cb.pack(side="left", padx=(4, 2))
         self._tooltip(
             self.move_mon_cb,
             "选择目标显示器。「自动」按窗口当前所在屏；要跨屏一次跳到位时，"
@@ -516,7 +520,7 @@ class App:
 
         # 并排左右：可选目标显示器 + 可指定左右两个窗口（留"自动"则由程序取最前面两个）
         sbs = ttk.Frame(f)
-        sbs.pack(fill="x", padx=6, pady=(4, 2))
+        sbs.pack(fill="x", padx=6, pady=(1, 1))
         ttk.Label(sbs, text="并排:").pack(side="left")
         self.sbs_mon_var = tk.StringVar(value=AUTO_MON)
         # 下拉宽度按 120 DPI 下的实际像素收窄：原先并排/竖排整行会超出窗口，
@@ -547,11 +551,11 @@ class App:
 
         # 竖排上中下：可选目标显示器 + 可指定上/中/下三个窗口（留"自动"则由程序取最前面三个）
         stack = ttk.Frame(f)
-        stack.pack(fill="x", padx=6, pady=(4, 2))
+        stack.pack(fill="x", padx=6, pady=(1, 1))
         ttk.Label(stack, text="竖排:").pack(side="left")
         self.stack_mon_var = tk.StringVar(value=AUTO_MON)
         self.stack_mon_cb = ttk.Combobox(stack, textvariable=self.stack_mon_var,
-                                         state="readonly", width=13)
+                                         state="readonly", width=7)
         self.stack_mon_cb.pack(side="left", padx=(4, 2))
         self._tooltip(self.stack_mon_cb, "竖排到哪块屏。「自动」按上窗口当前所在屏。")
         self.stack_top_var = tk.StringVar(value=AUTO_TARGET)
@@ -559,17 +563,17 @@ class App:
         self.stack_bot_var = tk.StringVar(value=AUTO_TARGET)
         ttk.Label(stack, text="上").pack(side="left", padx=(8, 2))
         self.stack_top_cb = ttk.Combobox(stack, textvariable=self.stack_top_var,
-                                         state="readonly", width=16)
+                                         state="readonly", width=11)
         self.stack_top_cb.pack(side="left")
         self._tooltip(self.stack_top_cb, "竖排最上面的窗口。同名窗口按 #序号 选。")
         ttk.Label(stack, text="中").pack(side="left", padx=(6, 2))
         self.stack_mid_cb = ttk.Combobox(stack, textvariable=self.stack_mid_var,
-                                         state="readonly", width=16)
+                                         state="readonly", width=11)
         self.stack_mid_cb.pack(side="left")
         self._tooltip(self.stack_mid_cb, "竖排中间的窗口。同名窗口按 #序号 选。")
         ttk.Label(stack, text="下").pack(side="left", padx=(6, 2))
         self.stack_bot_cb = ttk.Combobox(stack, textvariable=self.stack_bot_var,
-                                         state="readonly", width=16)
+                                         state="readonly", width=11)
         self.stack_bot_cb.pack(side="left")
         self._tooltip(self.stack_bot_cb, "竖排最下面的窗口。同名窗口按 #序号 选。")
         stack_btn = ttk.Button(stack, text="竖排上中下",
@@ -581,33 +585,37 @@ class App:
             "同名窗口（如多个 UU远程）请在下拉框按 #序号 选不同窗口。")
 
         # 四宫格 2×2：四个窗口一次排满一屏（左上/右上/左下/右下）
+        # 下拉、按钮、点格网格都排在同一行——原先网格单独占一行，整个窗口
+        # 要滚 3000px 才看得完，四宫格和跨屏铺满都落在首屏外。
         quad = ttk.Frame(f)
-        quad.pack(fill="x", padx=6, pady=(4, 2))
-        ttk.Label(quad, text="四宫格:").pack(side="left")
+        quad.pack(fill="x", padx=6, pady=(1, 1))
+        ttk.Label(quad, text="四格:").pack(side="left")
         self.quad_mon_var = tk.StringVar(value=AUTO_MON)
         self.quad_mon_cb = ttk.Combobox(quad, textvariable=self.quad_mon_var,
-                                        state="readonly", width=13)
+                                        state="readonly", width=7)
         self.quad_mon_cb.pack(side="left", padx=(4, 2))
         self._tooltip(self.quad_mon_cb, "四宫格排到哪块屏。「自动」按左上窗口当前所在屏。")
         self.quad_tl_var = tk.StringVar(value=AUTO_TARGET)
         self.quad_tr_var = tk.StringVar(value=AUTO_TARGET)
         self.quad_bl_var = tk.StringVar(value=AUTO_TARGET)
         self.quad_br_var = tk.StringVar(value=AUTO_TARGET)
-        for label, var, tip in (
-            ("左上", self.quad_tl_var, "四宫格左上角的窗口。"),
-            ("右上", self.quad_tr_var, "四宫格右上角的窗口。"),
-            ("左下", self.quad_bl_var, "四宫格左下角的窗口。"),
-            ("右下", self.quad_br_var, "四宫格右下角的窗口。"),
+        # 四个下拉不重复写「左上/右上/左下/右下」文字标签：右侧 2×2 网格本身
+        # 就是方位图，格子与下拉按 TL/TR/BL/BR 同序对应，再把四个 label 省掉
+        # （整行原宽 884px，超出行宽工具条，四宫格选项会被挤出可视区）。
+        # tooltip 里说明对应关系，鼠标悬停即可看到。
+        for key, var, pos, tip in (
+            ("tl", self.quad_tl_var, "左上", "四宫格左上角的窗口。"),
+            ("tr", self.quad_tr_var, "右上", "四宫格右上角的窗口。"),
+            ("bl", self.quad_bl_var, "左下", "四宫格左下角的窗口。"),
+            ("br", self.quad_br_var, "右下", "四宫格右下角的窗口。"),
         ):
-            ttk.Label(quad, text=label).pack(side="left", padx=(8, 2))
             cb = ttk.Combobox(quad, textvariable=var, state="readonly", width=10)
-            cb.pack(side="left")
-            self._tooltip(cb, tip)
-            setattr(self, "quad_%s_cb" % {"左上": "tl", "右上": "tr",
-                                         "左下": "bl", "右下": "br"}[label], cb)
+            cb.pack(side="left", padx=(4, 0))
+            self._tooltip(cb, f"{pos}角的窗口。自动 = 取最前面的未占用窗口。")
+            setattr(self, "quad_%s_cb" % key, cb)
         quad_btn = ttk.Button(quad, text="2×2 排列",
                               command=self._snap_four_quad)
-        quad_btn.pack(side="left", padx=(10, 0))
+        quad_btn.pack(side="left", padx=(6, 0))
         self._tooltip(
             quad_btn,
             "把四个窗口按 2×2 四宫格排到同一屏（即上下左右四分屏）。"
@@ -615,20 +623,15 @@ class App:
 
         # 四宫格可视化：把「左上/右上/左下/右下」四个下拉对应到一块 2×2 网格，
         # 点格子直接填/清空那一格，不用记住下拉框和方位的对应关系。
-        # 下拉框与网格双向同步：点格子会改动同一批 StringVar。
-        self._quad_pick_order = ["AUTO", "TL", "TR", "BL", "BR"]
-        grid = ttk.Frame(f)
-        grid.pack(fill="x", padx=6, pady=(2, 4))
-        ttk.Label(grid, text="点格填充:").pack(side="left", anchor="n")
         self.quad_grid_canvas = tk.Canvas(
-            grid, width=196, height=124, bg="#fafafa",
+            quad, width=140, height=88, bg="#fafafa",
             relief="sunken", borderwidth=1, highlightthickness=0)
-        self.quad_grid_canvas.pack(side="left", padx=(4, 6))
+        self.quad_grid_canvas.pack(side="left", padx=(6, 2))
         self._quad_cells = {}
-        for key, x0, y0 in (("TL", 0, 0), ("TR", 98, 0),
-                            ("BL", 0, 62), ("BR", 98, 62)):
+        for key, x0, y0 in (("TL", 0, 0), ("TR", 70, 0),
+                            ("BL", 0, 44), ("BR", 70, 44)):
             rid = self.quad_grid_canvas.create_rectangle(
-                x0 + 2, y0 + 2, x0 + 96, y0 + 60,
+                x0 + 1, y0 + 1, x0 + 68, y0 + 42,
                 fill="#e9e9e9", outline="#5a5a5a", width=1.2,
                 activefill="#d0d0d0")
             self.quad_grid_canvas.tag_bind(
@@ -636,32 +639,24 @@ class App:
                 lambda e, k=key: self._on_quad_cell_click(k))
             self._quad_cells[key] = rid
         self._quad_labels = {}
-        for key, cx, cy in (("TL", 48, 22), ("TR", 146, 22),
-                            ("BL", 48, 80), ("BR", 146, 80)):
+        for key, cx, cy in (("TL", 34, 18), ("TR", 104, 18),
+                            ("BL", 34, 60), ("BR", 104, 60)):
             self._quad_labels[key] = self.quad_grid_canvas.create_text(
                 cx, cy, text="空", font=("Helvetica", 8), fill="#333")
         self._quad_title_id = self.quad_grid_canvas.create_text(
-            98, 5, text="", font=("Helvetica", 7), fill="#777", anchor="n")
+            70, 1, text="", font=("Helvetica", 6), fill="#777", anchor="n")
         self.quad_grid_canvas.bind("<Configure>", self._on_quad_grid_resize)
         self._refresh_quad_grid()
-        tip_grid = ttk.Frame(grid)
-        tip_grid.pack(side="left", fill="y")
-        ttk.Label(tip_grid, text="点格子 = 把最靠前的未占用窗口放进该方位",
-                  foreground="#666", wraplength=200,
-                  justify="left").pack(anchor="nw")
-        ttk.Label(tip_grid, text="再点一次 = 清空该方位",
-                  foreground="#666", wraplength=200,
-                  justify="left").pack(anchor="nw")
-        ttk.Label(tip_grid, text="已填的格子会显示窗口名；四格齐了再点「2×2 排列」",
-                  foreground="#666", wraplength=200,
-                  justify="left").pack(anchor="nw")
+        self._tooltip(self.quad_grid_canvas,
+                      "点格子 = 把最靠前的未占用窗口放进该方位，"
+                      "再点一次 = 清空该方位（与左侧下拉框联动）。")
 
         # 跨屏铺满：若干窗口分别铺满各自勾选的屏（一个窗口一块屏）
         # 容器无条件建：__init__ 里 self.monitors 还是空的，屏数在之后的
         # refresh_monitors() 才填上，若按当时屏数决定是否建控件，
         # 之后热插拔变多屏也不会再出现入口（_rebuild 拿不到 parent）。
         spread = ttk.Frame(f)
-        spread.pack(fill="x", padx=6, pady=(4, 2))
+        spread.pack(fill="x", padx=6, pady=(1, 1))
         ttk.Label(spread, text="跨屏铺满:").pack(side="left")
         self._spread_checks_parent = spread
         self._last_monitors = list(self.monitors)
