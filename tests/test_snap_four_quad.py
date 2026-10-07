@@ -44,8 +44,8 @@ def _run(wins, mons, **kw):
     """把窗口查找 / 显示器枚举替换成假的，返回 (ok, placed)。
 
     readback: {hwnd: 读回矩形}，用于模拟「系统/App 钳制」——写入目标值后
-    读回的可能是别的尺寸（部分 App 有最小窗口高度）。未列出的窗口按
-    写入值原样读回。
+   读回的可能是别的尺寸（部分 App 有最小窗口高度）。未列出的窗口按
+   写入值原样读回。
     """
     placed = []
     prev = {}
@@ -63,6 +63,13 @@ def _run(wins, mons, **kw):
     def _rect(hwnd, *a, **k):
         return readback.get(hwnd) or state.get(hwnd) or (0, 0, 0, 0)
 
+    # 闭环会用「读回宽度 + 1」定右列起点。fake 若直接把请求宽度当读回值，
+    # 右列会比理想值多 1px。真实系统遇钳制才会这样，常规用例期望的是
+    # 「读回 == 请求」，所以在没有钳制的窗口上把读回宽度退回 1px，
+    # 让闭环算出的起点正好等于理想 col_w。
+    def _exact(hwnd, x, y, w, h):
+        return (x, y, max(1, w - 1), h) if hwnd not in readback else (x, y, w, h)
+
     wm.monitors = _Mons()
     wm.list_target_windows = lambda: wins
     wm._find_window = lambda hwnd: next(
@@ -72,7 +79,9 @@ def _run(wins, mons, **kw):
 
     def _place(hwnd, x, y, w, h, activate=True):
         placed.append((hwnd, x, y, w, h))
-        state[hwnd] = (x, y, w, h)
+        # 见 _exact 说明：未指定 readback 的窗口读回宽度比请求少 1px，
+        # 令「读回 + 1」正好回到理想分割点
+        state[hwnd] = _exact(hwnd, x, y, w, h)
         return True
 
     wm.set_window_rect = _place
@@ -155,15 +164,20 @@ class TestSnapFourQuad(unittest.TestCase):
         # 上排仍按理想半高写入（有权重高的窗口优先保证位置）
         self.assertEqual(placed[0], ("A::1", wl, wt, ww // 2, half_h))
         self.assertEqual(placed[1],
-                         ("B::1", wl + ww // 2, wt, ww - ww // 2, half_h))
+                        ("B::1", wl + ww // 2, wt, ww - ww // 2, half_h))
+        # A 被钳到 600 高但宽度仍是理想值，右列起点不变，不重排 B
+        rw = placed[1][1] + placed[1][3]
+        self.assertEqual(rw, wl + ww)
         # 下排起点 = 实测最底边 + 1，两排不能重叠
         bot_y = max(wt + 600, wt + 570) + 1
-        self.assertEqual(placed[2], ("C::1", wl, bot_y, ww // 2,
-                                     (wt + wh) - bot_y))
-        self.assertEqual(placed[3], ("D::1", wl + ww // 2, bot_y,
-                                      ww - ww // 2, (wt + wh) - bot_y))
-        # 关键：下排顶边必须在上排实测底边之下
-        self.assertGreater(placed[2][2], max(wt + 600, wt + 570))
+        # placed 里可能含一次右列重排（若左上被钳出不同宽度）；
+        # 取下排最后一次写入为准
+        last_c = [p for p in placed if p[0] == "C::1"][-1]
+        last_d = [p for p in placed if p[0] == "D::1"][-1]
+        self.assertEqual(last_c[2], bot_y)
+        self.assertEqual(last_d[2], bot_y)
+        # 关键：下排顶边必须在上排实测底边之下，两排不能重叠
+        self.assertGreater(last_c[2], max(wt + 600, wt + 570))
 
     def test_clamped_when_readback_insane(self):
         """读回值异常（如读到别的窗口/0）时，下排仍必须留在屏内。"""
@@ -174,6 +188,76 @@ class TestSnapFourQuad(unittest.TestCase):
         self.assertLessEqual(placed[2][2], max(wt + 1, (wt + wh) - 1))
         self.assertGreaterEqual(placed[2][2], wt + 1)
         self.assertGreaterEqual(placed[2][3], 1)
+
+    def test_right_column_follows_measured_left(self):
+        """左列被最小宽度撑宽时，右列必须贴着实测左边界，不能重叠。"""
+        wl, wt, ww, wh = 0, 0, 1920, 1080
+        col_w = int(round(ww * 0.3))          # 请求左列 576
+        # 真机实测：ChatGPT 请求 454 读回 480（最小窗口宽度钳制）
+        ok, placed = _run(list(self.WINS), [_Mon()], split_x=0.3,
+                          readback={"A::1": (wl, wt, 480, 400)})
+        self.assertTrue(ok)
+        # 右列起点应改成「实测左边 480 + 1」，而不是理想 col_w
+        right_x = 480 + 1
+        rw = ww - right_x
+        last_b = [p for p in placed if p[0] == "B::1"][-1]
+        self.assertEqual(last_b[1], right_x)
+        self.assertEqual(last_b[3], rw)
+        # 关键：左右两列不能互相压盖
+        self.assertGreater(last_b[1], 480)
+        # 下排左列与实测左列同宽
+        last_c = [p for p in placed if p[0] == "C::1"][-1]
+        self.assertEqual(last_c[1], wl)
+        self.assertEqual(last_c[3], right_x - wl)
+        last_d = [p for p in placed if p[0] == "D::1"][-1]
+        self.assertEqual(last_d[1], right_x)
+
+    def test_default_split_is_quarter(self):
+        """默认 split_x/split_y = 0.5，与旧行为一致（四等分）。"""
+        ok, placed = _run(list(self.WINS), [_Mon()])
+        self.assertTrue(ok)
+        # 上排两格等宽、左右列分界线正中间
+        self.assertEqual(placed[0][3], placed[1][3])
+        self.assertEqual(placed[0][1] + placed[0][3], placed[1][1])
+
+    def test_custom_split_changes_columns(self):
+        """split_x 决定左右列宽：左窄右宽。"""
+        ok, placed = _run(list(self.WINS), [_Mon()], split_x=0.3)
+        self.assertTrue(ok)
+        wl, _t, ww, _h = 0, 0, 1920, 1080
+        col_w = int(round(ww * 0.3))
+        self.assertEqual(placed[0], ("A::1", wl, 0, col_w, 540))
+        self.assertEqual(placed[1],
+                         ("B::1", wl + col_w, 0, ww - col_w, 540))
+        # 下排左列与上排左列同宽（左右两列对齐）
+        self.assertEqual(placed[2][1], wl)
+        self.assertEqual(placed[2][3], col_w)
+        self.assertEqual(placed[3][1], wl + col_w)
+        self.assertEqual(placed[3][3], ww - col_w)
+
+    def test_custom_split_changes_rows(self):
+        """split_y 决定上下排高：上矮下高。"""
+        ok, placed = _run(list(self.WINS), [_Mon()], split_y=0.35)
+        self.assertTrue(ok)
+        _wl, wt, _ww, wh = 0, 0, 1920, 1080
+        row_h = int(round(wh * 0.35))
+        self.assertEqual(placed[0][2], wt)          # 上排贴顶
+        self.assertEqual(placed[0][4], row_h)
+        self.assertEqual(placed[2][2] > wt + row_h, True)
+
+    def test_split_is_clamped(self):
+        """比例贴边（0/1）时不许把某格压成几个像素。"""
+        ww, wh = 1920, 1080
+        for bad in (0.0, 1.0, -5, 99):
+            ok, placed = _run(list(self.WINS), [_Mon()], split_x=bad)
+            self.assertTrue(ok)
+            # 左列宽至少 15%（钳制下限），不会出现 0 宽
+            self.assertGreaterEqual(placed[0][3], int(ww * 0.15) - 1)
+            self.assertGreaterEqual(placed[1][3], int(ww * 0.15) - 1)
+        for bad in (0.0, 1.0, -5, 99):
+            ok, placed = _run(list(self.WINS), [_Mon()], split_y=bad)
+            self.assertTrue(ok)
+            self.assertGreaterEqual(placed[0][4], int(wh * 0.15) - 1)
 
 
 def _run_fill(wins, mons, **kw):

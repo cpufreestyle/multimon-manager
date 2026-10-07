@@ -909,13 +909,17 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
 
 
 def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
-                   use_pinned=True, monitor=None):
+                   use_pinned=True, monitor=None, split_x=0.5, split_y=0.5):
     """把四个窗口排到同一屏的 2×2 四宫格（左上/右上/左下/右下，整数 HWND）。
 
     与 snap 的 quad-* 四等分吸附配套：那四个一次只动一个窗口，本函数一次摆四个。
 
     四个 hwnd 均可显式指定；未指定时自动取最前面的四个窗口（左上优先用界面
     固定的目标窗口）。monitor 可指定目标显示器；为 None 时以左上窗口所在屏为准。
+
+    split_x / split_y 给出分割比例（0~1，0.5 = 四等分）。等分并不总是最合适：
+    左栏放终端想窄一点、右栏放浏览器想宽一点是常见需求，界面上做了可拖拽的
+    分割线，把这两个比例一起传进来。
     """
     ms = monitors.enum_monitors()
     if not ms:
@@ -948,10 +952,24 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
                                      tl_w["w"], tl_w["h"])
     mon = ms[idx]
     wl, wt, ww, wh = mon.work_rect
-    half_w, half_h = ww // 2, wh // 2
+    # 比例钳在安全区间：贴边会让某一格只剩几个像素，等于把窗口藏起来
+    sx = min(max(float(split_x), 0.15), 0.85)
+    sy = min(max(float(split_y), 0.15), 0.85)
+    half_w = int(round(ww * sx))
+    half_h = int(round(wh * sy))
     # 上排先按理想四等分摆放
     _place_window(picked[0][0], wl, wt, half_w, half_h)
     _place_window(picked[1][0], wl + half_w, wt, ww - half_w, half_h)
+    # 左列 App 可能有最小窗口宽度，读回实测宽度后按它定右列起点，两列不再
+    # 互相压盖（宽度不匀是应用侧钳制，无法消除）。
+    tl_rect = get_window_rect(picked[0][0])
+    right_x = wl + half_w
+    if tl_rect and tl_rect != (0, 0, 0, 0) and tl_rect[2] > 0:
+        right_x = max(wl + 1, min(wl + ww - 1, tl_rect[0] + tl_rect[2] + 1))
+    right_w = max(1, (wl + ww) - right_x)
+    if right_x != wl + half_w:
+        _place_window(picked[1][0], right_x, wt, right_w, half_h)
+    half_w = int(right_x - wl)          # 下排左列与实测左列对齐
     # 实测闭环：部分 App 有最小窗口高度，上排可能缩不到理想 half_h；此时仍按
     # 理想值写下排会让两排重叠。摆放完读回实测高度推导下排起点，保证不重叠。
     bot_y = wt + half_h
@@ -963,9 +981,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     bot_h = max(1, (wt + wh) - bot_y)
     _place_window(picked[2][0], wl, bot_y, half_w, bot_h)
     _place_window(picked[3][0], wl + half_w, bot_y, ww - half_w, bot_h)
-    logger.info("四宫格排列完成(Windows): 左上=%s 右上=%s 左下=%s 右下=%s（屏幕 %s）",
+    logger.info("四宫格排列完成(Windows): 左上=%s 右上=%s 左下=%s 右下=%s"
+                "（屏幕 %s，横向 %.0f%% / 竖向 %.0f%%）",
                 picked[0][0], picked[1][0], picked[2][0], picked[3][0],
-                mon.device_name)
+                mon.device_name, sx * 100, sy * 100)
     return True
 
 

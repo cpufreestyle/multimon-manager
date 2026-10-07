@@ -1003,14 +1003,17 @@ def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",
     return done
 
 def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
-                   use_pinned=True, monitor=None):
+                   use_pinned=True, monitor=None, split_x=0.5, split_y=0.5):
     """把四个窗口排到同一屏的 2×2 四宫格（左上/右上/左下/右下）。
 
     与单窗的四等分吸附（snap 的 quad-*）配套：那四个按钮一次只动一个窗口，
     本函数一次摆四个窗口。
 
-    四宫格在横屏上就是上下左右四等分；竖屏不做特殊处理——用户明确要求
-    横屏上下左右 = 2×2 四等分，两块窄竖格并不好用。
+    四宫格在横屏上就是上下左右四等分；竖屏不做特殊处理——两块窄竖格并不好用。
+
+    split_x / split_y 给出分割比例（0~1，0.5 = 四等分）。等分并不总是最合适：
+    左栏放终端想窄一点、右栏放浏览器想宽一点是常见需求，所以界面上做了可
+    拖拽的分割线，把这两个比例一起传进来。
 
     四个 hwnd 均可显式指定；未指定时自动取最前面的四个窗口（左上优先用界面
     固定的目标窗口）。monitor 可指定目标显示器（int 索引或 device_name 字符串）；
@@ -1050,17 +1053,34 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
         idx = _monitor_index_by_rect(ms, tl_w["x"], tl_w["y"], tl_w["w"], tl_w["h"])
     mon = ms[idx]
     wl, wt, ww, wh = mon.work_rect
-    half_w, half_h = ww // 2, wh // 2
+    # 比例钳在安全区间：贴边会让某一格只剩几个像素，等于把窗口藏起来
+    sx = min(max(float(split_x), 0.15), 0.85)
+    sy = min(max(float(split_y), 0.15), 0.85)
+    col_w = int(round(ww * sx))
+    row_h = int(round(wh * sy))
+    right_w = ww - col_w
     # 上排先按理想四等分摆放
-    set_window_rect(picked[0][0], wl, wt, half_w, half_h, activate=False)
-    set_window_rect(picked[1][0], wl + half_w, wt, ww - half_w, half_h,
+    set_window_rect(picked[0][0], wl, wt, col_w, row_h, activate=False)
+    set_window_rect(picked[1][0], wl + col_w, wt, right_w, row_h,
                     activate=False)
+    # 左列的 App 可能有最小窗口宽度（实测 ChatGPT 请求 454 读回 480），
+    # 若右列仍按理想 col_w 起排，两列会重叠。读回实测宽度后按它定右列起点，
+    # 宽度不匀是应用侧钳制、无法消除，但至少两列不再互相压盖。
+    tl_rect = get_window_rect(picked[0][0])
+    right_x = wl + col_w
+    if tl_rect and tl_rect != (0, 0, 0, 0) and tl_rect[2] > 0:
+        right_x = max(wl + 1, min(wl + ww - 1, tl_rect[0] + tl_rect[2] + 1))
+    right_w = max(1, (wl + ww) - right_x)
+    if right_x != wl + col_w:
+        set_window_rect(picked[1][0], right_x, wt, right_w, row_h,
+                        activate=False)
+    half_w = int(right_x - wl)                # 下排左列与实测左列对齐
     # 实测闭环：System Events 对窗口几何有系统级钳制，且部分 App（Electron 类）
     # 有最小窗口高度，可能根本缩不到理想 half_h——实测笔记本竖半屏仅 447px，
     # ChatGPT 最小高 600px、CodeBuddy 570px。上排缩不下去时若仍按理想 half_h
     # 写下排，两排会重叠上百 px。因此上排写完后读回实测高度，用它推导下排起点，
     # 保证两排不重叠（与三栏排列的处理同源）。
-    bot_y = wt + half_h
+    bot_y = wt + row_h
     for h, _w in picked[:2]:
         rect = get_window_rect(h)
         if rect and rect != (0, 0, 0, 0) and rect[3] > 0:
@@ -1071,9 +1091,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     set_window_rect(picked[2][0], wl, bot_y, half_w, bot_h, activate=False)
     set_window_rect(picked[3][0], wl + half_w, bot_y, ww - half_w, bot_h,
                     activate=False)
-    logger.info("四宫格排列完成: 左上=%s 右上=%s 左下=%s 右下=%s（屏幕 %s）",
-                picked[0][0], picked[1][0], picked[2][0], picked[3][0],
-                mon.device_name)
+    logger.info("四宫格排列完成: 左上=%s 右上=%s 左下=%s 右下=%s（屏幕 %s，"
+                 "横向 %.0f%% / 竖向 %.0f%%）",
+                 picked[0][0], picked[1][0], picked[2][0], picked[3][0],
+                mon.device_name, sx * 100, sy * 100)
     return True
 
 

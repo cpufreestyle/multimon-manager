@@ -623,26 +623,40 @@ class App:
 
         # 四宫格可视化：把「左上/右上/左下/右下」四个下拉对应到一块 2×2 网格，
         # 点格子直接填/清空那一格，不用记住下拉框和方位的对应关系。
+        # 两条分割线可拖拽改比例——四等分并不总是合适（左栏放终端想窄一点、
+        # 右栏放浏览器想宽一点），拖动时实时重画，比例随「2×2 排列」一起生效。
         self.quad_grid_canvas = tk.Canvas(
             quad, width=140, height=88, bg="#fafafa",
             relief="sunken", borderwidth=1, highlightthickness=0)
         self.quad_grid_canvas.pack(side="left", padx=(6, 2))
+        self._quad_split_x = tk.DoubleVar(value=0.5)
+        self._quad_split_y = tk.DoubleVar(value=0.5)
+        self._quad_drag = None
         self._quad_cells = {}
-        for key, x0, y0 in (("TL", 0, 0), ("TR", 70, 0),
-                            ("BL", 0, 44), ("BR", 70, 44)):
+        self.quad_grid_canvas.bind("<Button-1>", self._on_quad_grid_press)
+        self.quad_grid_canvas.bind("<B1-Motion>", self._on_quad_grid_drag)
+        self.quad_grid_canvas.bind("<ButtonRelease-1>", self._on_quad_grid_release)
+        for key in self._QUAD_KEYS:
             rid = self.quad_grid_canvas.create_rectangle(
-                x0 + 1, y0 + 1, x0 + 68, y0 + 42,
-                fill="#e9e9e9", outline="#5a5a5a", width=1.2,
+                0, 0, 1, 1, fill="#e9e9e9", outline="#5a5a5a", width=1.2,
                 activefill="#d0d0d0")
             self.quad_grid_canvas.tag_bind(
                 rid, "<Button-1>",
                 lambda e, k=key: self._on_quad_cell_click(k))
             self._quad_cells[key] = rid
         self._quad_labels = {}
-        for key, cx, cy in (("TL", 34, 18), ("TR", 104, 18),
-                            ("BL", 34, 60), ("BR", 104, 60)):
+        for key in self._QUAD_KEYS:
             self._quad_labels[key] = self.quad_grid_canvas.create_text(
-                cx, cy, text="空", font=("Helvetica", 8), fill="#333")
+                0, 0, text="空", font=("Helvetica", 7), fill="#333")
+        # 分割线一横一竖 + 命中加粗：命中区宽 4px，方便鼠标点中
+        self._quad_vline = self.quad_grid_canvas.create_line(
+            0, 0, 0, 0, fill="#3b6ea5", width=1)
+        self._quad_hline = self.quad_grid_canvas.create_line(
+            0, 0, 0, 0, fill="#3b6ea5", width=1)
+        self._quad_vhit = self.quad_grid_canvas.create_rectangle(
+            0, 0, 0, 0, fill="", outline="")
+        self._quad_hhit = self.quad_grid_canvas.create_rectangle(
+            0, 0, 0, 0, fill="", outline="")
         self._quad_title_id = self.quad_grid_canvas.create_text(
             70, 1, text="", font=("Helvetica", 6), fill="#777", anchor="n")
         self.quad_grid_canvas.bind("<Configure>", self._on_quad_grid_resize)
@@ -895,12 +909,16 @@ class App:
         mon_label = self.quad_mon_var.get()
         if b.snap_four_quad(tl_hwnd=chosen[0], tr_hwnd=chosen[1],
                             bl_hwnd=chosen[2], br_hwnd=chosen[3],
-                            monitor=mon_idx):
+                            monitor=mon_idx,
+                            split_x=self._quad_split_x.get(),
+                            split_y=self._quad_split_y.get()):
             # 摆完清空四方格，下次点格子重新取材（避免旧窗口名误导）
             for v in quad_vars:
                 v.set(AUTO_TARGET)
             self.status_var.set("已 2×2 四宫格排列"
-                                + (f"（{mon_label}）" if mon_idx is not None else ""))
+                                + (f"（{mon_label}）" if mon_idx is not None else "")
+                                + f" 左{self._quad_split_x.get():.0%}/"
+                                f"上{self._quad_split_y.get():.0%}")
         else:
             self.status_var.set("四宫格失败：需要至少四个可操作窗口")
 
@@ -947,25 +965,106 @@ class App:
         self.status_var.set(f"{self._quad_key_names()[key]} ← {pick}")
 
     def _refresh_quad_grid(self):
-        """按四个方位的当前选择重画网格：填了的显示窗口名并高亮。"""
+        """按比例与四个方位的当前选择重画网格：格子、分割线、文字一起更新。"""
         cv = getattr(self, "quad_grid_canvas", None)
         if cv is None:
             return
+        sx = min(max(self._quad_split_x.get(), 0.15), 0.85)
+        sy = min(max(self._quad_split_y.get(), 0.15), 0.85)
+        cw, ch = cv.winfo_width(), cv.winfo_height()
+        if cw < 4 or ch < 4:                # 还没布局完，取请求尺寸兜底
+            cw, ch = 140, 88
+        # 顶部留给「已填 n/4」小标题，正文从 10px 开始
+        top = 10
+        col_x = int(round(cw * sx))
+        row_y = top + int(round((ch - top) * sy))
+        boxes = {
+            "TL": (0, top, col_x, row_y),
+            "TR": (col_x, top, cw, row_y),
+            "BL": (0, row_y, col_x, ch),
+            "BR": (col_x, row_y, cw, ch),
+        }
         for key in self._QUAD_KEYS:
             val = self._quad_var(key).get()
             filled = bool(val) and val != AUTO_TARGET
             rid = self._quad_cells.get(key)
             if rid is not None:
+                x0, y0, x1, y1 = boxes[key]
+                cv.coords(rid, x0 + 1, y0 + 1, x1, y1)
                 cv.itemconfigure(rid,
                                  fill="#d8e6ff" if filled else "#e9e9e9")
             lid = self._quad_labels.get(key)
             if lid is not None:
+                x0, y0, x1, y1 = boxes[key]
+                cv.coords(lid, (x0 + x1) // 2, (y0 + y1) // 2)
                 cv.itemconfigure(lid,
                                  text=(self._short_label(val) if filled else "空"),
                                  fill="#1a3d6d" if filled else "#999")
+        # 分割线贴在格子边界上，命中区加宽到 4px 方便鼠标抓
+        if getattr(self, "_quad_vline", None) is not None:
+            cv.coords(self._quad_vline, col_x, top, col_x, ch)
+            cv.coords(self._quad_vhit, col_x - 2, top, col_x + 2, ch)
+        if getattr(self, "_quad_hline", None) is not None:
+            cv.coords(self._quad_hline, 0, row_y, cw, row_y)
+            cv.coords(self._quad_hhit, 0, row_y - 2, cw, row_y + 2)
         n = sum(1 for k in self._QUAD_KEYS
                 if self._quad_var(k).get() not in ("", AUTO_TARGET, None))
-        cv.itemconfigure(self._quad_title_id, text=f"已填 {n}/4")
+        cv.itemconfigure(self._quad_title_id,
+                         text=f"已填 {n}/4 · {sx:.0%}/{sy:.0%}")
+
+    # ---------- 四宫格分割线拖拽 ----------
+    def _quad_hit_which(self, event):
+        """判断鼠标落在哪条分割线的命中区里；不在命中区返回 None。"""
+        cv = self.quad_grid_canvas
+        sx = min(max(self._quad_split_x.get(), 0.15), 0.85)
+        sy = min(max(self._quad_split_y.get(), 0.15), 0.85)
+        cw, ch = 140, 88
+        top = 10
+        col_x = int(round(cw * sx))
+        row_y = top + int(round((ch - top) * sy))
+        if abs(event.x - col_x) <= 3:
+            return "v"
+        if abs(event.y - row_y) <= 3:
+            return "h"
+        return None
+
+    def _on_quad_grid_press(self, event):
+        """按下：抓分割线并改成可拖拽光标。"""
+        which = self._quad_hit_which(event)
+        if which is None:
+            return
+        self._quad_drag = which
+        self.quad_grid_canvas.configure(cursor="sb_h_double_arrow"
+                                        if which == "v" else "sb_v_double_arrow")
+
+    def _on_quad_grid_drag(self, event):
+        """拖动：按鼠标位置更新比例并重画（实时预览）。"""
+        if self._quad_drag is None:
+            return
+        cw, ch = 140, 88
+        top = 10
+        x = min(max(event.x, int(cw * 0.15)), int(cw * 0.85))
+        y = min(max(event.y, top + int((ch - top) * 0.15)),
+                top + int((ch - top) * 0.85))
+        if self._quad_drag == "v":
+            self._quad_split_x.set(x / cw)
+        else:
+            self._quad_split_y.set((y - top) / (ch - top))
+        self._refresh_quad_grid()
+
+    def _on_quad_grid_release(self, _event=None):
+        """松手：还原光标并提示当前比例。"""
+        if self._quad_drag is None:
+            return
+        self._quad_drag = None
+        self.quad_grid_canvas.configure(cursor="")
+        self.status_var.set(
+            "四宫格比例：横向 %.0f%%（左栏）/ %.0f%%（右栏），"
+            "竖向 %.0f%%（上排）/ %.0f%%（下排）——点「2×2 排列」生效" % (
+                self._quad_split_x.get() * 100,
+                (1 - self._quad_split_x.get()) * 100,
+                self._quad_split_y.get() * 100,
+                (1 - self._quad_split_y.get()) * 100))
 
     @staticmethod
     def _short_label(label):
