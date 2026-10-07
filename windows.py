@@ -7,6 +7,8 @@ from ctypes import wintypes
 
 import monitors
 
+import quad_plan
+
 logger = logging.getLogger(__name__)
 
 # ── 撤销栈：记录每次移动/缩放前的窗口几何，供"撤销移动"使用（F7）──
@@ -830,6 +832,8 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, moni
             ms, left_w["x"], left_w["y"], left_w["w"], left_w["h"])
     mon = ms[idx]
     wl, wt, ww, wh = mon.work_rect
+    # 默认用手动传入的比例；smart 成功时被下面的智能分配覆盖
+    sx, sy = split_x, split_y
     half = ww // 2
     _place_window(left_w["hwnd"], wl, wt, half, wh)
     _place_window(right_w["hwnd"], wl + half, wt, ww - half, wh)
@@ -909,7 +913,8 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
 
 
 def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
-                   use_pinned=True, monitor=None, split_x=0.5, split_y=0.5):
+                   use_pinned=True, monitor=None, split_x=0.5, split_y=0.5,
+                   smart=False):
     """把四个窗口排到同一屏的 2×2 四宫格（左上/右上/左下/右下，整数 HWND）。
 
     与 snap 的 quad-* 四等分吸附配套：那四个一次只动一个窗口，本函数一次摆四个。
@@ -920,6 +925,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     split_x / split_y 给出分割比例（0~1，0.5 = 四等分）。等分并不总是最合适：
     左栏放终端想窄一点、右栏放浏览器想宽一点是常见需求，界面上做了可拖拽的
     分割线，把这两个比例一起传进来。
+
+    smart=True 时改用智能分配：传入哪些窗口都行，谁去哪个角、用什么比例
+    都由 quad_plan.plan_quad_smart 按各窗口的宽高比算出来。此时 tl/tr/bl/br
+    只是「参与排列的四个窗口」（顺序不限），split_x/split_y 作为兜底值。
     """
     ms = monitors.enum_monitors()
     if not ms:
@@ -952,9 +961,35 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
                                      tl_w["w"], tl_w["h"])
     mon = ms[idx]
     wl, wt, ww, wh = mon.work_rect
+    # 默认用手动传入的比例；smart 成功时被下面的智能分配覆盖
+    sx, sy = split_x, split_y
+    if smart:
+        # 智能分配：按各窗口的宽高比重排四个角的归属，并重算分割比例。
+        # 直接用 picked 里的 w（带 x/y/w/h）做判据，不重新枚举——重新拉列表
+        # 顺序与几何都会变，按 (owner, name) 匹配会错位
+        try:
+            planned, sx2, sy2 = quad_plan.plan_quad_smart(
+                [dict(w, hwnd=h) for h, w in picked], ww, wh)
+        except ValueError as e:  # noqa: BLE001
+            logger.warning("智能分配失败，退回手动比例: %s", e)
+        else:
+            reordered = []
+            for w in planned:
+                reordered.append((w.get("hwnd"), w))
+            if all(h for h, _w in reordered) and len(reordered) == 4:
+                picked = reordered
+                sx, sy = sx2, sy2
+                logger.info("智能分配结果(Windows): 左上=%s 右上=%s 左下=%s 右下=%s "
+                            "（横向 %.0f%% / 竖向 %.0f%%）",
+                            picked[0][0], picked[1][0], picked[2][0], picked[3][0],
+                            sx * 100, sy * 100)
+            else:
+                logger.warning("智能分配结果异常，保留手动顺序")
     # 比例钳在安全区间：贴边会让某一格只剩几个像素，等于把窗口藏起来
-    sx = min(max(float(split_x), 0.15), 0.85)
-    sy = min(max(float(split_y), 0.15), 0.85)
+    sx = min(max(float(sx), 0.15), 0.85)
+    sy = min(max(float(sy), 0.15), 0.85)
+    global _last_quad_splits
+    _last_quad_splits = (sx, sy)
     half_w = int(round(ww * sx))
     half_h = int(round(wh * sy))
     # 上排先按理想四等分摆放
@@ -991,6 +1026,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
 def _is_portrait(mon):
     """屏幕是否为竖屏（高大于宽）。"""
     return mon.height > mon.width
+
+
+# 最近一次四宫格实际使用的比例 (split_x, split_y)，智能模式下即程序算出的值
+_last_quad_splits = (0.5, 0.5)
 
 
 def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",

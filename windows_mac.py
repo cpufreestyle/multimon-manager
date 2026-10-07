@@ -25,6 +25,8 @@ import time
 import monitors_mac as monitors
 from monitors_mac import CGRect
 
+import quad_plan
+
 logger = logging.getLogger(__name__)
 
 # ── 撤销栈：记录每次移动/缩放前的窗口几何，供"撤销移动"使用（F7）──
@@ -533,7 +535,7 @@ def _ax_window_selector(hwnd):
     return f"window {seq}"
 
 
-def _ax_window_by_geometry(app, rect):
+def _ax_window_by_geometry(app, rect, name=None):
     """按几何在 AX 窗口列表里找出对应的 window N 选择子。
 
     CG 的窗口枚举（list_windows_front_to_back）与 AppleScript 的 AX 窗口
@@ -586,9 +588,54 @@ def _ax_window_by_geometry(app, rect):
         return None
     # 偏差过大（超过 64px 总和）说明几何已变（窗口被移动过），匹配不可信
     if best_dev > 64:
-        logger.info("AX 几何匹配偏差过大 (%d)，回退按序号选择", best_dev)
+        by_name = _ax_window_by_name(app, name)
+        if by_name:
+            logger.info("AX 几何匹配偏差过大 (%d)，改用窗口名匹配 -> %s",
+                        best_dev, by_name)
+            return by_name
+        logger.info("AX 几何匹配偏差过大 (%d)，回退按序号", best_dev)
         return None
     return f"window {best}"
+
+
+def _ax_window_by_name(app, name):
+    """按窗口名在 AX 窗口列表里找 window N（几何匹配失效时的兜底）。
+
+    几何匹配失效时不能直接回退 window 1：真机 Chrome 的 EchoID 主窗口在
+    y=-870 的副屏，CG 几何与 AX 对不上就回退 window 1，几何便写到了
+    「要保存密码吗」对话框上，主窗口看着完全推不动。
+
+    AX 的 name 与 CG 的窗口标题未必字字相同，所以用「互相包含」判断，
+    并优先取名字更长（更具体）的那个，避免都含空串时误配。
+    """
+    want = (name or "").strip()
+    if not want:
+        return None
+    script = (
+        'tell application "System Events"'
+        ' tell process "' + app + '"'
+        ' set out to ""'
+        ' repeat with w in windows'
+        ' set out to out & (name of w as text) & ";"'
+        ' end repeat'
+        ' end tell'
+        ' end tell'
+        ' return out'
+    )
+    raw = _osa(script)
+    if not raw:
+        return None
+    names = [n.strip() for n in raw.split(";")]
+    best, best_len = None, 0
+    for i, n in enumerate(names, 1):
+        if not n:
+            continue
+        if want in n or n in want:
+            if len(n) > best_len:
+                best, best_len = i, len(n)
+    if best is None and len(names) == 1:
+        return "window 1"
+    return f"window {best}" if best else None
 
 
 def _wait_rect_stable(hwnd, timeout=1.5, interval=0.08, need=3):
@@ -650,11 +697,13 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
             push_undo(hwnd, get_window_rect(hwnd))
         except Exception:  # noqa: BLE001
             pass
-    app, _name, _seq = parse_hwnd(hwnd)
+    app2, nm, _sq = parse_hwnd(hwnd)
+    known = _last_rect.get(hwnd)
+    win_sel = (_ax_window_by_geometry(app2, known, nm)
+               or _ax_window_selector(hwnd))
     # 优先按几何在 AX 窗口列表里定位：CG 枚举顺序与 AX 顺序未必一致，
     # 只按 hwnd 序号选窗口会把几何写到别的窗口上（见 _ax_window_by_geometry）
-    known = _last_rect.get(hwnd)
-    win_sel = _ax_window_by_geometry(app, known) or _ax_window_selector(hwnd)
+    app = app2
     # 原始目标（content 坐标），闭环全程以此为基准，偏差按「实测 - 原始目标」累计
     tx, ty, tw, th = (int(round(v)) for v in (x, y, w, h))
     # 幂等重设次数上限：下半屏约 3 次命中；整屏高度类（变化量最大）需更多次才触顶
@@ -989,6 +1038,11 @@ def _is_portrait(mon):
 _last_quad_report = []
 
 
+# 最近一次四宫格实际使用的比例 (split_x, split_y)，智能模式下即程序算出的值，
+# 界面读它把拖拽分割线同步到真实比例
+_last_quad_splits = (0.5, 0.5)
+
+
 def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",
                       monitor_indices=None):
     """把若干窗口分别铺满各自的显示器，一个窗口一块屏。
@@ -1069,7 +1123,8 @@ def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",
     return done
 
 def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
-                   use_pinned=True, monitor=None, split_x=0.5, split_y=0.5):
+                   use_pinned=True, monitor=None, split_x=0.5, split_y=0.5,
+                   smart=False):
     """把四个窗口排到同一屏的 2×2 四宫格（左上/右上/左下/右下）。
 
     与单窗的四等分吸附（snap 的 quad-*）配套：那四个按钮一次只动一个窗口，
@@ -1080,6 +1135,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     split_x / split_y 给出分割比例（0~1，0.5 = 四等分）。等分并不总是最合适：
     左栏放终端想窄一点、右栏放浏览器想宽一点是常见需求，所以界面上做了可
     拖拽的分割线，把这两个比例一起传进来。
+
+    smart=True 时改用智能分配：传入哪些窗口都行，谁去哪个角、用什么比例
+    都由 quad_plan.plan_quad_smart 按各窗口的宽高比算出来。此时 tl/tr/bl/br
+    只是「参与排列的四个窗口」（顺序不限），split_x/split_y 作为兜底值。
 
     四个 hwnd 均可显式指定；未指定时自动取最前面的四个窗口（左上优先用界面
     固定的目标窗口）。monitor 可指定目标显示器（int 索引或 device_name 字符串）；
@@ -1122,9 +1181,37 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
         idx = _monitor_index_by_rect(ms, tl_w["x"], tl_w["y"], tl_w["w"], tl_w["h"])
     mon = ms[idx]
     wl, wt, ww, wh = mon.work_rect
+    # 默认用手动传入的比例；smart 成功时被下面的智能分配覆盖
+    sx, sy = split_x, split_y
+    if smart:
+        # 智能分配：按各窗口的宽高比重排四个角的归属，并重算分割比例。
+        # 直接用 picked 里的 w（带 x/y/w/h）做判据，不再重新枚举——重新拉列表
+        # 会拿到不同的顺序与几何，重排时按 (owner, name) 匹配就会错位
+        # （真机实测 plan 说豆包去 TL，实际 ChatGPT 去了 TR）。
+        try:
+            planned, sx2, sy2 = quad_plan.plan_quad_smart(
+                [dict(w, hwnd=h) for h, w in picked], ww, wh)
+        except ValueError as e:  # noqa: BLE001
+            logger.warning("智能分配失败，退回手动比例: %s", e)
+        else:
+            # planned 里的元素就是传入的 dict（已带 hwnd 键），直接取
+            reordered = []
+            for w in planned:
+                reordered.append((w.get("hwnd"), w))
+            if all(h for h, _w in reordered) and len(reordered) == 4:
+                picked = reordered
+                sx, sy = sx2, sy2
+                logger.info("智能分配结果: 左上=%s 右上=%s 左下=%s 右下=%s "
+                            "（横向 %.0f%% / 竖向 %.0f%%）",
+                            picked[0][0], picked[1][0], picked[2][0], picked[3][0],
+                            sx * 100, sy * 100)
+            else:
+                logger.warning("智能分配结果异常，保留手动顺序")
     # 比例钳在安全区间：贴边会让某一格只剩几个像素，等于把窗口藏起来
-    sx = min(max(float(split_x), 0.15), 0.85)
-    sy = min(max(float(split_y), 0.15), 0.85)
+    sx = min(max(float(sx), 0.15), 0.85)
+    sy = min(max(float(sy), 0.15), 0.85)
+    global _last_quad_splits
+    _last_quad_splits = (sx, sy)
     col_w = int(round(ww * sx))
     row_h = int(round(wh * sy))
     right_w = ww - col_w

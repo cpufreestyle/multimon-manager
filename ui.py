@@ -599,6 +599,7 @@ class App:
         self.quad_tr_var = tk.StringVar(value=AUTO_TARGET)
         self.quad_bl_var = tk.StringVar(value=AUTO_TARGET)
         self.quad_br_var = tk.StringVar(value=AUTO_TARGET)
+        self.quad_smart_var = tk.BooleanVar(value=False)
         # 四个下拉不重复写「左上/右上/左下/右下」文字标签：右侧 2×2 网格本身
         # 就是方位图，格子与下拉按 TL/TR/BL/BR 同序对应，再把四个 label 省掉
         # （整行原宽 884px，超出行宽工具条，四宫格选项会被挤出可视区）。
@@ -628,15 +629,26 @@ class App:
             quad_btn,
             "把四个窗口按 2×2 四宫格排到同一屏（即上下左右四分屏）。"
             "留「自动」时取最前面的四个窗口。")
+        # 智能分配：用户只管选哪四个窗口，谁去哪个角、用什么比例由程序算。
+        # 判据是各窗口的宽高比——把窗口放进宽高比最接近的格子，反之会被
+        # App 的最小尺寸钳制（真机 ChatGPT 请求高 448 实测 600）。
+        smart_cb = ttk.Checkbutton(
+            quad, text="智能", variable=self.quad_smart_var,
+            command=self._on_quad_smart_toggle)
+        smart_cb.pack(side="left", padx=(6, 0))
+        self._tooltip(
+            smart_cb,
+            "勾选后不用管四个下拉的顺序：程序按每个窗口的宽高比，"
+            "决定谁去哪个角、左右上下怎么切，让每格都贴合窗口。"
+            "下拉此时只表示「参与排列的四个窗口」。")
 
         # 四宫格可视化：把「左上/右上/左下/右下」四个下拉对应到一块 2×2 网格，
         # 点格子直接填/清空那一格，不用记住下拉框和方位的对应关系。
         # 两条分割线可拖拽改比例——四等分并不总是合适（左栏放终端想窄一点、
         # 右栏放浏览器想宽一点），拖动时实时重画，比例随「2×2 排列」一起生效。
         self.quad_grid_canvas = tk.Canvas(
-            quad, width=140, height=88, bg="#fafafa",
+            quad, width=self._quad_grid_w, height=self._quad_grid_h, bg="#fafafa",
             relief="sunken", borderwidth=1, highlightthickness=0)
-        self.quad_grid_canvas.pack(side="left", padx=(6, 2))
         self._quad_split_x = tk.DoubleVar(value=0.5)
         self._quad_split_y = tk.DoubleVar(value=0.5)
         self._quad_drag = None
@@ -666,7 +678,8 @@ class App:
         self._quad_hhit = self.quad_grid_canvas.create_rectangle(
             0, 0, 0, 0, fill="", outline="")
         self._quad_title_id = self.quad_grid_canvas.create_text(
-            70, 1, text="", font=("Helvetica", 6), fill="#777", anchor="n")
+            self._quad_grid_w // 2, 1, text="",
+            font=("Helvetica", 6), fill="#777", anchor="n")
         self.quad_grid_canvas.bind("<Configure>", self._on_quad_grid_resize)
         self._refresh_quad_grid()
         self._tooltip(self.quad_grid_canvas,
@@ -944,6 +957,7 @@ class App:
         # 四宫格下拉存的是短标签，经 _quad_short_map 换回 hwnd
         short_map = getattr(self, "_quad_short_map", {AUTO_TARGET: None})
         chosen = [short_map.get(v.get()) for v in quad_vars]
+        smart = bool(self.quad_smart_var.get())
         filled = [x for x in chosen if x]
         if len(set(filled)) < len(filled):
             messagebox.showwarning("提示", "四宫格四个窗口不能重复选择")
@@ -954,19 +968,30 @@ class App:
                             bl_hwnd=chosen[2], br_hwnd=chosen[3],
                             monitor=mon_idx,
                             split_x=self._quad_split_x.get(),
-                            split_y=self._quad_split_y.get()):
+                            split_y=self._quad_split_y.get(),
+                            smart=smart):
             # 摆完清空四方格，下次点格子重新取材（避免旧窗口名误导）
             for v in quad_vars:
                 v.set(AUTO_TARGET)
+            # 智能模式下程序自己定了比例，把它同步回分割线，
+            # 网格显示才与实际排出来的一致
+            if smart:
+                bm = self._quad_backend_mod()
+                sx2, sy2 = getattr(bm, "_last_quad_splits", (None, None))
+                if sx2 is not None:
+                    self._quad_split_x.set(sx2)
+                    self._quad_split_y.set(sy2)
+                    self._refresh_quad_grid()
             self.status_var.set("已 2×2 四宫格排列"
                                 + (f"（{mon_label}）" if mon_idx is not None else "")
                                 + f" 左{self._quad_split_x.get():.0%}/"
                                 f"上{self._quad_split_y.get():.0%}")
             # 逐格实测 vs 目标：App 有最小窗口尺寸时某一格缩不到目标值，
             # 呈现为「不准」，但那是应用侧钳制、不是坐标算错。如实报出来。
+            bm = self._quad_backend_mod()
             clamped = []
-            for hwnd, want, got in getattr(b.windows_mac, "_last_quad_report",
-                                           []) or []:
+            for hwnd, want, got in (getattr(bm, "_last_quad_report", None)
+                                    or []):
                 if got is None:
                     clamped.append("读不到")
                     continue
@@ -982,6 +1007,18 @@ class App:
 
     # ---------- 四宫格可视化 ----------
     _QUAD_KEYS = ("TL", "TR", "BL", "BR")
+    _quad_grid_w = 118          # 网格画布宽度（见下方创建处）
+    _quad_grid_h = 88
+
+    @staticmethod
+    def _quad_backend_mod():
+        """当前平台真正干活的窗口模块（mac 与 Windows 的模块名不同）。"""
+        try:
+            import windows_mac as wm
+            return wm
+        except ImportError:  # noqa: BLE001
+            import windows as ww
+            return ww
 
     def _quad_var(self, key):
         return {"TL": self.quad_tl_var, "TR": self.quad_tr_var,
@@ -1031,7 +1068,7 @@ class App:
         sy = min(max(self._quad_split_y.get(), 0.15), 0.85)
         cw, ch = cv.winfo_width(), cv.winfo_height()
         if cw < 4 or ch < 4:                # 还没布局完，取请求尺寸兜底
-            cw, ch = 140, 88
+            cw, ch = self._quad_grid_w, self._quad_grid_h
         # 顶部留给「已填 n/4」小标题，正文从 10px 开始
         top = 10
         col_x = int(round(cw * sx))
@@ -1076,7 +1113,7 @@ class App:
         cv = self.quad_grid_canvas
         sx = min(max(self._quad_split_x.get(), 0.15), 0.85)
         sy = min(max(self._quad_split_y.get(), 0.15), 0.85)
-        cw, ch = 140, 88
+        cw, ch = self._quad_grid_w, self._quad_grid_h
         top = 10
         col_x = int(round(cw * sx))
         row_y = top + int(round((ch - top) * sy))
@@ -1088,6 +1125,11 @@ class App:
 
     def _on_quad_grid_press(self, event):
         """按下：抓分割线并改成可拖拽光标。"""
+        if self.quad_smart_var.get():
+            # 智能模式下比例由程序算，不接受手动拖
+            self.status_var.set("智能分配已开，比例由程序计算；"
+                                "想手动拖分割线请先取消勾选")
+            return
         which = self._quad_hit_which(event)
         if which is None:
             return
@@ -1099,7 +1141,7 @@ class App:
         """拖动：按鼠标位置更新比例并重画（实时预览）。"""
         if self._quad_drag is None:
             return
-        cw, ch = 140, 88
+        cw, ch = self._quad_grid_w, self._quad_grid_h
         top = 10
         x = min(max(event.x, int(cw * 0.15)), int(cw * 0.85))
         y = min(max(event.y, top + int((ch - top) * 0.15)),
@@ -1123,6 +1165,19 @@ class App:
                 (1 - self._quad_split_x.get()) * 100,
                 self._quad_split_y.get() * 100,
                 (1 - self._quad_split_y.get()) * 100))
+
+    def _on_quad_smart_toggle(self):
+        """勾选/取消智能分配。智能模式下分割线由程序计算，不接受手动拖。"""
+        smart = bool(self.quad_smart_var.get())
+        if smart:
+            # 比例将被程序算出，先提示用户下拉框 semantics 的变化
+            self.status_var.set(
+                "智能分配已开：四个下拉只表示参与排列的窗口，"
+                "谁去哪个角、比例怎么切都由程序按窗口宽高比算；"
+                "想手动指定就取消勾选")
+        else:
+            self.status_var.set("智能分配已关：按四个下拉的位置摆放，"
+                                "比例用分割线的当前位置")
 
     @staticmethod
     def _short_label(label):

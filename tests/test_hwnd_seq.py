@@ -59,6 +59,59 @@ class TestAxWindowByGeometry(unittest.TestCase):
         self._set_ax("")
         self.assertIsNone(wm._ax_window_by_geometry("QClaw", (50, 50, 900, 700)))
 
+    def test_falls_back_to_name_when_geometry_mismatch(self):
+        """几何对不上（窗口在副屏）时应改用窗口名匹配，不能回退 window 1。
+
+        真机 Chrome 的 EchoID 主窗口在 y=-870 副屏，CG 几何与 AX 差 978px；
+        若回退 window 1，几何会写到「要保存密码吗」对话框上，主窗口看着
+        完全推不动。
+        """
+        calls = []
+
+        def _osa(script):
+            calls.append(script)
+            if "position of w" in script:
+                # 主窗口在副屏，几何与目标差很远
+                return "0,-870,1600,870;0,0,448,394"
+            if "name of w" in script:
+                return "要保存密码吗？;EchoID - 录音 - Google Chrome"
+            return ""
+
+        wm._osa = _osa
+        sel = wm._ax_window_by_geometry("Google Chrome", (0, 33, 906, 447),
+                                        name="EchoID")
+        self.assertEqual(sel, "window 2")
+
+    def test_name_match_prefers_longer_name(self):
+        """多个窗口名都包含目标时，取更具体的那个。"""
+
+        def _osa(script):
+            if "name of w" in script:
+                return "a;ab;abc"
+            return ""
+
+        wm._osa = _osa
+        # 三个都命中（互相包含），取最具体的 abc = window 3
+        self.assertEqual(wm._ax_window_by_name("App", "ab"), "window 3")
+
+    def test_name_match_single_window(self):
+        """整个应用只有一个窗口，名字再不像也只能是它。"""
+
+        def _osa(script):
+            if "name of w" in script:
+                return "totally different"
+            return ""
+
+        wm._osa = _osa
+        self.assertEqual(wm._ax_window_by_name("App", "Wanted"), "window 1")
+
+    def test_name_match_empty_name_returns_none(self):
+        def _osa(script):
+            return "whatever"
+
+        wm._osa = _osa
+        self.assertIsNone(wm._ax_window_by_name("App", ""))
+
     def test_selector_still_works_without_geometry(self):
         """没有已知几何时仍按 hwnd 序号选窗（旧行为保留）。"""
         wm._last_rect.clear()
