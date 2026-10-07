@@ -603,13 +603,21 @@ class App:
         # 就是方位图，格子与下拉按 TL/TR/BL/BR 同序对应，再把四个 label 省掉
         # （整行原宽 884px，超出行宽工具条，四宫格选项会被挤出可视区）。
         # tooltip 里说明对应关系，鼠标悬停即可看到。
+        # Tk 的 Combobox 在 values 变化后会按最长项重算请求宽度，构造时的
+        # width 形同虚设（实测四个各自涨到 139px，整行 954px 被画布裁掉）。
+        # 用一个禁止尺寸传播的固定宽 Frame 装起来：容器宽度写死，控件按
+        # 容器裁切，下拉列表本身仍能看完整项。
+        quad_picks = ttk.Frame(quad, width=390, height=28)
+        quad_picks.pack(side="left", padx=(6, 0))
+        quad_picks.pack_propagate(False)
         for key, var, pos, tip in (
             ("tl", self.quad_tl_var, "左上", "四宫格左上角的窗口。"),
             ("tr", self.quad_tr_var, "右上", "四宫格右上角的窗口。"),
             ("bl", self.quad_bl_var, "左下", "四宫格左下角的窗口。"),
             ("br", self.quad_br_var, "右下", "四宫格右下角的窗口。"),
         ):
-            cb = ttk.Combobox(quad, textvariable=var, state="readonly", width=10)
+            cb = ttk.Combobox(quad_picks, textvariable=var, state="readonly",
+                              width=11)
             cb.pack(side="left", padx=(4, 0))
             self._tooltip(cb, f"{pos}角的窗口。自动 = 取最前面的未占用窗口。")
             setattr(self, "quad_%s_cb" % key, cb)
@@ -706,6 +714,29 @@ class App:
             labels.append(w["label"])
             self._target_map[w["label"]] = w["hwnd"]
         self.target_cb["values"] = labels
+        # 四宫格那四个下拉单独用短标签：完整标签形如
+        # 「ChatGPT — ChatGPT  (1512×895)」，Combobox 会按最长项把自己
+        # 撑到 121px/个，四个加网格和按钮整行溢出可视区（这是四宫格选项
+        # 在界面里看不见的直接原因）。压缩成「#1 应用名」后宽度可控，
+        # 也与网格里显示的文字一致。
+        short = [AUTO_TARGET]
+        short_map = {AUTO_TARGET: None}
+        for w in wins:
+            lb = w["label"]
+            if lb not in self._target_map:
+                continue
+            s = self._short_label(lb)
+            if s in short_map:
+                continue
+            short_map[s] = self._target_map[lb]
+            short.append(s)
+        self._quad_short_map = short_map
+        # 反向表：完整标签 -> 短标签（保存/切换选择时用）
+        self._quad_short_rev = {}
+        for w in wins:
+            lb = w["label"]
+            if lb in self._target_map:
+                self._quad_short_rev[lb] = self._short_label(lb)
         # 并排窗口下拉与目标窗口共用同一份列表（含"自动"）
         if hasattr(self, "sbs_left_cb"):
             for cb, var in ((self.sbs_left_cb, self.sbs_left_var),
@@ -713,13 +744,23 @@ class App:
                             (self.stack_top_cb, self.stack_top_var),
                             (self.stack_mid_cb, self.stack_mid_var),
                             (self.stack_bot_cb, self.stack_bot_var),
-                            (self.quad_tl_cb, self.quad_tl_var),
-                            (self.quad_tr_cb, self.quad_tr_var),
-                            (self.quad_bl_cb, self.quad_bl_var),
-                            (self.quad_br_cb, self.quad_br_var)):
+                            ):
                 cb["values"] = labels
                 if var.get() and var.get() not in self._target_map:
                     var.set(AUTO_TARGET)
+        if hasattr(self, "quad_tl_cb"):
+            for cb, var in ((self.quad_tl_cb, self.quad_tl_var),
+                            (self.quad_tr_cb, self.quad_tr_var),
+                            (self.quad_bl_cb, self.quad_bl_var),
+                            (self.quad_br_cb, self.quad_br_var)):
+                cb["values"] = short
+                # 现存的可能是短标签（自己写的）或完整标签（别处写的），
+                # 都要归一到短标签，否则下面按 short_map 查不到会掉成「自动」
+                raw = var.get()
+                cur = raw if raw in short_map else self._quad_short_rev.get(raw)
+                if cur not in short_map:
+                    cur = AUTO_TARGET
+                var.set(cur)
         # 窗口列表变了：网格上显示的窗口名可能已失效，按新选择重画
         if hasattr(self, "quad_grid_canvas"):
             self._refresh_quad_grid()
@@ -900,7 +941,9 @@ class App:
                 pass
         quad_vars = (self.quad_tl_var, self.quad_tr_var,
                      self.quad_bl_var, self.quad_br_var)
-        chosen = [self._target_map.get(v.get()) for v in quad_vars]
+        # 四宫格下拉存的是短标签，经 _quad_short_map 换回 hwnd
+        short_map = getattr(self, "_quad_short_map", {AUTO_TARGET: None})
+        chosen = [short_map.get(v.get()) for v in quad_vars]
         filled = [x for x in chosen if x]
         if len(set(filled)) < len(filled):
             messagebox.showwarning("提示", "四宫格四个窗口不能重复选择")
@@ -952,10 +995,10 @@ class App:
                 taken.add(v)
         # 按界面窗口列表顺序取第一个未被其它方位占用的窗口
         pick = None
-        for label, hwnd in getattr(self, "_target_map", {}).items():
-            if label == AUTO_TARGET or not hwnd or label in taken:
+        for short in getattr(self, "_quad_short_map", {}):
+            if short == AUTO_TARGET or short in taken:
                 continue
-            pick = label
+            pick = short
             break
         if pick is None:
             self.status_var.set("没有更多窗口可填了（先清空某一格）")
@@ -1117,6 +1160,7 @@ class App:
         """屏的短名，用于状态栏（避免长设备名把状态栏挤爆）。"""
         name = (self._monitor_display_name(m) or "").strip()
         return name or f"{m.width}x{m.height}"
+
     def _fill_all_monitors(self):
         """把最前面的若干窗口依次铺到勾选的屏（一个窗口一块屏）。
 
