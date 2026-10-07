@@ -656,48 +656,33 @@ class App:
                   foreground="#666", wraplength=200,
                   justify="left").pack(anchor="nw")
 
-        # 跨屏铺满：若干窗口分别铺满各自的屏（一个窗口一块屏）
-        # 单屏环境做不了跨屏（只有一块屏，铺满即最大化），故隐藏入口
-        if len(self.monitors) >= 2:
-            spread = ttk.Frame(f)
-            spread.pack(fill="x", padx=6, pady=(4, 2))
-            ttk.Label(spread, text="跨屏铺满:").pack(side="left")
-            n_mon = len(self.monitors)
-            self.spread_mode_var = tk.StringVar(value="每屏整屏最大化")
-            self.spread_mode_cb = ttk.Combobox(
-                spread, textvariable=self.spread_mode_var, state="readonly",
-                width=14,
-                values=["每屏整屏最大化", "每屏左上角四分之一"])
-            self.spread_mode_cb.pack(side="left", padx=(4, 2))
-            self._tooltip(self.spread_mode_cb,
-                         "铺到每块屏的方式：整屏铺满工作区，或只占左上四分之一。")
-            spread_btn = ttk.Button(spread, text="逐屏铺满",
-                                    command=self._fill_all_monitors)
-            spread_btn.pack(side="left", padx=(10, 0))
-            self._tooltip(
-                spread_btn,
-                f"把最前面的 {n_mon} 个窗口分别铺到 {n_mon} 块屏，"
-                "第 1 个窗口去第 1 块屏、依此类推（顺序同上方显示器列表）。"
-                "窗口不够则有多少铺多少，多出来的屏不动。")
+        # 跨屏铺满：若干窗口分别铺满各自勾选的屏（一个窗口一块屏）
+        # 容器无条件建：__init__ 里 self.monitors 还是空的，屏数在之后的
+        # refresh_monitors() 才填上，若按当时屏数决定是否建控件，
+        # 之后热插拔变多屏也不会再出现入口（_rebuild 拿不到 parent）。
+        spread = ttk.Frame(f)
+        spread.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(spread, text="跨屏铺满:").pack(side="left")
+        self._spread_checks_parent = spread
+        self._last_monitors = list(self.monitors)
+        self.spread_mode_var = tk.StringVar(value="每屏整屏最大化")
+        self.spread_mode_cb = ttk.Combobox(
+            spread, textvariable=self.spread_mode_var, state="readonly",
+            width=14,
+            values=["每屏整屏最大化", "每屏左上角四分之一"])
+        self.spread_mode_cb.pack(side="left", padx=(4, 2))
+        self._tooltip(self.spread_mode_cb,
+                     "铺到每块屏的方式：整屏铺满工作区，或只占左上四分之一。")
+        spread_btn = ttk.Button(spread, text="铺所选屏",
+                                command=self._fill_all_monitors)
+        spread_btn.pack(side="left", padx=(10, 0))
+        self._tooltip(
+            spread_btn,
+            "把窗口依次铺到勾选的屏，第 1 个窗口去第 1 块勾选的屏、依此类推。"
+            "窗口比勾选的屏少时有几屏铺几屏，多出来的屏不动。")
+        # 勾选框按当前屏数生成（屏数为 1 时跨屏铺满等价于最大化，故不显示）
+        self._rebuild_spread_checks()
 
-
-        # 台前调度开启时，两个不同 App 的窗口必须处于同一个"台前组"才会同时显示，
-        # 而 macOS 无公开 API 建组，只能用户先手动拖到一起。
-        if b.stage_manager_enabled():
-            ttk.Label(
-                f,
-                text="提示：已开启「台前调度」。两个窗口需先手动拖到同一个组，"
-                     "再用「并排左右」，否则另一个会被收进侧边。",
-                foreground="#a15c00",
-                wraplength=620,
-                justify="left",
-            ).pack(fill="x", padx=6, pady=(0, 6))
-
-        self._target_map = {AUTO_TARGET: None}
-        self._refresh_targets()
-        self._apply_topmost()
-
-    # ---------- 目标窗口 ----------
     def _refresh_targets(self):
         """刷新可选窗口列表，尽量保留当前选择。"""
         try:
@@ -773,6 +758,50 @@ class App:
             cb["values"] = labels
             if var.get() not in self._monitor_map:
                 var.set(AUTO_MON)
+        # 跨屏铺满的勾选框按 device_path 保留勾选（显示器增减后仍对得上）
+        self._rebuild_spread_checks()
+
+    def _rebuild_spread_checks(self):
+        """重建跨屏铺满的屏勾选框，尽量保留原有勾选。
+
+        热插拔会改变屏的数量与顺序，勾选框是构建期建的静态控件，
+        这里按 device_path 迁移旧状态，再对新屏按「横屏勾、竖屏不勾」给默认值。
+        """
+        parent = getattr(self, "_spread_checks_parent", None)
+        if parent is None:
+            return
+        old = {}
+        for i, var in getattr(self, "_spread_checks", []):
+            if i < len(self._last_monitors):
+                old[self._last_monitors[i].device_path] = bool(var.get())
+        for child in parent.winfo_children():
+            child.destroy()
+        self._spread_checks = []
+        # 单屏时跨屏铺满等价于最大化，没有可选项，整个勾选行不显示
+        if len(self.monitors) < 2:
+            self._last_monitors = list(self.monitors)
+            return
+        ttk.Label(parent, text="屏:").pack(side="left", padx=(6, 2))
+        for i, m in enumerate(self.monitors):
+            portrait = m.height > m.width
+            if m.device_path in old:
+                val = old[m.device_path]
+            else:
+                val = not portrait
+            var = tk.BooleanVar(value=val)
+            label = (f"{i + 1}"
+                     + ("★" if m.is_primary else "")
+                     + ("竖" if portrait else "横")
+                     + f" {m.width}x{m.height}")
+            cb = ttk.Checkbutton(parent, text=label, variable=var,
+                                 command=self._on_spread_check)
+            cb.pack(side="left", padx=(2, 0))
+            self._tooltip(
+                cb,
+                f"勾选则把窗口铺到这块屏（{self._monitor_display_name(m)}）。"
+                "竖屏上的横屏应用会被压扁，默认不勾。")
+            self._spread_checks.append((i, var))
+        self._last_monitors = list(self.monitors)
 
     def _move_to_selected_monitor(self):
         """把目标/活动窗口一次移动到下拉框选中的显示器。"""
@@ -965,32 +994,68 @@ class App:
     def _on_quad_grid_resize(self, _event=None):
         """格子是固定像素网格，尺寸变化不影响布局，只需重画内容。"""
         self._refresh_quad_grid()
+
+    # ---------- 跨屏铺满 ----------
+    def _spread_indices(self):
+        """返回勾选的屏下标（按界面顺序）。"""
+        out = []
+        for i, var in getattr(self, "_spread_checks", []):
+            try:
+                if var.get():
+                    out.append(i)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def _on_spread_check(self):
+        """勾选/取消某块屏后即时提示当前选了哪些屏。"""
+        idx = self._spread_indices()
+        if not idx:
+            self.status_var.set("未选择任何屏（至少勾一块才能铺）")
+        else:
+            self.status_var.set(
+                "已选 %d 块屏: %s" % (
+                    len(idx),
+                    "、".join(self._monitor_short_name(self.monitors[i])
+                              for i in idx)))
+
+    def _monitor_short_name(self, m):
+        """屏的短名，用于状态栏（避免长设备名把状态栏挤爆）。"""
+        name = (self._monitor_display_name(m) or "").strip()
+        return name or f"{m.width}x{m.height}"
     def _fill_all_monitors(self):
-        """把最前面的若干窗口分别铺满各自的屏（一个窗口一块屏）。
-        窗口数不足屏幕数时有多少铺多少、多出来的屏不动——开着 3 个应用
-        却有 4 块屏是常见情况，不当作失败，状态栏如实说明铺了几块。
+        """把最前面的若干窗口依次铺到勾选的屏（一个窗口一块屏）。
+
+        窗口比勾选的屏少时有几屏铺几屏、多出来的屏不动——开着 2 个应用
+        却勾了 3 块屏是常见情况，不当作失败，状态栏如实说明铺了几块。
+        竖屏默认不勾，用户想往竖屏铺就自己勾上。
         """
         if self.topmost.get():
             try:
                 self.root.attributes("-topmost", False)
             except Exception:  # noqa: BLE001
                 pass
+        indices = self._spread_indices()
+        if not indices:
+            self.status_var.set("铺屏失败：请先勾选至少一块目标屏")
+            return
         mode = ("quad" if self.spread_mode_var.get() == "每屏左上角四分之一"
                 else "max")
         try:
-            done = b.fill_all_monitors(mode=mode)
+            done = b.fill_all_monitors(mode=mode, monitor_indices=indices)
         except Exception as e:  # noqa: BLE001
             self.status_var.set(f"逐屏铺满失败：{e}")
             return
         if not done:
-            self.status_var.set("逐屏铺满失败：没有可操作的窗口")
+            self.status_var.set("铺屏失败：没有可操作的窗口")
             return
-        total = len(self.monitors)
+        total = len(indices)
         if done < total:
             self.status_var.set(
-                f"已铺 {done} 屏：窗口不足 {total} 个，剩下的屏未动")
+                f"已铺 {done} 屏：窗口不足 {total} 个，勾选的屏还剩 %d 块未动"
+                % (total - done))
         else:
-            self.status_var.set(f"已逐屏铺满 {done} 块屏")
+            self.status_var.set(f"已铺满勾选的 {done} 块屏")
 
 
     def _toggle_topmost_action(self):

@@ -969,5 +969,80 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     return True
 
 
+def _is_portrait(mon):
+    """屏幕是否为竖屏（高大于宽）。"""
+    return mon.height > mon.width
+
+
+def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",
+                      monitor_indices=None):
+    """把若干窗口分别铺满各自的显示器，一个窗口一块屏（整数 HWND）。
+
+   典型场景是四屏环境：四个窗口各占一块屏。已有能力都是「单屏内」排布，
+   缺的是跨屏——要逐屏铺满得先跨屏移动再最大化，点好几次。
+
+    hwnds 为 None 时取最前面的 len(ms) 个窗口（首个优先用界面固定目标）。
+    窗口少于屏幕数时按窗口数铺，多于屏幕数时忽略多余窗口。
+
+    mode: "max" 铺满整块屏工作区；"quad" 每块屏左上角四分之一。
+
+    monitor_indices: 只铺这些下标的屏（按给定顺序）。None 时铺全部屏。
+    竖屏常不适合放全屏窗口（竖屏上的横屏应用会被压成一条），界面默认只勾横屏。
+    """
+    ms = monitors.enum_monitors()
+    if not ms:
+        return 0
+
+    if monitor_indices is not None:
+        keep = []
+        for i in monitor_indices:
+            if isinstance(i, int) and 0 <= i < len(ms) and i not in keep:
+                keep.append(i)
+        ms = [ms[i] for i in keep]
+        if not ms:
+            logger.warning("没有可铺的目标屏")
+            return 0
+
+    if hwnds is None:
+        cands = list_windows_front_to_back()
+        picked, seen = [], set()
+        first = _find_window(_pinned_target) if use_pinned and _pinned_target else None
+        if first is not None:
+            picked.append(first["hwnd"])
+            seen.add(first["hwnd"])
+        for w in cands:
+            if len(picked) >= len(ms):
+                break
+            if w["hwnd"] in seen:
+                continue
+            picked.append(w["hwnd"])
+            seen.add(w["hwnd"])
+        hwnds = picked
+
+    if not hwnds:
+        logger.warning("没有可用于跨屏铺满的窗口")
+        return 0
+
+    done = 0
+    for hwnd, mon in zip(list(hwnds), ms):
+        if not hwnd:
+            continue
+        try:
+            if mode == "quad":
+                wl, wt, ww, wh = mon.work_rect
+                _place_window(hwnd, wl, wt, ww // 2, wh // 2)
+            else:
+                _place_window(hwnd, mon.work_left, mon.work_top,
+                              mon.work_width, mon.work_height)
+            done += 1
+        except Exception:  # noqa: BLE001
+            logger.warning("跨屏铺满失败: hwnd=%s 屏=%s", hwnd, mon.device_name,
+                           exc_info=True)
+    logger.info("跨屏铺满完成(Windows): %d 个窗口 -> %d 块屏（mode=%s）",
+                done, len(ms), mode)
+    return done
+
+
+
 if __name__ == "__main__":
     print("当前显示器:", [m.device_name for m in monitors.enum_monitors()])

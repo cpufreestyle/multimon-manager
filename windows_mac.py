@@ -918,6 +918,90 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
     return True
 
 
+def _is_portrait(mon):
+    """屏幕是否为竖屏（高大于宽）。"""
+    return mon.height > mon.width
+
+
+def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",
+                      monitor_indices=None):
+    """把若干窗口分别铺满各自的显示器，一个窗口一块屏。
+
+    典型场景是四屏环境：四个窗口各占一块屏。已有能力都是「单屏内」排布
+    （并排 / 竖排 / 四宫格），缺的是跨屏——要逐屏铺满得先跨屏移动再最大化，
+    点好几次。
+
+    hwnds: 显式指定窗口列表；为 None 时取最前面的若干个（数量 = 屏幕数，
+    首个优先用界面固定的目标窗口）。窗口数少于屏幕数时按窗口数铺（多出来的屏
+    不动），多于屏幕数时忽略多余窗口，绝不超屏摆放。
+
+    mode: "max" 每块屏铺满整个工作区；"quad" 每块屏左上角四分之一。
+
+    monitor_indices: 只铺这些下标的屏（按给定顺序）。None 时铺全部屏。
+    竖屏常常不适合放全屏窗口（竖屏上的横屏应用会被压成一条），所以在界面上
+    默认只勾横屏，用户可自行增删。
+
+    窗口按枚举顺序与显示器一一对应（第 k 个窗口去第 k 块屏），这样「屏一 →
+    屏二 → 屏三」的次序与界面显示器列表一致，结果可预期。
+    """
+    ms = monitors.enum_monitors()
+    if not ms:
+        return 0
+
+    if monitor_indices is not None:
+        picked = []
+        for i in monitor_indices:
+            if isinstance(i, int) and 0 <= i < len(ms) and i not in picked:
+                picked.append(i)
+        ms = [ms[i] for i in picked]
+        if not ms:
+            logger.warning("没有可铺的目标屏")
+            return 0
+
+    if hwnds is None:
+        cands = [w for w in list_target_windows()
+                 if w["pid"] not in _OWN_PIDS and w["owner"]]
+        picked = []
+        seen = set()
+        # 界面固定的目标窗口优先放在第一位（只有它，多个固定目标没有意义）
+        first = _find_window(_pinned_target) if use_pinned and _pinned_target else None
+        if first is not None:
+            h = first.get("hwnd") or make_hwnd(first["owner"], first["name"] or "")
+            picked.append(h)
+            seen.add(h)
+        for w in cands:
+            if len(picked) >= len(ms):
+                break
+            h = w.get("hwnd") or make_hwnd(w["owner"], w["name"] or "")
+            if h in seen:
+                continue
+            picked.append(h)
+            seen.add(h)
+        hwnds = picked
+
+    if not hwnds:
+        logger.warning("没有可用于跨屏铺满的窗口")
+        return 0
+
+    done = 0
+    for hwnd, mon in zip(list(hwnds), ms):
+        if not hwnd:
+            continue
+        try:
+            if mode == "quad":
+                wl, wt, ww, wh = mon.work_rect
+                set_window_rect(hwnd, wl, wt, ww // 2, wh // 2, activate=False)
+            else:
+                set_window_rect(hwnd, mon.work_left, mon.work_top,
+                                mon.work_width, mon.work_height, activate=False)
+            done += 1
+        except Exception:  # noqa: BLE001
+            logger.warning("跨屏铺满失败: hwnd=%s 屏=%s", hwnd, mon.device_name,
+                           exc_info=True)
+    logger.info("跨屏铺满完成: %d 个窗口 -> %d 块屏（mode=%s）",
+                done, len(ms), mode)
+    return done
+
 def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
                    use_pinned=True, monitor=None):
     """把四个窗口排到同一屏的 2×2 四宫格（左上/右上/左下/右下）。

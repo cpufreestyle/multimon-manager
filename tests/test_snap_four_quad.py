@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""snap_four_quad（2×2 四宫格排列）单测：mock 窗口与显示器，不碰真机。
+"""窗口排布单测：snap_four_quad（2×2 四宫格）与 fill_all_monitors（跨屏铺满）。
 
 横屏四宫格就是上下左右四等分：屏幕工作区按宽/高各切一半，四个矩形无缝拼满
 （宽高为奇数时，右列/下排用减法补齐，避免出现 1px 缝隙）。这与单窗的
 quad-tl/tr/bl/br 吸附是同一套几何，区别是一次摆四个窗口。
+
+跨屏铺满是另一个形状的问题：若干窗口分别铺满各自的屏，且要能只铺勾选的屏
+（竖屏上的横屏应用会被压扁，默认不该往竖屏铺）。
 
 只覆盖 windows_mac（本仓库现有单测的既有前提）：windows.py 依赖
 ctypes.windll，在 macOS 上无法导入。
@@ -26,6 +29,9 @@ class _Mon:
         self.device_name = name
         self.device_path = name
         self.work_rect = (left, top, width, height)
+        # 真实 MonitorInfo 还有这四个扁平字段，fill_all_monitors 的 max 模式用
+        self.work_left, self.work_top = left, top
+        self.work_width, self.work_height = width, height
 
 
 def _win(hwnd, x=0, y=0, w=100, h=100):
@@ -168,6 +174,106 @@ class TestSnapFourQuad(unittest.TestCase):
         self.assertLessEqual(placed[2][2], max(wt + 1, (wt + wh) - 1))
         self.assertGreaterEqual(placed[2][2], wt + 1)
         self.assertGreaterEqual(placed[2][3], 1)
+
+
+def _run_fill(wins, mons, **kw):
+    """同 _run，但跑 fill_all_monitors，返回 (done, placed)。"""
+    placed = []
+    prev = {}
+    for attr in ("list_target_windows", "monitors", "_find_window",
+                 "get_window_rect", "set_window_rect", "push_undo"):
+        prev[attr] = getattr(wm, attr)
+
+    class _Mons:
+        def enum_monitors(self):
+            return mons
+
+    wm.monitors = _Mons()
+    wm.list_target_windows = lambda: wins
+    wm._find_window = lambda hwnd: next(
+        (w for w in wins if w["hwnd"] == hwnd), None)
+    wm.get_window_rect = lambda hwnd, *a, **k: (0, 0, 0, 0)
+    wm.push_undo = lambda *a, **k: None
+
+    def _place(hwnd, x, y, w, h, activate=True):
+        placed.append((hwnd, x, y, w, h))
+        return True
+
+    wm.set_window_rect = _place
+    try:
+        done = wm.fill_all_monitors(**kw)
+    finally:
+        for k, v in prev.items():
+            setattr(wm, k, v)
+    return done, placed
+
+
+class TestFillAllMonitors(unittest.TestCase):
+    """跨屏铺满：窗口与屏一一对应，且能只铺勾选的屏。"""
+
+    WINS = [_win("A::1"), _win("B::1"), _win("C::1"), _win("D::1")]
+    # 三屏：横、横、竖（用户的 DELL U2414H 就是 1080x1920）
+    MONS = [_Mon(width=1512, height=982),
+            _Mon(left=1512, width=1600, height=900, name="M2"),
+            _Mon(left=3112, width=1080, height=1920, name="竖屏")]
+
+    def test_default_spreads_to_all_screens(self):
+        done, placed = _run_fill(list(self.WINS), list(self.MONS))
+        self.assertEqual(done, 3)
+        self.assertEqual([p[0] for p in placed], ["A::1", "B::1", "C::1"])
+        # 每块屏用自己的工作区尺寸，左上角对齐
+        self.assertEqual(placed[0], ("A::1", 0, 0, 1512, 982))
+        self.assertEqual(placed[1], ("B::1", 1512, 0, 1600, 900))
+        self.assertEqual(placed[2], ("C::1", 3112, 0, 1080, 1920))
+
+    def test_portrait_excluded_by_indices(self):
+        """只勾横屏时，竖屏不该被铺到。"""
+        done, placed = _run_fill(list(self.WINS), list(self.MONS),
+                                 monitor_indices=[0, 1])
+        self.assertEqual(done, 2)
+        self.assertEqual([p[0] for p in placed], ["A::1", "B::1"])
+        # 没有一个窗口落在竖屏工作区（宽不会等于 1080 那条）
+        self.assertNotIn(1080, {p[3] for p in placed})
+
+    def test_portrait_only_when_selected(self):
+        """显式只勾竖屏时，窗口才铺到竖屏。"""
+        done, placed = _run_fill(list(self.WINS), list(self.MONS),
+                                 monitor_indices=[2])
+        self.assertEqual(done, 1)
+        self.assertEqual(placed[0], ("A::1", 3112, 0, 1080, 1920))
+
+    def test_order_follows_selection(self):
+        """勾选顺序即铺屏顺序，与界面一一对应。"""
+        done, placed = _run_fill(list(self.WINS), list(self.MONS),
+                                 monitor_indices=[1, 0])
+        self.assertEqual(done, 2)
+        self.assertEqual(placed[0], ("A::1", 1512, 0, 1600, 900))
+        self.assertEqual(placed[1], ("B::1", 0, 0, 1512, 982))
+
+    def test_quad_mode_fills_top_left_quarter(self):
+        done, placed = _run_fill(list(self.WINS), list(self.MONS),
+                                 mode="quad")
+        self.assertEqual(placed[0], ("A::1", 0, 0, 1512 // 2, 982 // 2))
+
+    def test_fewer_windows_than_screens(self):
+        """窗口比屏少时只铺已有的，done 反映实际铺了几屏。"""
+        done, placed = _run_fill(list(self.WINS)[:2], list(self.MONS))
+        self.assertEqual(done, 2)
+        self.assertEqual(len(placed), 2)
+
+    def test_invalid_indices_are_dropped(self):
+        """越界/重复/非整数下标都应被忽略，不落到错误的屏上。"""
+        done, placed = _run_fill(list(self.WINS), list(self.MONS),
+                                 monitor_indices=[0, 99, 0, "x", -1])
+        self.assertEqual(done, 1)
+        self.assertEqual(placed[0], ("A::1", 0, 0, 1512, 982))
+
+    def test_empty_indices_spreads_nothing(self):
+        """一个屏都没勾时什么都不铺，也不报错。"""
+        done, placed = _run_fill(list(self.WINS), list(self.MONS),
+                                 monitor_indices=[])
+        self.assertEqual(done, 0)
+        self.assertEqual(placed, [])
 
 
 if __name__ == "__main__":
