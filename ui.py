@@ -962,6 +962,21 @@ class App:
                                 + (f"（{mon_label}）" if mon_idx is not None else "")
                                 + f" 左{self._quad_split_x.get():.0%}/"
                                 f"上{self._quad_split_y.get():.0%}")
+            # 逐格实测 vs 目标：App 有最小窗口尺寸时某一格缩不到目标值，
+            # 呈现为「不准」，但那是应用侧钳制、不是坐标算错。如实报出来。
+            clamped = []
+            for hwnd, want, got in getattr(b.windows_mac, "_last_quad_report",
+                                           []) or []:
+                if got is None:
+                    clamped.append("读不到")
+                    continue
+                dev = max(abs(g - t) for g, t in zip(got, want))
+                if dev > 8:
+                    who = (hwnd or "").split("::")[0]
+                    clamped.append(f"{who}差{dev}px")
+            if clamped:
+                self.status_var.set("已 2×2 排列，但这些格子被应用最小尺寸"
+                                    "钳制：" + "、".join(clamped[:4]))
         else:
             self.status_var.set("四宫格失败：需要至少四个可操作窗口")
 

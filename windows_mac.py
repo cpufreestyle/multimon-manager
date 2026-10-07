@@ -533,6 +533,64 @@ def _ax_window_selector(hwnd):
     return f"window {seq}"
 
 
+def _ax_window_by_geometry(app, rect):
+    """按几何在 AX 窗口列表里找出对应的 window N 选择子。
+
+    CG 的窗口枚举（list_windows_front_to_back）与 AppleScript 的 AX 窗口
+    顺序**不一定一致**：QClaw 有两个 AX 窗口，window 1 是 430x40 的悬浮小条、
+    window 2 才是 1200x800 的主窗口，而 CG 只列出主窗口。此时 hwnd 不带 #n
+    （CG 侧只有一个同名窗口），_ax_window_selector 退化成 "window 1"，
+    结果把几何写到小条上、读回的却是主窗口——表现为「这个窗口完全推不动」。
+
+    做法：枚举该应用所有 AX 窗口的位置/尺寸，取与目标矩形最接近的那个，
+    返回 "window N"。找不到时返回 None，让调用方回退到按序号。
+    """
+    if not rect or rect == (0, 0, 0, 0):
+        return None
+    tx, ty, tw, th = rect
+    script = (
+        'tell application "System Events"\n'
+        f'  tell process "{app}"\n'
+        '    set out to ""\n'
+        '    repeat with w in windows\n'
+        '      set p to position of w\n'
+        '      set s to size of w\n'
+        '      set out to out & (item 1 of p as text) & "," & '
+        '(item 2 of p as text) & "," & (item 1 of s as text) & "," & '
+        '(item 2 of s as text) & ";"\n'
+        '    end repeat\n'
+        '  end tell\n'
+        'end tell\n'
+        'return out'
+    )
+    raw = _osa(script)
+    if not raw:
+        return None
+    best, best_dev = None, None
+    for i, item in enumerate(raw.split(";"), 1):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(",")
+        if len(parts) != 4:
+            continue
+        try:
+            nums = [abs(int(float(v))) for v in parts]
+        except ValueError:  # noqa: BLE001
+            continue
+        dev = (abs(nums[0] - tx) + abs(nums[1] - ty)
+               + abs(nums[2] - tw) + abs(nums[3] - th))
+        if best_dev is None or dev < best_dev:
+            best, best_dev = i, dev
+    if best is None:
+        return None
+    # 偏差过大（超过 64px 总和）说明几何已变（窗口被移动过），匹配不可信
+    if best_dev > 64:
+        logger.info("AX 几何匹配偏差过大 (%d)，回退按序号选择", best_dev)
+        return None
+    return f"window {best}"
+
+
 def _wait_rect_stable(hwnd, timeout=1.5, interval=0.08, need=3):
     """等窗口几何稳定后再读回；始终不稳时返回最后一次读数。
 
@@ -593,7 +651,10 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
         except Exception:  # noqa: BLE001
             pass
     app, _name, _seq = parse_hwnd(hwnd)
-    win_sel = _ax_window_selector(hwnd)
+    # 优先按几何在 AX 窗口列表里定位：CG 枚举顺序与 AX 顺序未必一致，
+    # 只按 hwnd 序号选窗口会把几何写到别的窗口上（见 _ax_window_by_geometry）
+    known = _last_rect.get(hwnd)
+    win_sel = _ax_window_by_geometry(app, known) or _ax_window_selector(hwnd)
     # 原始目标（content 坐标），闭环全程以此为基准，偏差按「实测 - 原始目标」累计
     tx, ty, tw, th = (int(round(v)) for v in (x, y, w, h))
     # 幂等重设次数上限：下半屏约 3 次命中；整屏高度类（变化量最大）需更多次才触顶
@@ -923,6 +984,11 @@ def _is_portrait(mon):
     return mon.height > mon.width
 
 
+# 最近一次四宫格排列的实测报告：[(hwnd, 目标矩形, 实测矩形或None), ...]
+# 供界面说明「哪些格子被应用的最小窗口尺寸钳制了」
+_last_quad_report = []
+
+
 def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",
                       monitor_indices=None):
     """把若干窗口分别铺满各自的显示器，一个窗口一块屏。
@@ -1044,6 +1110,9 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
             logger.warning("可用窗口不足四个，无法四宫格排列")
             return False
         h = w.get("hwnd") or make_hwnd(w["owner"], w["name"] or "")
+        # 登记 CG 侧几何：set_window_rect 靠它在 AX 窗口列表里认出这个窗口
+        # （CG 枚举序与 AX 序不一致时，纯按序号会选到别的窗口）
+        _last_rect[h] = (w["x"], w["y"], w["w"], w["h"])
         picked.append((h, w))
         seen.add(h)
 
@@ -1092,9 +1161,29 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     set_window_rect(picked[3][0], wl + half_w, bot_y, ww - half_w, bot_h,
                     activate=False)
     logger.info("四宫格排列完成: 左上=%s 右上=%s 左下=%s 右下=%s（屏幕 %s，"
-                 "横向 %.0f%% / 竖向 %.0f%%）",
-                 picked[0][0], picked[1][0], picked[2][0], picked[3][0],
+                "横向 %.0f%% / 竖向 %.0f%%）",
+                picked[0][0], picked[1][0], picked[2][0], picked[3][0],
                 mon.device_name, sx * 100, sy * 100)
+    # 逐个读回报「实测 vs 目标」偏差：App 的最小窗口尺寸（Electron 类常见）
+    # 会让某一格缩不到目标值，呈现为「不准」。这不是坐标算错，把偏差写进
+    # 日志和返回值，界面才能如实说明「哪些格子被应用钳制了」。
+    report = []
+    boxes = [(wl, wt, half_w, row_h),
+             (right_x, wt, right_w, row_h),
+             (wl, bot_y, half_w, bot_h),
+             (right_x, bot_y, right_w, bot_h)]
+    for (h, _w), want in zip(picked, boxes):
+        got = get_window_rect(h)
+        if not got or got == (0, 0, 0, 0):
+            report.append((h, want, None))
+            continue
+        dev = max(abs(g - t) for g, t in zip(got, want))
+        report.append((h, want, got))
+        if dev > 8:
+            logger.info("四宫格偏差 %s：目标=%s 实测=%s（最大偏差 %d px，"
+                        "可能被应用的最小窗口尺寸钳制）", h, want, got, dev)
+    global _last_quad_report
+    _last_quad_report = report
     return True
 
 
