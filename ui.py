@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import threading
+import re
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
@@ -34,6 +35,9 @@ VK_DOWN = b.VK_DOWN
 
 # 目标窗口下拉框的"自动"选项：由程序判断最前面的非本程序窗口
 AUTO_TARGET = "自动（上次活动窗口）"
+# 后端给同名窗口加的「#n 」序号前缀（如「#2 UU远程」）。四宫格短标签重新
+# 编号前先剥掉它，避免出现「#3 #2 UU远程」这种叠编号。
+_QUAD_SEQ_RE = re.compile(r"^#\d+\s*")
 # 并排/竖排显示器下拉框的"自动"选项：按窗口当前所在屏决定
 AUTO_MON = "自动（按窗口所在屏）"
 # 规则引擎（F5）：目标屏"不换屏"选项 + 位置预设（中文 → 内部键）
@@ -584,45 +588,41 @@ class App:
             "把「上」「中」「下」三个窗口竖向堆叠到同一屏，各占三分之一。"
             "同名窗口（如多个 UU远程）请在下拉框按 #序号 选不同窗口。")
 
-        # 四宫格 2×2：四个窗口一次排满一屏（左上/右上/左下/右下）
-        # 下拉、按钮、点格网格都排在同一行——原先网格单独占一行，整个窗口
-        # 要滚 3000px 才看得完，四宫格和跨屏铺满都落在首屏外。
+        # 四宫格 2×2：四个窗口一次排满一屏（左上/右上/左下/右下）。
+        # 分两行排：第 1 行 = 四个方位下拉 + 排列按钮 + 智能开关；
+        # 第 2 行 = 目标屏下拉 + 2×2 点格网格 + 操作提示。
+        #
+        # 原先四个下拉被塞进一个硬写 390px 宽的容器里（为了省行宽），而 Tk
+        # 的 packer 在容器装不下时**不会映射**后面的子控件——真机实测只有前
+        # 三个下拉可见可点，右下角那个 x=0 w=1 根本没被映射，用户永远选不到
+        # 第四个窗口；第 4 格于是由程序随便补一个「最靠前的未占用窗口」，
+        # 这正是「4 格模式只能选三个窗口」且「智能 / 非智能都不准」的主因。
+        # 改成按自然宽度分两行后，行宽实测 720px / 583px，都在 793px 可视宽内。
         quad = ttk.Frame(f)
         quad.pack(fill="x", padx=6, pady=(1, 1))
-        ttk.Label(quad, text="四格:").pack(side="left")
-        self.quad_mon_var = tk.StringVar(value=AUTO_MON)
-        self.quad_mon_cb = ttk.Combobox(quad, textvariable=self.quad_mon_var,
-                                        state="readonly", width=7)
-        self.quad_mon_cb.pack(side="left", padx=(4, 2))
-        self._tooltip(self.quad_mon_cb, "四宫格排到哪块屏。「自动」按左上窗口当前所在屏。")
+
+        quad_row = ttk.Frame(quad)
+        quad_row.pack(fill="x")
+        ttk.Label(quad_row, text="四格:").pack(side="left")
         self.quad_tl_var = tk.StringVar(value=AUTO_TARGET)
         self.quad_tr_var = tk.StringVar(value=AUTO_TARGET)
         self.quad_bl_var = tk.StringVar(value=AUTO_TARGET)
         self.quad_br_var = tk.StringVar(value=AUTO_TARGET)
         self.quad_smart_var = tk.BooleanVar(value=False)
-        # 四个下拉不重复写「左上/右上/左下/右下」文字标签：右侧 2×2 网格本身
-        # 就是方位图，格子与下拉按 TL/TR/BL/BR 同序对应，再把四个 label 省掉
-        # （整行原宽 884px，超出行宽工具条，四宫格选项会被挤出可视区）。
-        # tooltip 里说明对应关系，鼠标悬停即可看到。
-        # Tk 的 Combobox 在 values 变化后会按最长项重算请求宽度，构造时的
-        # width 形同虚设（实测四个各自涨到 139px，整行 954px 被画布裁掉）。
-        # 用一个禁止尺寸传播的固定宽 Frame 装起来：容器宽度写死，控件按
-        # 容器裁切，下拉列表本身仍能看完整项。
-        quad_picks = ttk.Frame(quad, width=390, height=28)
-        quad_picks.pack(side="left", padx=(6, 0))
-        quad_picks.pack_propagate(False)
-        for key, var, pos, tip in (
-            ("tl", self.quad_tl_var, "左上", "四宫格左上角的窗口。"),
-            ("tr", self.quad_tr_var, "右上", "四宫格右上角的窗口。"),
-            ("bl", self.quad_bl_var, "左下", "四宫格左下角的窗口。"),
-            ("br", self.quad_br_var, "右下", "四宫格右下角的窗口。"),
+        # 四个下拉不重复写「左上/右上/左下/右下」文字标签：下方 2×2 网格本身
+        # 就是方位图，格子与下拉按 TL/TR/BL/BR 同序对应（tooltip 里说明）。
+        for key, var, pos in (
+            ("tl", self.quad_tl_var, "左上"),
+            ("tr", self.quad_tr_var, "右上"),
+            ("bl", self.quad_bl_var, "左下"),
+            ("br", self.quad_br_var, "右下"),
         ):
-            cb = ttk.Combobox(quad_picks, textvariable=var, state="readonly",
+            cb = ttk.Combobox(quad_row, textvariable=var, state="readonly",
                               width=11)
             cb.pack(side="left", padx=(4, 0))
-            self._tooltip(cb, f"{pos}角的窗口。自动 = 取最前面的未占用窗口。")
+            self._tooltip(cb, f"四宫格{pos}角的窗口。自动 = 取最前面的未占用窗口。")
             setattr(self, "quad_%s_cb" % key, cb)
-        quad_btn = ttk.Button(quad, text="2×2 排列",
+        quad_btn = ttk.Button(quad_row, text="2×2 排列",
                               command=self._snap_four_quad)
         quad_btn.pack(side="left", padx=(6, 0))
         self._tooltip(
@@ -633,7 +633,7 @@ class App:
         # 判据是各窗口的宽高比——把窗口放进宽高比最接近的格子，反之会被
         # App 的最小尺寸钳制（真机 ChatGPT 请求高 448 实测 600）。
         smart_cb = ttk.Checkbutton(
-            quad, text="智能", variable=self.quad_smart_var,
+            quad_row, text="智能", variable=self.quad_smart_var,
             command=self._on_quad_smart_toggle)
         smart_cb.pack(side="left", padx=(6, 0))
         self._tooltip(
@@ -642,13 +642,28 @@ class App:
             "决定谁去哪个角、左右上下怎么切，让每格都贴合窗口。"
             "下拉此时只表示「参与排列的四个窗口」。")
 
-        # 四宫格可视化：把「左上/右上/左下/右下」四个下拉对应到一块 2×2 网格，
+        # 第 2 行：目标屏 + 四宫格可视化。
+        quad_row2 = ttk.Frame(quad)
+        quad_row2.pack(fill="x", pady=(1, 0))
+        ttk.Label(quad_row2, text="屏:").pack(side="left")
+        self.quad_mon_var = tk.StringVar(value=AUTO_MON)
+        self.quad_mon_cb = ttk.Combobox(quad_row2,
+                                        textvariable=self.quad_mon_var,
+                                        state="readonly", width=13)
+        self.quad_mon_cb.pack(side="left", padx=(4, 2))
+        self._tooltip(self.quad_mon_cb,
+                      "四宫格排到哪块屏。「自动」按左上窗口当前所在屏。")
+
+        # 把「左上/右上/左下/右下」四个下拉对应到一块 2×2 网格，
         # 点格子直接填/清空那一格，不用记住下拉框和方位的对应关系。
         # 两条分割线可拖拽改比例——四等分并不总是合适（左栏放终端想窄一点、
         # 右栏放浏览器想宽一点），拖动时实时重画，比例随「2×2 排列」一起生效。
         self.quad_grid_canvas = tk.Canvas(
-            quad, width=self._quad_grid_w, height=self._quad_grid_h, bg="#fafafa",
-            relief="sunken", borderwidth=1, highlightthickness=0)
+            quad_row2, width=self._quad_grid_w, height=self._quad_grid_h,
+            bg="#fafafa", relief="sunken", borderwidth=1, highlightthickness=0)
+        # 必须 pack：画布只 create_* 而不 pack 就永远不显示，网格、点格、
+        # 分割线全都看不见（这正是「新功能没有渲染出来」的原因）。
+        self.quad_grid_canvas.pack(side="left", padx=(4, 4))
         self._quad_split_x = tk.DoubleVar(value=0.5)
         self._quad_split_y = tk.DoubleVar(value=0.5)
         self._quad_drag = None
@@ -685,6 +700,13 @@ class App:
         self._tooltip(self.quad_grid_canvas,
                       "点格子 = 把最靠前的未占用窗口放进该方位，"
                       "再点一次 = 清空该方位（与左侧下拉框联动）。")
+        _quad_hint = ttk.Label(
+            quad_row2,
+            text="点格=填/清空 · 拖分割线=改比例",
+            font=("Helvetica", 8))
+        _quad_hint.pack(side="left")
+        self._tooltip(_quad_hint, "拖两条分割线可改左右/上下比例，"
+                      "四等分不总是合适——比例随「2×2 排列」一起生效。")
 
         # 跨屏铺满：若干窗口分别铺满各自勾选的屏（一个窗口一块屏）
         # 容器无条件建：__init__ 里 self.monitors 还是空的，屏数在之后的
@@ -733,23 +755,9 @@ class App:
         # 在界面里看不见的直接原因）。压缩成「#1 应用名」后宽度可控，
         # 也与网格里显示的文字一致。
         short = [AUTO_TARGET]
-        short_map = {AUTO_TARGET: None}
-        for w in wins:
-            lb = w["label"]
-            if lb not in self._target_map:
-                continue
-            s = self._short_label(lb)
-            if s in short_map:
-                continue
-            short_map[s] = self._target_map[lb]
-            short.append(s)
-        self._quad_short_map = short_map
-        # 反向表：完整标签 -> 短标签（保存/切换选择时用）
-        self._quad_short_rev = {}
-        for w in wins:
-            lb = w["label"]
-            if lb in self._target_map:
-                self._quad_short_rev[lb] = self._short_label(lb)
+        known = [w for w in wins if w["label"] in self._target_map]
+        short, self._quad_short_map, self._quad_hwnd_short, \
+            self._quad_short_rev = self.build_quad_short_labels(known)
         # 并排窗口下拉与目标窗口共用同一份列表（含"自动"）
         if hasattr(self, "sbs_left_cb"):
             for cb, var in ((self.sbs_left_cb, self.sbs_left_var),
@@ -762,6 +770,7 @@ class App:
                 if var.get() and var.get() not in self._target_map:
                     var.set(AUTO_TARGET)
         if hasattr(self, "quad_tl_cb"):
+            short_map = self._quad_short_map
             for cb, var in ((self.quad_tl_cb, self.quad_tl_var),
                             (self.quad_tr_cb, self.quad_tr_var),
                             (self.quad_bl_cb, self.quad_bl_var),
@@ -970,25 +979,39 @@ class App:
                             split_x=self._quad_split_x.get(),
                             split_y=self._quad_split_y.get(),
                             smart=smart):
-            # 摆完清空四方格，下次点格子重新取材（避免旧窗口名误导）
-            for v in quad_vars:
-                v.set(AUTO_TARGET)
-            # 智能模式下程序自己定了比例，把它同步回分割线，
+            bm = self._quad_backend_mod()
+            # 比例同步：智能模式下程序自己定了比例，把它同步回分割线，
             # 网格显示才与实际排出来的一致
-            if smart:
-                bm = self._quad_backend_mod()
-                sx2, sy2 = getattr(bm, "_last_quad_splits", (None, None))
-                if sx2 is not None:
-                    self._quad_split_x.set(sx2)
-                    self._quad_split_y.set(sy2)
-                    self._refresh_quad_grid()
-            self.status_var.set("已 2×2 四宫格排列"
-                                + (f"（{mon_label}）" if mon_idx is not None else "")
-                                + f" 左{self._quad_split_x.get():.0%}/"
-                                f"上{self._quad_split_y.get():.0%}")
+            sx2, sy2 = getattr(bm, "_last_quad_splits", (None, None))
+            if sx2 is not None:
+                self._quad_split_x.set(sx2)
+                self._quad_split_y.set(sy2)
+            # 把**实际分配**写回四个下拉/网格。智能模式会按窗口宽高比重排
+            # 四个角的归属，若界面仍显示用户排的顺序，看到的就是「不准」；
+            # 写回实测归属后，下次再点「2×2 排列」也是确定性的同一结果，
+            # 不会再由程序随机补一个「最靠前的未占用窗口」。
+            order = getattr(bm, "_last_quad_order", None) or []
+            rev = getattr(self, "_quad_hwnd_short", {})
+            names = []
+            if len(order) == 4 and all(order):
+                for h in order:
+                    nm = rev.get(h)
+                    names.append(nm if nm in short_map else AUTO_TARGET)
+                for v, nm in zip(quad_vars, names):
+                    v.set(nm)
+            self._refresh_quad_grid()
+            assigned = "、".join(f"{k}={v}" for k, v in
+                              zip(("左上", "右上", "左下", "右下"), names)
+                              if v and v != AUTO_TARGET)
+            head = "已 2×2 四宫格排列"
+            if mon_idx is not None:
+                head += f"（{mon_label}）"
+            head += (f" 左{self._quad_split_x.get():.0%}/"
+                     f"上{self._quad_split_y.get():.0%}")
+            if assigned:
+                head += " · " + assigned
             # 逐格实测 vs 目标：App 有最小窗口尺寸时某一格缩不到目标值，
             # 呈现为「不准」，但那是应用侧钳制、不是坐标算错。如实报出来。
-            bm = self._quad_backend_mod()
             clamped = []
             for hwnd, want, got in (getattr(bm, "_last_quad_report", None)
                                     or []):
@@ -997,18 +1020,22 @@ class App:
                     continue
                 dev = max(abs(g - t) for g, t in zip(got, want))
                 if dev > 8:
-                    who = (hwnd or "").split("::")[0]
-                    clamped.append(f"{who}差{dev}px")
+                    app = (hwnd or "").split("::")[0]
+                    clamped.append(f"{app}差{dev}px")
             if clamped:
-                self.status_var.set("已 2×2 排列，但这些格子被应用最小尺寸"
-                                    "钳制：" + "、".join(clamped[:4]))
+                self.status_var.set(head + " ｜ 这些格子被应用最小尺寸钳制："
+                                    + "、".join(clamped[:4]))
+            else:
+                self.status_var.set(head)
         else:
             self.status_var.set("四宫格失败：需要至少四个可操作窗口")
 
     # ---------- 四宫格可视化 ----------
     _QUAD_KEYS = ("TL", "TR", "BL", "BR")
-    _quad_grid_w = 118          # 网格画布宽度（见下方创建处）
-    _quad_grid_h = 88
+    # 网格画布尺寸：2×2 网格要能放得下短标签（每格约 95×50，够放
+    # 「Chrome」「CodeBuddy」这类 11 字内的短名），也留出拖分割线的余量。
+    _quad_grid_w = 200
+    _quad_grid_h = 104
 
     @staticmethod
     def _quad_backend_mod():
@@ -1108,12 +1135,24 @@ class App:
                          text=f"已填 {n}/4 · {sx:.0%}/{sy:.0%}")
 
     # ---------- 四宫格分割线拖拽 ----------
+    def _quad_canvas_size(self):
+        """网格画布的实际可用尺寸。
+
+        命中判断与拖拽必须按实际尺寸算：画布尺寸一变（改常量、拉伸窗口）
+        还拿旧常量比对，分割线就会与鼠标位置错开，既点不中也拖不动。
+        还没布局完时退回请求尺寸。
+        """
+        cv = self.quad_grid_canvas
+        cw, ch = cv.winfo_width(), cv.winfo_height()
+        if cw < 4 or ch < 4:
+            cw, ch = self._quad_grid_w, self._quad_grid_h
+        return cw, ch
+
     def _quad_hit_which(self, event):
         """判断鼠标落在哪条分割线的命中区里；不在命中区返回 None。"""
-        cv = self.quad_grid_canvas
         sx = min(max(self._quad_split_x.get(), 0.15), 0.85)
         sy = min(max(self._quad_split_y.get(), 0.15), 0.85)
-        cw, ch = self._quad_grid_w, self._quad_grid_h
+        cw, ch = self._quad_canvas_size()
         top = 10
         col_x = int(round(cw * sx))
         row_y = top + int(round((ch - top) * sy))
@@ -1141,7 +1180,7 @@ class App:
         """拖动：按鼠标位置更新比例并重画（实时预览）。"""
         if self._quad_drag is None:
             return
-        cw, ch = self._quad_grid_w, self._quad_grid_h
+        cw, ch = self._quad_canvas_size()
         top = 10
         x = min(max(event.x, int(cw * 0.15)), int(cw * 0.85))
         y = min(max(event.y, top + int((ch - top) * 0.15)),
@@ -1197,6 +1236,60 @@ class App:
             s = s.split("—", 1)[0].strip() or s
         s = s.replace("::", " ").strip() or s
         return s if len(s) <= 11 else s[:10] + "…"
+
+    @classmethod
+    def build_quad_short_labels(cls, wins):
+        """把窗口列表压成四宫格下拉/网格用的短标签。
+
+        返回 (values, short_map, hwnd_short, short_rev)：
+        - values:     下拉框候选（首个是「自动」），每个窗口都有唯一一项
+        - short_map:  短标签 -> hwnd，按钮据此把选择换回窗口
+        - hwnd_short: hwnd -> 短标签，排列完成后把实际分配写回界面用
+        - short_rev:  完整标签 -> 短标签，别处写入完整标签时归一用
+
+        压缩后会同名撞车：一个应用开多个窗口（两个 Chrome）时短标签都是
+        「Chrome」，四个下拉可选项只剩一个，用户没法把不同窗口放进不同角，
+        选了还会被「不能重复选择」挡住——这正是四宫格「只能选三个」之外的
+        另一半症状。撞车时按出现顺序补 #n 后缀，保证每项唯一。
+        """
+        items = []
+        for w in wins:
+            lb = w.get("label")
+            hwnd = w.get("hwnd")
+            if not lb or not hwnd:
+                continue
+            base = cls._short_label(lb)
+            # 后端已给同名窗口加过序号（「#1 UU远程」）。剥掉序号再统计，
+            # 否则「#2 #1 UU远程」这种叠编号会一路套下去。
+            core = _QUAD_SEQ_RE.sub("", base)
+            items.append((lb, hwnd, base, core))
+        # 撞车的（同一应用多窗口）统一重编号：不带序号的会变成「#1 名字」，
+        # 与「#2 名字」配对，读起来一致，也不会出现孤零零的 #2。
+        total = {}
+        for _lb, _h, _b, core in items:
+            total[core] = total.get(core, 0) + 1
+        values = [AUTO_TARGET]
+        short_map = {AUTO_TARGET: None}
+        hwnd_short = {}
+        short_rev = {}
+        seen_n = {}
+        for lb, hwnd, base, core in items:
+            if total[core] > 1:
+                seen_n[core] = seen_n.get(core, 0) + 1
+                s = f"#{seen_n[core]} {core}"
+            else:
+                s = base
+            if s in short_map:      # 兜底：理论上不会撞，真撞了往后顺延
+                n = seen_n.get(core, 0)
+                while s in short_map:
+                    n += 1
+                    s = f"#{n} {core}"
+                seen_n[core] = n
+            short_map[s] = hwnd
+            hwnd_short[hwnd] = s
+            short_rev[lb] = s
+            values.append(s)
+        return values, short_map, hwnd_short, short_rev
 
     def _on_quad_grid_resize(self, _event=None):
         """格子是固定像素网格，尺寸变化不影响布局，只需重画内容。"""

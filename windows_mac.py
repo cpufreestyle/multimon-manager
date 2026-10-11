@@ -1043,6 +1043,12 @@ _last_quad_report = []
 _last_quad_splits = (0.5, 0.5)
 
 
+# 最近一次四宫格的实际分配顺序 [左上, 右上, 左下, 右下]（hwnd）。
+# 智能模式会按窗口宽高比重排四个角，界面必须回报「谁最终去了哪个角」，
+# 否则用户看到的下拉顺序与实际摆放不一致，就是「不准」。
+_last_quad_order = [None, None, None, None]
+
+
 def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",
                       monitor_indices=None):
     """把若干窗口分别铺满各自的显示器，一个窗口一块屏。
@@ -1245,8 +1251,16 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     bot_y = min(max(bot_y, wt + 1), max(wt + 1, (wt + wh) - 1))
     bot_h = max(1, (wt + wh) - bot_y)
     set_window_rect(picked[2][0], wl, bot_y, half_w, bot_h, activate=False)
-    set_window_rect(picked[3][0], wl + half_w, bot_y, ww - half_w, bot_h,
-                    activate=False)
+    # 下排左格同样可能被 App 的最小宽度撑宽（与上排左格同源）。若右下格仍按
+    # 理想 half_w 起排，两格会互相压盖——用户看到的就是「右下窗口叠在左下上」。
+    # 读回实测宽度，按实测右边界定右下格起点，宽度用减法补齐，避免留缝。
+    bl_rect = get_window_rect(picked[2][0])
+    br_x = wl + half_w
+    if bl_rect and bl_rect != (0, 0, 0, 0) and bl_rect[2] > 0:
+        br_x = max(br_x, bl_rect[0] + bl_rect[2] + 1)
+    br_x = min(max(br_x, wl + 1), max(wl + 1, (wl + ww) - 1))
+    br_w = max(1, (wl + ww) - br_x)
+    set_window_rect(picked[3][0], br_x, bot_y, br_w, bot_h, activate=False)
     logger.info("四宫格排列完成: 左上=%s 右上=%s 左下=%s 右下=%s（屏幕 %s，"
                 "横向 %.0f%% / 竖向 %.0f%%）",
                 picked[0][0], picked[1][0], picked[2][0], picked[3][0],
@@ -1258,7 +1272,7 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     boxes = [(wl, wt, half_w, row_h),
              (right_x, wt, right_w, row_h),
              (wl, bot_y, half_w, bot_h),
-             (right_x, bot_y, right_w, bot_h)]
+             (br_x, bot_y, br_w, bot_h)]
     for (h, _w), want in zip(picked, boxes):
         got = get_window_rect(h)
         if not got or got == (0, 0, 0, 0):
@@ -1271,6 +1285,8 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
                         "可能被应用的最小窗口尺寸钳制）", h, want, got, dev)
     global _last_quad_report
     _last_quad_report = report
+    global _last_quad_order
+    _last_quad_order = [h for h, _w in picked]
     return True
 
 

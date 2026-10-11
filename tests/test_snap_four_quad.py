@@ -189,6 +189,53 @@ class TestSnapFourQuad(unittest.TestCase):
         self.assertGreaterEqual(placed[2][2], wt + 1)
         self.assertGreaterEqual(placed[2][3], 1)
 
+    def test_bottom_right_avoids_clamped_bottom_left(self):
+        """下排左格被最小宽度撑宽时，右下格必须贴实测定界，两格不能压盖。
+
+        上排早就有这层保护，下排原先没有：左下写入后不管实测多宽，右下仍按
+        理想 half_w 起排，两格在水平方向重叠——用户看到的就是「右下窗口盖住
+        左下」。这里给左下返回一个比请求更宽的实测矩形，断言右下起点避开了它。
+        """
+        wl, ww = 0, 1920
+        half_w = ww // 2
+        bl_rect = (wl, 541, 1000, 539)     # 实测比请求的 960 宽出 40px
+        ok, placed = _run(list(self.WINS), [_Mon()], readback={"C::1": bl_rect})
+        self.assertTrue(ok)
+        last_d = [p for p in placed if p[0] == "D::1"][-1]
+        # 右下起点 = 左下实测右边界 + 1，不再与左格重叠
+        self.assertEqual(last_d[1], bl_rect[0] + bl_rect[2] + 1)
+        self.assertGreater(last_d[1], bl_rect[0] + bl_rect[2])
+        # 宽度用减法补齐，右边缘仍精确落在工作区右边，不留缝
+        self.assertEqual(last_d[1] + last_d[3], wl + ww)
+
+    def test_bottom_right_stays_inside_screen(self):
+        """左下实测宽到满屏（异常值）时，右下仍要留在屏内且有正宽度。"""
+        ok, placed = _run(list(self.WINS), [_Mon()],
+                          readback={"C::1": (0, 541, 99999, 539)})
+        self.assertTrue(ok)
+        last_d = [p for p in placed if p[0] == "D::1"][-1]
+        self.assertGreaterEqual(last_d[1], 1)
+        self.assertLess(last_d[1], 1920)
+        self.assertGreater(last_d[3], 0)
+        self.assertEqual(last_d[1] + last_d[3], 1920)
+
+    def test_reports_actual_assignment_order(self):
+        """排列完成后必须回报「谁实际去了哪个角」。
+
+        智能模式会按窗口宽高比重排四个角的归属；界面若继续显示用户排的
+        顺序，看到的就是「不准」。后端把实际顺序写进 _last_quad_order，
+        界面据此回写下拉与网格。
+        """
+        ok, placed = _run(list(self.WINS), [_Mon()],
+                          tl_hwnd="D::1", tr_hwnd="C::1",
+                          bl_hwnd="B::1", br_hwnd="A::1")
+        self.assertTrue(ok)
+        # 回报的顺序必须与实际写入的顺序逐一对应（不是用户传入的顺序）
+        self.assertEqual([p[0] for p in placed],
+                         ["D::1", "C::1", "B::1", "A::1"])
+        self.assertEqual(wm._last_quad_order,
+                         ["D::1", "C::1", "B::1", "A::1"])
+
     def test_right_column_follows_measured_left(self):
         """左列被最小宽度撑宽时，右列必须贴着实测左边界，不能重叠。"""
         wl, wt, ww, wh = 0, 0, 1920, 1080
