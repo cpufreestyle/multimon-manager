@@ -1040,11 +1040,16 @@ class App:
                 if dev > 8:
                     app = (hwnd or "").split("::")[0]
                     clamped.append(f"{app}差{dev}px")
+            # 后端如实记录的异常情况（屏装不下四个最小尺寸、某窗口被系统判给
+            # 了别的屏）。「四个窗口不在一个屏幕上」是根因级问题，必须报出来，
+            # 不能只靠「被最小尺寸钳制」这么说——那是现象不是原因。
+            notes = [n for n in (getattr(bm, "_last_quad_notes", None) or []) if n]
+            parts = [head]
+            if notes:
+                parts.append("｜ " + "；".join(notes[:2]))
             if clamped:
-                self.status_var.set(head + " ｜ 这些格子被应用最小尺寸钳制："
-                                    + "、".join(clamped[:4]))
-            else:
-                self.status_var.set(head)
+                parts.append("｜ 被应用最小尺寸钳制：" + "、".join(clamped[:4]))
+            self.status_var.set(" ".join(parts))
         else:
             self.status_var.set("四宫格失败：需要至少四个可操作窗口")
 

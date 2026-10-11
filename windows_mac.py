@@ -611,16 +611,18 @@ def _ax_window_by_name(app, name):
     want = (name or "").strip()
     if not want:
         return None
+    # 语句之间必须有换行符：AppleScript 不接受把多条语句拼在同一行（缺了 \n
+    # 时 osascript 一律报 -2741 语法错误，这条按窗口名兜底的分支等于死代码）
     script = (
-        'tell application "System Events"'
-        ' tell process "' + app + '"'
-        ' set out to ""'
-        ' repeat with w in windows'
-        ' set out to out & (name of w as text) & ";"'
-        ' end repeat'
-        ' end tell'
-        ' end tell'
-        ' return out'
+        'tell application "System Events"\n'
+        '  tell process "' + app + '"\n'
+        '    set out to ""\n'
+        '    repeat with w in windows\n'
+        '      set out to out & (name of w as text) & ";"\n'
+        '    end repeat\n'
+        '  end tell\n'
+        'end tell\n'
+        'return out'
     )
     raw = _osa(script)
     if not raw:
@@ -1049,6 +1051,11 @@ _last_quad_splits = (0.5, 0.5)
 _last_quad_order = [None, None, None, None]
 
 
+# 最近一次四宫格需要如实告知用户的情况（屏幕装不下四个最小尺寸、某窗口
+# 被系统判给了别的屏……）。界面读它在状态栏里提示，而不是只说「排列完成」。
+_last_quad_notes = []
+
+
 def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",
                       monitor_indices=None):
     """把若干窗口分别铺满各自的显示器，一个窗口一块屏。
@@ -1128,6 +1135,104 @@ def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",
                 done, len(ms), mode)
     return done
 
+# ── 四宫格：最小尺寸实测与几何 ─────────────────────────────────────────
+
+# 探测最小尺寸时请求的尺寸：宽高都明显小于常见 App 的下限，读回的就是下限
+_PROBE_W, _PROBE_H = 320, 120
+
+# 探测写入后等动画的时间（真机实测 0.3s 已稳定，留点余量）
+_probe_settle_secs = 0.45
+
+
+def _fresh_rect(hwnd):
+    """绕过 _last_rect 缓存读一次真实几何。
+
+    get_window_rect 命中缓存时直接返回缓存值，而缓存可能是写入过程中的旧值 /
+    动画中间帧。四宫格的闭环读回必须用实测值，否则读到的是自己刚写的目标值，
+    察觉不到「窗口被系统搬到了别的屏」。
+    """
+    _last_rect.pop(hwnd, None)
+    try:
+        got = get_window_rect(hwnd)
+    except Exception:  # noqa: BLE001
+        return (0, 0, 0, 0)
+    return got if got else (0, 0, 0, 0)
+
+
+def _probe_min_size(hwnd, at_x, at_y):
+    """实测一个窗口的最小可用尺寸：写一个小尺寸，读回被 App 钳制后的几何。
+
+    macOS 上查不到这个值——真机实测 ChatGPT / Qoder CN 等窗口根本没有
+    AXMinSize 属性，只能写小再读回。返回 (min_w, min_h)；读不到时返回 (0, 0)。
+
+    位置先挪到目标屏工作区左上角再缩小：App 的最小尺寸会把窗口撑回去，
+    贴着屏幕底边缩小时撑回去的那部分就出了屏，macOS 会把整个窗口判给别的屏
+    （真机实测 RV200 Pro 上 ChatGPT y=-200 被搬到主屏）——探测不能反过来把
+    窗口搬走。写完留下的几何无所谓，紧接着的正式排布会把它放进自己的格子。
+    """
+    app, name, _seq = parse_hwnd(hwnd)
+    sel = (_ax_window_by_geometry(app, _last_rect.get(hwnd), name)
+           or _ax_window_selector(hwnd) or "window 1")
+    script = (
+        'tell application "System Events"\n'
+        f'  tell process "{app}"\n'
+        f'    set position of {sel} to {{{int(at_x)}, {int(at_y)}}}\n'
+        f'    set size of {sel} to {{{_PROBE_W}, {_PROBE_H}}}\n'
+        '  end tell\n'
+        'end tell\n'
+    )
+    # 真机实测：同一个 App 用同一个小尺寸写入，读回值不稳定——有时是钳制后的
+    # 下限、有时是写入过程里的中间值（还带着旧的大尺寸）。所以探两次取逐维更小
+    # 的那个：写小读回大，说明这一轮还没落到位，取更小的那次才接近真实下限。
+    best = None
+    for _ in range(2):
+        _osa(script)
+        time.sleep(_probe_settle_secs)
+        got = _fresh_rect(hwnd)
+        if not got or got == (0, 0, 0, 0):
+            continue
+        cur = (got[2], got[3])
+        if cur[0] <= 0 or cur[1] <= 0:
+            continue
+        best = cur if best is None else (min(best[0], cur[0]),
+                                         min(best[1], cur[1]))
+    if best is None:
+        logger.warning("最小尺寸探测读不到几何: %s", hwnd)
+        return (0, 0)
+    return best
+
+
+def _pick_quad_screen(ms, cur_idx, corners):
+    """给四宫格挑一块放得下四格最小尺寸的屏；没有合适的就返回当前屏。
+
+    当前屏放得下就不换，避免窗口白跑一趟。要换时只在横屏里挑——竖屏上排四个
+    窗口并不好用（用户明确说过「不适合竖屏的窗口不要发到竖屏屏幕」）。
+    优先换到完全放得下的横屏；一块都放不下时，也要离开竖屏，退而选面积最大
+    的横屏——留一点重叠（允许上下重叠即可排下）也比把四个窗口挤在竖屏上好，
+    这正是用户报的场景：竖屏 DELL 上四宫格挤成一团。
+    """
+    need_w, need_h = quad_plan.quad_requirements(corners)
+    cur = ms[cur_idx]
+    cur_wl, _t, cur_ww, cur_wh = cur.work_rect
+    cur_fits = need_w <= cur_ww and need_h <= cur_wh
+    if cur_fits and cur.height <= cur.width:
+        return cur_idx
+    fits, landscape = [], []
+    for i, m in enumerate(ms):
+        if m.height > m.width:      # 竖屏：不主动送
+            continue
+        _ml, _mt, mw, mh = m.work_rect
+        landscape.append(i)
+        if need_w <= mw and need_h <= mh:
+            fits.append(i)
+    # 完全放得下的横屏优先；都放不下就退到面积最大的横屏（离开竖屏）。
+    # 横屏一块都没有（例如只有一块竖屏外接）才维持原地。
+    pool = fits or landscape
+    if not pool:
+        return cur_idx
+    return max(pool, key=lambda i: ms[i].work_rect[2] * ms[i].work_rect[3])
+
+
 def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
                    use_pinned=True, monitor=None, split_x=0.5, split_y=0.5,
                    smart=False):
@@ -1135,8 +1240,6 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
 
     与单窗的四等分吸附（snap 的 quad-*）配套：那四个按钮一次只动一个窗口，
     本函数一次摆四个窗口。
-
-    四宫格在横屏上就是上下左右四等分；竖屏不做特殊处理——两块窄竖格并不好用。
 
     split_x / split_y 给出分割比例（0~1，0.5 = 四等分）。等分并不总是最合适：
     左栏放终端想窄一点、右栏放浏览器想宽一点是常见需求，所以界面上做了可
@@ -1148,11 +1251,25 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
 
     四个 hwnd 均可显式指定；未指定时自动取最前面的四个窗口（左上优先用界面
     固定的目标窗口）。monitor 可指定目标显示器（int 索引或 device_name 字符串）；
-    为 None 时以左上窗口当前所在屏幕为准。
+    为 None 时以左上窗口当前所在屏幕为准，该屏放不下四格最小尺寸时自动换一块
+    放得下的横屏。
+
+    排布前先实测每个窗口的最小尺寸：App 的最小尺寸（真机 ChatGPT 高 600、
+    Qoder CN 540）会把窗口撑出我们给的格子，撑过屏幕底边后 macOS 会把整个
+    窗口判给别的屏——这就是「四个窗口排完不在一个屏幕上」的根因，不是坐标算错。
+    四格按「比例切分值」与「窗口最小尺寸」取大者，并钉在工作区内：上排贴顶、
+    下排贴底、左列贴左、右列贴右，最小尺寸把哪一格撑大就往外撑，绝不越界。
+    工作区实在装不下四个最小尺寸时，才允许上下 / 左右重叠，并在
+    _last_quad_notes 里如实说明（界面据此提示用户）。
     """
     ms = monitors.enum_monitors()
     if not ms:
         return False
+
+    # 上一轮的说明先清空：界面读 _last_quad_notes 做提示，留着旧值会把上次的
+    # 「装不下 / 被搬屏」报在这一次成功的排列上
+    global _last_quad_notes
+    _last_quad_notes.clear()
 
     cands = [w for w in list_target_windows()
              if w["pid"] not in _OWN_PIDS and w["owner"]]
@@ -1184,11 +1301,41 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     tl_hwnd, tl_w = picked[0]
     idx = _resolve_monitor_index(ms, monitor)
     if idx is None:
-        idx = _monitor_index_by_rect(ms, tl_w["x"], tl_w["y"], tl_w["w"], tl_w["h"])
+        idx = _monitor_index_by_rect(ms, tl_w["x"], tl_w["y"],
+                                     tl_w["w"], tl_w["h"])
+    if idx is None or not (0 <= idx < len(ms)):
+        idx = 0
     mon = ms[idx]
     wl, wt, ww, wh = mon.work_rect
-    # 默认用手动传入的比例；smart 成功时被下面的智能分配覆盖
-    sx, sy = split_x, split_y
+
+    # 1) 实测四个窗口的最小尺寸
+    mins = {}
+    for h, _w in picked:
+        mins[h] = _probe_min_size(h, wl + 1, wt + 1)
+    corners = [(mins[h][0], mins[h][1]) for h, _w in picked]
+    need_w, need_h = quad_plan.quad_requirements(corners)
+    logger.info("四格最小尺寸需求 %dx%d（屏幕 %s %dx%d）：%s",
+                need_w, need_h, mon.device_name, ww, wh,
+                "、".join("%s=%dx%d" % (h.split("::")[0], mins[h][0], mins[h][1])
+                          for h, _w in picked))
+
+    # 2) 选屏：用户点名了屏就尊重它（放不下也尽力排在上面并如实说明）；
+    #    「自动」时该屏放不下就换一块放得下的横屏，竖屏不主动送。
+    # 不仅「装不下」要换屏：当前屏是竖屏时也换——用户明确说过不适合竖屏的
+    # 窗口不要发到竖屏屏幕，四宫格在竖屏上必挤（真机 DELL U2414H 上实测）。
+    if monitor is None and (need_w > ww or need_h > wh or wh > ww):
+        better = _pick_quad_screen(ms, idx, corners)
+        if better != idx:
+            logger.info("屏幕 %s（%dx%d）不适合四宫格（四格最小尺寸 %dx%d），"
+                        "改排到 %s",
+                        mon.device_name, ww, wh, need_w, need_h,
+                        ms[better].device_name)
+            idx = better
+            mon = ms[idx]
+            wl, wt, ww, wh = mon.work_rect
+
+    # 3) 比例与四个角的归属
+    sx, sy = float(split_x), float(split_y)
     if smart:
         # 智能分配：按各窗口的宽高比重排四个角的归属，并重算分割比例。
         # 直接用 picked 里的 w（带 x/y/w/h）做判据，不再重新枚举——重新拉列表
@@ -1196,97 +1343,142 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
         # （真机实测 plan 说豆包去 TL，实际 ChatGPT 去了 TR）。
         try:
             planned, sx2, sy2 = quad_plan.plan_quad_smart(
-                [dict(w, hwnd=h) for h, w in picked], ww, wh)
+                [dict(w, hwnd=h, min_w=mins[h][0], min_h=mins[h][1])
+                 for h, w in picked], ww, wh)
         except ValueError as e:  # noqa: BLE001
             logger.warning("智能分配失败，退回手动比例: %s", e)
         else:
             # planned 里的元素就是传入的 dict（已带 hwnd 键），直接取
-            reordered = []
-            for w in planned:
-                reordered.append((w.get("hwnd"), w))
+            reordered = [(w.get("hwnd"), w) for w in planned]
             if all(h for h, _w in reordered) and len(reordered) == 4:
                 picked = reordered
                 sx, sy = sx2, sy2
                 logger.info("智能分配结果: 左上=%s 右上=%s 左下=%s 右下=%s "
                             "（横向 %.0f%% / 竖向 %.0f%%）",
-                            picked[0][0], picked[1][0], picked[2][0], picked[3][0],
-                            sx * 100, sy * 100)
+                            picked[0][0], picked[1][0], picked[2][0],
+                            picked[3][0], sx * 100, sy * 100)
             else:
                 logger.warning("智能分配结果异常，保留手动顺序")
     # 比例钳在安全区间：贴边会让某一格只剩几个像素，等于把窗口藏起来
-    sx = min(max(float(sx), 0.15), 0.85)
-    sy = min(max(float(sy), 0.15), 0.85)
+    sx = min(max(sx, 0.15), 0.85)
+    sy = min(max(sy, 0.15), 0.85)
+    c1, c2, r1, r2, ov_x, ov_y = quad_plan.grid_geometry(
+        ww, wh, sx, sy, [(mins[h][0], mins[h][1]) for h, _w in picked])
+    # 实际生效的比例：格子被最小尺寸抬高后与传入的 sx/sy 已有出入，界面上的
+    # 分割线必须按实际值显示，否则用户看到的比例与排出来的不符
     global _last_quad_splits
-    _last_quad_splits = (sx, sy)
-    col_w = int(round(ww * sx))
-    row_h = int(round(wh * sy))
-    right_w = ww - col_w
-    # 上排先按理想四等分摆放
-    set_window_rect(picked[0][0], wl, wt, col_w, row_h, activate=False)
-    set_window_rect(picked[1][0], wl + col_w, wt, right_w, row_h,
-                    activate=False)
-    # 左列的 App 可能有最小窗口宽度（实测 ChatGPT 请求 454 读回 480），
-    # 若右列仍按理想 col_w 起排，两列会重叠。读回实测宽度后按它定右列起点，
-    # 宽度不匀是应用侧钳制、无法消除，但至少两列不再互相压盖。
-    tl_rect = get_window_rect(picked[0][0])
-    right_x = wl + col_w
+    _last_quad_splits = (min(max(c1 / float(ww or 1), 0.15), 0.85),
+                         min(max(r1 / float(wh or 1), 0.15), 0.85))
+
+    notes = []
+
+    wr, wb = wl + ww, wt + wh          # 工作区右 / 下边界
+    min_right_w = max(mins[picked[1][0]][0], mins[picked[3][0]][0])
+    min_bot_h = max(mins[picked[2][0]][1], mins[picked[3][0]][1])
+    min_bl_w = mins[picked[2][0]][0]
+
+    # 上排贴工作区左 / 顶，右列贴着左列的**实测**右边缘起排。
+    # 用实测值（而不是只按算好的 c1）是必须的：左列 App 有最小窗口宽度
+    # （实测 ChatGPT 请求 454 读回 480），左列比格子宽时右列按理想值排会互相
+    # 压盖；左列比格子窄时按理想值排又会在两列之间留下一道空洞。
+    set_window_rect(picked[0][0], wl, wt, c1, r1, activate=False)
+    tl_rect = _fresh_rect(picked[0][0])
+    right_x = wr - c2
     if tl_rect and tl_rect != (0, 0, 0, 0) and tl_rect[2] > 0:
-        right_x = max(wl + 1, min(wl + ww - 1, tl_rect[0] + tl_rect[2] + 1))
-    right_w = max(1, (wl + ww) - right_x)
-    if right_x != wl + col_w:
-        set_window_rect(picked[1][0], right_x, wt, right_w, row_h,
-                        activate=False)
-    half_w = int(right_x - wl)                # 下排左列与实测左列对齐
-    # 实测闭环：System Events 对窗口几何有系统级钳制，且部分 App（Electron 类）
-    # 有最小窗口高度，可能根本缩不到理想 half_h——实测笔记本竖半屏仅 447px，
-    # ChatGPT 最小高 600px、CodeBuddy 570px。上排缩不下去时若仍按理想 half_h
-    # 写下排，两排会重叠上百 px。因此上排写完后读回实测高度，用它推导下排起点，
-    # 保证两排不重叠（与三栏排列的处理同源）。
-    bot_y = wt + row_h
+        right_x = tl_rect[0] + tl_rect[2] + 1
+    right_x = max(wl + 1, right_x)
+    # 右列必须留够它自己的最小宽度，否则右列窗口会被撑出工作区右边——
+    # 越出屏幕的窗口会被 macOS 判给别的屏。装不下时宁可让两列重叠。
+    if min_right_w and right_x + min_right_w > wr:
+        right_x = max(wl + 1, wr - min_right_w)
+    right_x = min(right_x, max(wl + 1, wr - 1))
+    right_w = max(1, wr - right_x)
+    set_window_rect(picked[1][0], right_x, wt, right_w, r1, activate=False)
+    # 下排左列与实测左列对齐
+    half_w = max(1, right_x - wl, min_bl_w)
+    # 下排起点：先贴住上排**实测**底边（App 的最小高度会让上排缩不到理想值，
+    # 按理想值写下排两排会重叠上百 px）。但下排自己也有最小高度，高度不足时
+    # 它会为了满足下限往下撑、越过屏幕底边——那正是 macOS 把整个窗口搬到
+    # 别的屏的触发条件。所以下排高度无论如何都要保住自己的下限，宁可让两排
+    # 重叠：重叠只是难看，被搬走才是用户报的故障。
+    top_bottom = wt + r1
     for h, _w in picked[:2]:
-        rect = get_window_rect(h)
+        rect = _fresh_rect(h)
         if rect and rect != (0, 0, 0, 0) and rect[3] > 0:
-            bot_y = max(bot_y, rect[1] + rect[3] + 1)
-    # 读回值异常时（窗口刚被销毁 / 读到别的窗口）也要留在屏内
-    bot_y = min(max(bot_y, wt + 1), max(wt + 1, (wt + wh) - 1))
-    bot_h = max(1, (wt + wh) - bot_y)
+            top_bottom = max(top_bottom, rect[1] + rect[3])
+    bot_y = top_bottom + 1
+    if bot_y + min_bot_h > wb:
+        bot_y = max(wt + 1, wb - min_bot_h)
+    bot_y = min(bot_y, max(wt + 1, wb - 1))
+    bot_h = max(1, wb - bot_y)
     set_window_rect(picked[2][0], wl, bot_y, half_w, bot_h, activate=False)
     # 下排左格同样可能被 App 的最小宽度撑宽（与上排左格同源）。若右下格仍按
     # 理想 half_w 起排，两格会互相压盖——用户看到的就是「右下窗口叠在左下上」。
-    # 读回实测宽度，按实测右边界定右下格起点，宽度用减法补齐，避免留缝。
-    bl_rect = get_window_rect(picked[2][0])
+    bl_rect = _fresh_rect(picked[2][0])
     br_x = wl + half_w
     if bl_rect and bl_rect != (0, 0, 0, 0) and bl_rect[2] > 0:
         br_x = max(br_x, bl_rect[0] + bl_rect[2] + 1)
-    br_x = min(max(br_x, wl + 1), max(wl + 1, (wl + ww) - 1))
-    br_w = max(1, (wl + ww) - br_x)
+    # 与上排同源：右下格也要留够自己的最小宽度，越出工作区右边同样会被搬屏
+    if min_right_w and br_x + min_right_w > wr:
+        br_x = max(wl + 1, wr - min_right_w)
+    br_x = min(max(br_x, wl + 1), max(wl + 1, wr - 1))
+    br_w = max(1, wr - br_x)
     set_window_rect(picked[3][0], br_x, bot_y, br_w, bot_h, activate=False)
     logger.info("四宫格排列完成: 左上=%s 右上=%s 左下=%s 右下=%s（屏幕 %s，"
                 "横向 %.0f%% / 竖向 %.0f%%）",
                 picked[0][0], picked[1][0], picked[2][0], picked[3][0],
-                mon.device_name, sx * 100, sy * 100)
+                mon.device_name, _last_quad_splits[0] * 100,
+                _last_quad_splits[1] * 100)
     # 逐个读回报「实测 vs 目标」偏差：App 的最小窗口尺寸（Electron 类常见）
     # 会让某一格缩不到目标值，呈现为「不准」。这不是坐标算错，把偏差写进
     # 日志和返回值，界面才能如实说明「哪些格子被应用钳制了」。
     report = []
-    boxes = [(wl, wt, half_w, row_h),
-             (right_x, wt, right_w, row_h),
+    boxes = [(wl, wt, c1, r1),
+             (right_x, wt, right_w, r1),
              (wl, bot_y, half_w, bot_h),
              (br_x, bot_y, br_w, bot_h)]
     for (h, _w), want in zip(picked, boxes):
-        got = get_window_rect(h)
+        got = _fresh_rect(h)
         if not got or got == (0, 0, 0, 0):
             report.append((h, want, None))
+            notes.append("%s 读不到几何" % h.split("::")[0])
             continue
         dev = max(abs(g - t) for g, t in zip(got, want))
         report.append((h, want, got))
-        if dev > 8:
+        # 窗口被系统判给了别的屏：中心点不在目标屏范围内。这是「四窗不在
+        # 一个屏幕上」的直接证据，必须报出来，不能记成「被最小尺寸钳制」。
+        cx, cy = got[0] + got[2] / 2.0, got[1] + got[3] / 2.0
+        if not (mon.left <= cx < mon.left + mon.width
+                and mon.top <= cy < mon.top + mon.height):
+            notes.append("%s 被系统移到了别的屏（实测 %s）"
+                         % (h.split("::")[0], got))
+            logger.warning("四宫格：%s 被移到别的屏 -> %s", h, got)
+        elif dev > 8:
             logger.info("四宫格偏差 %s：目标=%s 实测=%s（最大偏差 %d px，"
                         "可能被应用的最小窗口尺寸钳制）", h, want, got, dev)
     global _last_quad_report
     _last_quad_report = report
     global _last_quad_order
     _last_quad_order = [h for h, _w in picked]
+    # 重叠量用实测值算：前面 ov_x / ov_y 是理想几何的估计，而 App 的最小尺寸、
+    # 标题栏占位都会让窗口实际比格子大，只有实测才反映用户看到的重叠。
+    # 上排 = 顶边较小的两格、下排 = 其余两格（摆放时就是按这个顺序写的）。
+    live = [r for _h, _w, r in report if r]
+    if len(live) == 4:
+        rows = sorted(live, key=lambda r: r[1])
+        cols = sorted(live, key=lambda r: r[0])
+        real_ov_y = max(0, max(r[1] + r[3] for r in rows[:2])
+                        - min(r[1] for r in rows[2:]))
+        real_ov_x = max(0, max(r[0] + r[2] for r in cols[:2])
+                        - min(r[0] for r in cols[2:]))
+        if real_ov_x or real_ov_y:
+            notes.append("四格没完全排开：实测上下重叠 %dpx、左右重叠 %dpx"
+                         % (real_ov_y, real_ov_x))
+            logger.warning("四宫格：%s", notes[-1])
+    # 就地清空再填充（而不是重新绑定）：本函数顶部已用 global 声明过它，
+    # 这里再声明一次会报「name used prior to global declaration」。就地改内容
+    # 让界面持有的引用（若有）也同步更新。
+    _last_quad_notes[:] = notes
     return True
 
 

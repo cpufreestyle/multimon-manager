@@ -46,11 +46,16 @@ def _run(wins, mons, **kw):
     readback: {hwnd: 读回矩形}，用于模拟「系统/App 钳制」——写入目标值后
    读回的可能是别的尺寸（部分 App 有最小窗口高度）。未列出的窗口按
    写入值原样读回。
+
+    min_sizes: {hwnd: (min_w, min_h)}，模拟 App 的最小窗口尺寸。snap_four_quad
+    会先实测每个窗口的最小尺寸（真机是写个小尺寸再读回，走 AppleScript），
+    单测必须把这一步也换掉——否则会真的去动用户的窗口。
     """
     placed = []
     prev = {}
     for attr in ("list_target_windows", "monitors", "_find_window",
-                 "get_window_rect", "set_window_rect", "push_undo"):
+                 "get_window_rect", "set_window_rect", "push_undo",
+                 "_osa", "_probe_min_size"):
         prev[attr] = getattr(wm, attr)
 
     class _Mons:
@@ -58,6 +63,7 @@ def _run(wins, mons, **kw):
             return mons
 
     readback = kw.pop("readback", {})
+    min_sizes = kw.pop("min_sizes", {})
     state = {}
 
     def _rect(hwnd, *a, **k):
@@ -76,6 +82,10 @@ def _run(wins, mons, **kw):
         (w for w in wins if w["hwnd"] == hwnd), None)
     wm.get_window_rect = _rect
     wm.push_undo = lambda *a, **k: None
+    # 最小尺寸探测本身会真的写 AppleScript 动用户的窗口，单测里必须假掉
+    wm._osa = lambda script: ""
+    wm._probe_min_size = lambda hwnd, at_x, at_y: tuple(
+        min_sizes.get(hwnd, (0, 0)))
 
     def _place(hwnd, x, y, w, h, activate=True):
         placed.append((hwnd, x, y, w, h))
@@ -158,7 +168,9 @@ class TestSnapFourQuad(unittest.TestCase):
         ok, placed = _run(
             list(self.WINS), [_Mon()],
             # 左上/右上被系统钳制在 600 / 570 高（真机实测值）
-            readback={"A::1": (wl, wt, ww // 2, 600),
+            # 宽度按 _exact 的同一约定少 1px（AX 读回比实际少 1），表示「左列
+            # 高度被钳制、宽度正好是理想左半屏」，右列起点应落在理想分割点
+            readback={"A::1": (wl, wt, ww // 2 - 1, 600),
                       "B::1": (wl + ww // 2, wt, ww - ww // 2, 570)})
         self.assertTrue(ok)
         # 上排仍按理想半高写入（有权重高的窗口优先保证位置）
@@ -258,6 +270,52 @@ class TestSnapFourQuad(unittest.TestCase):
         self.assertEqual(last_c[3], right_x - wl)
         last_d = [p for p in placed if p[0] == "D::1"][-1]
         self.assertEqual(last_d[1], right_x)
+
+    def test_all_four_stay_on_one_screen_when_rows_too_tall(self):
+        """真机故障回归：屏装不下四格最小高度时，四个窗口必须仍留在同一屏。
+
+        真机现场是 RV200 Pro（工作区 1600x900）：上排 ChatGPT 最小高 600、
+        下排 Qoder CN 最小高 540，四等分后下排只有 450 高。旧实现让下排为了
+        满足 540 的下限往下撑、越过屏幕底边，macOS 随即把整个窗口判给别的屏
+        ——用户看到的就是「排列四个窗口不在一个屏幕上」。
+
+        修复后下排高度必须保住自己的下限（宁可两排重叠），四格的顶边 + 高度
+        一律不得越过工作区底边。
+        """
+        wl, wt, ww, wh = 0, 0, 1600, 900
+        mins = {"A::1": (500, 600), "B::1": (400, 570),
+                "C::1": (720, 540), "D::1": (600, 420)}
+        ok, placed = _run(list(self.WINS),
+                          [_Mon(width=ww, height=wh)], min_sizes=mins)
+        self.assertTrue(ok)
+        self.assertEqual(len(placed), 4)
+        for hwnd, x, y, w, h in placed:
+            self.assertGreaterEqual(x, wl, "%s 越过工作区左边" % hwnd)
+            self.assertGreaterEqual(y, wt, "%s 越过工作区顶边" % hwnd)
+            self.assertLessEqual(x + w, wl + ww, "%s 越过工作区右边" % hwnd)
+            # 这条就是根因：越出底边的窗口会被 macOS 判给别的屏
+            self.assertLessEqual(y + h, wt + wh, "%s 越过工作区底边" % hwnd)
+        # 下排必须保住自己的最小高度，否则窗口会被撑出屏幕
+        last_c = [p for p in placed if p[0] == "C::1"][-1]
+        last_d = [p for p in placed if p[0] == "D::1"][-1]
+        self.assertGreaterEqual(last_c[4], mins["C::1"][1])
+        self.assertGreaterEqual(last_d[4], mins["D::1"][1])
+        # 右列同样要留够最小宽度
+        last_b = [p for p in placed if p[0] == "B::1"][-1]
+        self.assertGreaterEqual(last_b[3], mins["B::1"][0])
+
+    def test_row_shrinks_other_row_instead_of_overflowing(self):
+        """一排被最小尺寸抬高时，另一排让出空间，不允许两侧叠加越界。"""
+        ww, wh = 1600, 1000
+        mins = {"A::1": (0, 800), "B::1": (0, 800),
+                "C::1": (0, 200), "D::1": (0, 200)}
+        ok, placed = _run(list(self.WINS),
+                          [_Mon(width=ww, height=wh)], min_sizes=mins)
+        self.assertTrue(ok)
+        for hwnd, _x, y, _w, h in placed:
+            self.assertLessEqual(y + h, wh, "%s 越界" % hwnd)
+        last_c = [p for p in placed if p[0] == "C::1"][-1]
+        self.assertGreaterEqual(last_c[4], 200)
 
     def test_default_split_is_quarter(self):
         """默认 split_x/split_y = 0.5，与旧行为一致（四等分）。"""

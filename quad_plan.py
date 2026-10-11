@@ -68,15 +68,19 @@ def plan_quad_smart(wins, work_w, work_h, min_ratio=0.15, max_ratio=0.85):
     best = None
     for sx in _grid(sx_hint, lo, hi):
         for sy in _grid(sy_hint, lo, hi):
-            c1 = round(work_w * sx)
-            c2 = max(1, work_w - c1)
-            r1 = round(work_h * sy)
-            r2 = max(1, work_h - r1)
-            cells = (c1 / r1, c2 / r1, c1 / r2, c2 / r2)
-            sizes = ((c1, r1), (c2, r1), (c1, r2), (c2, r2))
             for perm in itertools.permutations(wins):
+                # 四格的真实几何要带上各窗口的最小尺寸：格子比下限还小时，
+                # App 会把窗口撑出屏幕、被 macOS 搬到别的屏（见 grid_geometry）。
+                corner_mins = [(float(w.get("min_w") or 0),
+                                float(w.get("min_h") or 0)) for w in perm]
+                c1, c2, r1, r2, ov_x, ov_y = grid_geometry(
+                    work_w, work_h, sx, sy, corner_mins)
+                sizes = ((c1, r1), (c2, r1), (c1, r2), (c2, r2))
                 cost = sum(_fit_cost(w, cw, ch)
                            for w, (cw, ch) in zip(perm, sizes))
+                # 四格装不下各自的最小尺寸时只能贴边 + 重叠摆放：重叠越多越差，
+                # 让搜索宁可换一个比例 / 换一种摆法
+                cost += (ov_x + ov_y) / float(max(1, work_h)) * 10.0
                 # 面积均衡项：四格的「窗口面积占比」应与其「格子面积占比」
                 # 接近。少了这一项，算法会把小窗口挤进极小格、剩下的全给大
                 # 窗口——纯凑比例的话这样总成本更低，但四格大小失衡，
@@ -121,13 +125,98 @@ def _fit_cost(win, cw, ch):
     if w <= 0 or h <= 0:
         # 尺寸未知：只按比例 1.0 估，不做面积惩罚
         return abs(cw / ch - 1.0)
+    min_w = float(win.get("min_w") or 0)
+    min_h = float(win.get("min_h") or 0)
     # 硬约束：格子至少要有窗口的 min_frac（宽和高各自都要达到）。
     # 达不到就直接判为「不合适」，成本抬到很高，让搜索主动避开这种切法。
     if cw < w * MIN_CELL_FRAC or ch < h * MIN_CELL_FRAC:
         return 100.0 + (w * MIN_CELL_FRAC - cw) / w + (h * MIN_CELL_FRAC - ch) / h
     ratio_pen = abs(cw / ch - w / h) / (w / h)
     area_pen = max(0.0, (w * h - cw * ch) / (w * h))
-    return ratio_pen + area_pen
+    cost = ratio_pen + area_pen
+    # 绝对下限（App 硬限制，实测值）：格子比下限还小时，系统会为了满足下限
+    # 把窗口撑出格子、越出屏幕，macOS 随即把整个窗口搬到别的屏。
+    # grid_geometry 已按下限抬高格子，这里再罚一次，兜住调用方没传下限的情况。
+    if min_w and cw < min_w:
+        cost += 100.0 + (min_w - cw) / min_w
+    if min_h and ch < min_h:
+        cost += 100.0 + (min_h - ch) / min_h
+    return cost
+
+
+def grid_geometry(work_w, work_h, sx, sy, mins=None):
+    """把一次横向/纵向切分算成四格的实际几何（含各窗口最小尺寸）。
+
+    mins: [(min_w, min_h)] * 4，顺序 [左上, 右上, 左下, 右下]，缺省视为 0。
+
+    每格尺寸取「按比例切出来的值」与「该列 / 该行内窗口的最小尺寸」的较大者。
+    这一步是本 bug 的核心：格子小于窗口下限时，系统会为了满足下限把窗口撑出
+    格子、越出屏幕，macOS 随即把整个窗口搬到别的屏——真机实测 RV200 Pro
+    (1600x900) 上 ChatGPT 最小高 600 + Qoder CN 540 = 1140 > 900，下排必被
+    挤出屏幕，于是「四个窗口不在一个屏幕上」。
+
+    余量补给另一侧，网格仍铺满工作区；两侧之和超出工作区时，右列 / 下排改为
+    贴住工作区右 / 下边（四角锚定），中间允许重叠，重叠量一并返回，调用方据此
+    如实告知用户「这块屏放不下四格最小尺寸」。
+
+    返回 (c1, c2, r1, r2, overlap_x, overlap_y)。
+    """
+    m = list(mins or [(0, 0)] * 4)
+    while len(m) < 4:
+        m.append((0, 0))
+    # 每列 / 每排的最小尺寸取内部较长者：同一列的两个窗口共享列宽，窄的那个
+    # 也要能放下较宽的那个的下限，否则总有一格被撑出格子。
+    min_l = max(int(m[0][0] or 0), int(m[2][0] or 0))
+    min_r = max(int(m[1][0] or 0), int(m[3][0] or 0))
+    min_t = max(int(m[0][1] or 0), int(m[1][1] or 0))
+    min_b = max(int(m[2][1] or 0), int(m[3][1] or 0))
+
+    base1 = int(round(work_w * sx))
+    c1 = max(base1, min_l)
+    c2 = max(work_w - base1, min_r)
+    # 一侧被最小尺寸抬高后，另一侧必须让出空间——不能两侧都按比例切完就把
+    # 多出来的部分伸到工作区外（伸出去就是「窗口跑到别的屏」）。让的时候先
+    # 让没被最小尺寸钉住的那一侧；两侧都被钉住（真装不下）才允许重叠。
+    if c1 + c2 > work_w and c1 > min_l:
+        c1 = max(min_l, work_w - c2)
+    if c1 + c2 > work_w and c2 > min_r:
+        c2 = max(min_r, work_w - c1)
+    if c1 + c2 <= work_w:
+        extra = work_w - (c1 + c2)
+        c1 += extra // 2
+        c2 += extra - extra // 2
+
+    base_r1 = int(round(work_h * sy))
+    r1 = max(base_r1, min_t)
+    r2 = max(work_h - base_r1, min_b)
+    if r1 + r2 > work_h and r1 > min_t:
+        r1 = max(min_t, work_h - r2)
+    if r1 + r2 > work_h and r2 > min_b:
+        r2 = max(min_b, work_h - r1)
+    if r1 + r2 <= work_h:
+        extra = work_h - (r1 + r2)
+        r1 += extra // 2
+        r2 += extra - extra // 2
+    return c1, c2, r1, r2, max(0, c1 + c2 - work_w), max(0, r1 + r2 - work_h)
+
+
+def quad_requirements(corners):
+    """四格摆满一块屏所需的最小工作区尺寸。
+
+    corners 顺序 [左上, 右上, 左下, 右下]，元素是 (min_w, min_h)。左右两列
+    各自要装下自己那列里较宽的那个窗口，上下两排各要装下自己那排里较高的那个。
+    用来判断「这块屏放不放得下四宫格」，放不下才允许换屏 / 重叠。
+    """
+    m = list(corners or [])
+    while len(m) < 4:
+        m.append((0, 0))
+    # 每列取该列两个窗口里更宽的、每排取该排两个窗口里更高的（与 grid_geometry
+    # 的取 max 规则一致），否则算出来的需求比实际需要的还大，会误判「放不下」
+    need_w = (max(int(m[0][0] or 0), int(m[2][0] or 0))
+              + max(int(m[1][0] or 0), int(m[3][0] or 0)))
+    need_h = (max(int(m[0][1] or 0), int(m[1][1] or 0))
+              + max(int(m[2][1] or 0), int(m[3][1] or 0)))
+    return need_w, need_h
 
 
 def _grid(center, lo, hi, step=0.05):
