@@ -1106,6 +1106,7 @@ _last_quad_splits = (0.5, 0.5)
 # 智能模式会按窗口宽高比重排四个角，界面必须回报「谁最终去了哪个角」，
 # 否则用户看到的下拉顺序与实际摆放不一致，就是「不准」。
 _last_quad_order = [None, None, None, None]
+_last_quad_boxes = [None, None, None, None]
 
 
 # 最近一次四宫格需要如实告知用户的情况（屏幕装不下四个最小尺寸、某窗口
@@ -1234,6 +1235,29 @@ def _ax_read_rect(app, win_sel):
         return (x, y, w, h)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _settled_readback(hwnd, target):
+    """等窗口动画结束后再读回几何。
+
+    System Events 写入后系统会播放移动/缩放动画，CG 立刻读到的是中间帧
+    （真机实测写入 600 高立刻读回 297）。四宫格的闭环用中间帧算下排起点，
+    会把下排顶到上排中间去——两排重叠 302px 就是这么来的。
+    做法：先读一次，与目标偏差超过 8px 就再等 0.35s 读一次，取更接近
+    目标的那次（最多两次，避免把四宫格拖得太慢）。
+    """
+    got = _readback_rect(hwnd, target)
+    if not got or got == (0, 0, 0, 0) or not target:
+        return got
+    dev = max(abs(a - t) for a, t in zip(got, target))
+    if dev <= 8:
+        return got
+    time.sleep(0.35)
+    got2 = _readback_rect(hwnd, target)
+    if not got2 or got2 == (0, 0, 0, 0):
+        return got
+    dev2 = max(abs(a - t) for a, t in zip(got2, target))
+    return got2 if dev2 <= dev else got
 
 
 def _readback_rect(hwnd, target):
@@ -1560,8 +1584,11 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # 比例钳在安全区间：贴边会让某一格只剩几个像素，等于把窗口藏起来
     sx = min(max(sx, 0.15), 0.85)
     sy = min(max(sy, 0.15), 0.85)
+    # 格子严格按 sx/sy 铺满：不把最小尺寸传进去顶高某一排/列。
+    # 最小尺寸只影响「窗口在格子里 fit 后能被 App 顶多大」，以及
+    # 顶大后按方位贴边——格子本身永远铺满，两排永不重叠。
     c1, c2, r1, r2, ov_x, ov_y = quad_plan.grid_geometry(
-        ww, wh, sx, sy, [(mins[h][0], mins[h][1]) for h, _w in picked])
+        ww, wh, sx, sy)
     # 实际生效的比例：格子被最小尺寸抬高后与传入的 sx/sy 已有出入，界面上的
     # 分割线必须按实际值显示，否则用户看到的比例与排出来的不符
     global _last_quad_splits
@@ -1571,70 +1598,63 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     notes = []
 
     wr, wb = wl + ww, wt + wh          # 工作区右 / 下边界
-    min_right_w = max(mins[picked[1][0]][0], mins[picked[3][0]][0])
-    min_bot_h = max(mins[picked[2][0]][1], mins[picked[3][0]][1])
-    min_bl_w = mins[picked[2][0]][0]
 
-    # 上排贴工作区左 / 顶，右列贴着左列的**实测**右边缘起排。
-    # 用实测值（而不是只按算好的 c1）是必须的：左列 App 有最小窗口宽度
-    # （实测 ChatGPT 请求 454 读回 480），左列比格子宽时右列按理想值排会互相
-    # 压盖；左列比格子窄时按理想值排又会在两列之间留下一道空洞。
-    set_window_rect(picked[0][0], wl, wt, c1, r1, activate=False)
-    tl_rect = _readback_rect(picked[0][0], (wl, wt, c1, r1))
-    right_x = wr - c2
-    if tl_rect and tl_rect != (0, 0, 0, 0) and tl_rect[2] > 0:
-        right_x = tl_rect[0] + tl_rect[2] + 1
-    right_x = max(wl + 1, right_x)
-    # 右列必须留够它自己的最小宽度，否则右列窗口会被撑出工作区右边——
-    # 越出屏幕的窗口会被 macOS 判给别的屏。装不下时宁可让两列重叠。
-    if min_right_w and right_x + min_right_w > wr:
-        right_x = max(wl + 1, wr - min_right_w)
-    right_x = min(right_x, max(wl + 1, wr - 1))
-    right_w = max(1, wr - right_x)
-    set_window_rect(picked[1][0], right_x, wt, right_w, r1, activate=False)
-    # 下排左列与实测左列对齐
-    half_w = max(1, right_x - wl, min_bl_w)
-    # 下排起点：先贴住上排**实测**底边（App 的最小高度会让上排缩不到理想值，
-    # 按理想值写下排两排会重叠上百 px）。但下排自己也有最小高度，高度不足时
-    # 它会为了满足下限往下撑、越过屏幕底边——那正是 macOS 把整个窗口搬到
-    # 别的屏的触发条件。所以下排高度无论如何都要保住自己的下限，宁可让两排
-    # 重叠：重叠只是难看，被搬走才是用户报的故障。
-    top_bottom = wt + r1
-    for h, _w in picked[:2]:
-        rect = _readback_rect(h, (wl, wt, c1, r1))
-        if rect and rect != (0, 0, 0, 0) and rect[3] > 0:
-            top_bottom = max(top_bottom, rect[1] + rect[3])
-    bot_y = top_bottom + 1
-    if bot_y + min_bot_h > wb:
-        bot_y = max(wt + 1, wb - min_bot_h)
-    bot_y = min(bot_y, max(wt + 1, wb - 1))
-    bot_h = max(1, wb - bot_y)
-    set_window_rect(picked[2][0], wl, bot_y, half_w, bot_h, activate=False)
-    # 下排左格同样可能被 App 的最小宽度撑宽（与上排左格同源）。若右下格仍按
-    # 理想 half_w 起排，两格会互相压盖——用户看到的就是「右下窗口叠在左下上」。
-    bl_rect = _readback_rect(picked[2][0], (wl, bot_y, half_w, bot_h))
-    br_x = wl + half_w
-    if bl_rect and bl_rect != (0, 0, 0, 0) and bl_rect[2] > 0:
-        br_x = max(br_x, bl_rect[0] + bl_rect[2] + 1)
-    # 与上排同源：右下格也要留够自己的最小宽度，越出工作区右边同样会被搬屏
-    if min_right_w and br_x + min_right_w > wr:
-        br_x = max(wl + 1, wr - min_right_w)
-    br_x = min(max(br_x, wl + 1), max(wl + 1, wr - 1))
-    br_w = max(1, wr - br_x)
-    set_window_rect(picked[3][0], br_x, bot_y, br_w, bot_h, activate=False)
+    # 四个格子严格按 sx/sy 铺满工作区：不再用最小尺寸把某一排/列顶高。
+    # 顶高的直接后果是两排都装不下、必然重叠（真机实测 UU远程 最小高 744
+    # + 下排 570 = 1314 > 898 工作区，怎么切都重叠 400+px）。
+    # Moom 的做法是格子铺满 + 窗口在格子里等比缩放（fit_frame），窗口被
+    # App 的最小尺寸顶大时只会朝「不贴边的那一侧」溢出，贴边的一侧仍然准确。
+    col_x = (wl, wl + c1)
+    row_y = (wt, wt + r1)
+    cells = [(col_x[0], row_y[0], c1, r1),
+             (col_x[1], row_y[0], c2, r1),
+             (col_x[0], row_y[1], c1, r2),
+             (col_x[1], row_y[1], c2, r2)]
+    # 窗口在格子里的最终矩形：等比缩放 + 居中
+    finals = []
+    for (h, w), (bx, by, bw, bh) in zip(picked, cells):
+        rx, ry, rw, rh = quad_plan.fit_frame(w, bw, bh, corner=idx)
+        finals.append((int(round(bx + rx * bw)),
+                       int(round(by + ry * bh)),
+                       max(1, int(round(rw * bw))),
+                       max(1, int(round(rh * bh)))))
+    for idx in (0, 1, 2, 3):
+        h = picked[idx][0]
+        fx, fy, fw, fh = finals[idx]
+        set_window_rect(h, fx, fy, fw, fh, activate=False)
+        got = _settled_readback(h, (fx, fy, fw, fh))
+        if not got or got == (0, 0, 0, 0):
+            continue
+        gx, gy, gw, gh = got
+        # 只有尺寸被 App 明显顶小（>8px）时才重排贴边：读回宽度比目标
+        # 少 1~2px 是常态（AX 读回噪声），不该触发重排。
+        if abs(gw - fw) <= 8 and abs(gh - fh) <= 8:
+            continue
+        # 窗口被 App 顶大后，按方位把该贴的边贴住：左上格贴左上、右上格贴
+        # 右上、左下格贴左下、右下格贴右下。溢出只发生在远离贴边的那一侧。
+        ax, ay = gx, gy
+        if idx in (1, 3):
+            ax = max(cells[idx][0], cells[idx][0] + cells[idx][2] - gw)
+        if idx in (2, 3):
+            # 底缘优先：窗口比格子高时，贴格子底边会越出工作区底边，
+            # macOS 随即将整个窗口搬到别的屏（真机实测 ChatGPT 被搬到
+            # RV200 Pro）。所以先保证不越工作区底边，再尽量贴近格子底边。
+            ay = min(max(cells[idx][1] + cells[idx][3] - gh, wt),
+                     max(cells[idx][1], wt + wh - gh))
+        if (ax, ay) != (gx, gy):
+            set_window_rect(h, ax, ay, gw, gh, activate=False)
     logger.info("四宫格排列完成: 左上=%s 右上=%s 左下=%s 右下=%s（屏幕 %s，"
                 "横向 %.0f%% / 竖向 %.0f%%）",
                 picked[0][0], picked[1][0], picked[2][0], picked[3][0],
                 mon.device_name, _last_quad_splits[0] * 100,
                 _last_quad_splits[1] * 100)
-    # 逐个读回报「实测 vs 目标」偏差：App 的最小窗口尺寸（Electron 类常见）
-    # 会让某一格缩不到目标值，呈现为「不准」。这不是坐标算错，把偏差写进
-    # 日志和返回值，界面才能如实说明「哪些格子被应用钳制了」。
+
     report = []
-    boxes = [(wl, wt, c1, r1),
-             (right_x, wt, right_w, r1),
-             (wl, bot_y, half_w, bot_h),
-             (br_x, bot_y, br_w, bot_h)]
+    global _last_quad_boxes
+    _last_quad_boxes = cells
+    # 目标用「格子」（严格铺满）：窗口被 App 顶大时偏差即溢出量，
+    # 报告里如实说明哪些角被钳制。
+    boxes = cells
     for (h, _w), want in zip(picked, boxes):
         got = _readback_rect(h, want)
         if not got or got == (0, 0, 0, 0):
@@ -1734,7 +1754,6 @@ def distribute_app_windows(owner_pattern, counts=None, activate=True):
     if counts is None:
         n = len(wins)
         base, extra = divmod(n, len(ms))
-        counts = [base + (1 if i < extra else 0) for i in range(len(ms))]
     counts = list(counts)
 
     ok, miss = 0, 0

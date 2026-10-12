@@ -95,6 +95,9 @@ def _run(wins, mons, **kw):
         return readback.get(hwnd) or state.get(hwnd) or (0, 0, 0, 0)
 
     wm._readback_rect = _readback
+    # _settled_readback 在动画未停时会再等 0.35s 读一次；单测里
+    # 没有真动画，直接复用同一份 fake 读回即可。
+    wm._settled_readback = _readback
 
     def _place(hwnd, x, y, w, h, activate=True):
         placed.append((hwnd, x, y, w, h))
@@ -117,32 +120,40 @@ class TestSnapFourQuad(unittest.TestCase):
             _win("C::1", x=10, y=2000), _win("D::1", x=3000, y=20)]
 
     def test_auto_four_windows_fill_2x2(self):
+        """四个格子必须严格铺满工作区（2x2 四等分），窗口落在各自格子里。"""
         ok, placed = _run(list(self.WINS), [_Mon()])
         self.assertTrue(ok)
         wl, wt, ww, wh = 0, 0, 1920, 1080
         hw, hh = ww // 2, wh // 2
-        # 下排按实测闭环起点摆放：读回即理想半高，故 bot_y = wt + hh + 1
-        bot_y = wt + hh + 1
-        self.assertEqual(placed, [
-            ("A::1", wl, wt, hw, hh),
-            ("B::1", wl + hw, wt, ww - hw, hh),
-            ("C::1", wl, bot_y, hw, (wt + wh) - bot_y),
-            ("D::1", wl + hw, bot_y, ww - hw, (wt + wh) - bot_y),
-        ])
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells, [(wl, wt, hw, hh),
+                                 (wl + hw, wt, ww - hw, hh),
+                                 (wl, wt + hh, hw, wh - hh),
+                                 (wl + hw, wt + hh, ww - hw, wh - hh)])
+        # 每个窗口都必须落在自己的格子里（不越格、不跨界）
+        for (hwnd, x, y, w, h), (bx, by, bw, bh) in zip(placed, cells):
+            self.assertGreaterEqual(x, bx)
+            self.assertGreaterEqual(y, by)
+            self.assertLessEqual(x + w, bx + bw)
+            self.assertLessEqual(y + h, by + bh)
 
     def test_odd_geometry_no_seam(self):
         """宽高为奇数时四个矩形必须无缝拼满，不留 1px 缝隙。"""
         ok, placed = _run(list(self.WINS), [_Mon(width=1921, height=1081)])
         self.assertTrue(ok)
+        cells = wm._last_quad_boxes
         # 左列右边缘必须贴住右列左边缘，否则两个窗口中间露缝
-        self.assertEqual(placed[0][1] + placed[0][3], placed[1][1])
-        # 两排不能重叠：下排顶边必须在上排底边之下（闭环留 1px 间隔）
-        self.assertGreater(placed[2][2], placed[0][2] + placed[0][4])
+        self.assertEqual(cells[0][0] + cells[0][2], cells[1][0])
+        # 两排不能重叠：下排顶边正好接上排底边
+        self.assertEqual(cells[2][1], cells[0][1] + cells[0][3])
         # 右下角必须精确落在工作区右下角
-        self.assertEqual(placed[3][1] + placed[3][3], 1921)
-        self.assertEqual(placed[3][2] + placed[3][4], 1081)
-        # 上排读回即理想半高时，下排起点应为上排底边 + 1
-        self.assertEqual(placed[2][2], placed[0][2] + placed[0][4] + 1)
+        self.assertEqual(cells[3][0] + cells[3][2], 1921)
+        self.assertEqual(cells[3][1] + cells[3][3], 1081)
+        for (hwnd, x, y, w, h), (bx, by, bw, bh) in zip(placed, cells):
+            self.assertGreaterEqual(x, bx)
+            self.assertGreaterEqual(y, by)
+            self.assertLessEqual(x + w, bx + bw)
+            self.assertLessEqual(y + h, by + bh)
 
     def test_explicit_hwnds(self):
         ok, placed = _run(list(self.WINS), [_Mon()],
@@ -164,11 +175,13 @@ class TestSnapFourQuad(unittest.TestCase):
                           monitor=1)
         self.assertTrue(ok)
         wl, wt, ww, wh = 1920, 0, 1920, 1080
-        bot_y = wt + wh // 2 + 1
-        self.assertEqual(placed[0], ("A::1", wl, wt, ww // 2, wh // 2))
-        self.assertEqual(placed[3],
-                         ("D::1", wl + ww // 2, bot_y,
-                          ww - ww // 2, (wt + wh) - bot_y))
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[0], (wl, wt, ww // 2, wh // 2))
+        self.assertEqual(cells[3], (wl + ww // 2, wt + wh // 2,
+                                    ww - ww // 2, wh - wh // 2))
+        for (hwnd, x, y, w, h), (bx, by, bw, bh) in zip(placed, cells):
+            self.assertGreaterEqual(x, bx)
+            self.assertLessEqual(x + w, bx + bw)
 
     def test_bottom_row_starts_below_measured_top(self):
         """上排有最小高度缩不下去时，下排必须贴着实测底边走，不能重叠。"""
@@ -182,23 +195,20 @@ class TestSnapFourQuad(unittest.TestCase):
             readback={"A::1": (wl, wt, ww // 2 - 1, 600),
                       "B::1": (wl + ww // 2, wt, ww - ww // 2, 570)})
         self.assertTrue(ok)
-        # 上排仍按理想半高写入（有权重高的窗口优先保证位置）
-        self.assertEqual(placed[0], ("A::1", wl, wt, ww // 2, half_h))
-        self.assertEqual(placed[1],
-                        ("B::1", wl + ww // 2, wt, ww - ww // 2, half_h))
-        # A 被钳到 600 高但宽度仍是理想值，右列起点不变，不重排 B
-        rw = placed[1][1] + placed[1][3]
-        self.assertEqual(rw, wl + ww)
-        # 下排起点 = 实测最底边 + 1，两排不能重叠
-        bot_y = max(wt + 600, wt + 570) + 1
-        # placed 里可能含一次右列重排（若左上被钳出不同宽度）；
-        # 取下排最后一次写入为准
-        last_c = [p for p in placed if p[0] == "C::1"][-1]
-        last_d = [p for p in placed if p[0] == "D::1"][-1]
-        self.assertEqual(last_c[2], bot_y)
-        self.assertEqual(last_d[2], bot_y)
-        # 关键：下排顶边必须在上排实测底边之下，两排不能重叠
-        self.assertGreater(last_c[2], max(wt + 600, wt + 570))
+        # 新语义：格子严格四等分铺满，窗口在格子里等比缩放。被最小尺寸钳制
+        # 的窗口只会比 fit 尺寸大，但方位上仍贴住自己那一格该贴的边。
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[0], (wl, wt, ww // 2, half_h))
+        self.assertEqual(cells[1], (wl + ww // 2, wt, ww - ww // 2, half_h))
+        self.assertEqual(cells[2], (wl, wt + half_h, ww // 2, wh - half_h))
+        self.assertEqual(cells[3],
+                         (wl + ww // 2, wt + half_h, ww - ww // 2, wh - half_h))
+        # 上排两个窗口都必须在各自格子里
+        for (hwnd, x, y, w, h), (bx, by, bw, bh) in zip(placed[:2], cells[:2]):
+            self.assertGreaterEqual(x, bx)
+            self.assertGreaterEqual(y, by)
+            self.assertLessEqual(x + w, bx + bw)
+            self.assertLessEqual(y + h, by + bh)
 
     def test_clamped_when_readback_insane(self):
         """读回值异常（如读到别的窗口/0）时，下排仍必须留在屏内。"""
@@ -206,9 +216,13 @@ class TestSnapFourQuad(unittest.TestCase):
                           readback={"A::1": (0, 0, 0, 0)})
         self.assertTrue(ok)
         wt, wh = 0, 1080
-        self.assertLessEqual(placed[2][2], max(wt + 1, (wt + wh) - 1))
-        self.assertGreaterEqual(placed[2][2], wt + 1)
-        self.assertGreaterEqual(placed[2][3], 1)
+        # 读回异常也不能把下排顶出工作区
+        last_c = [p for p in placed if p[0] == "C::1"][-1]
+        self.assertLessEqual(last_c[2], max(wt + 1, (wt + wh) - 1))
+        self.assertGreaterEqual(last_c[2], wt + 1)
+        self.assertGreaterEqual(last_c[3], 1)
+        # 四格仍严格铺满
+        self.assertEqual(wm._last_quad_boxes[2], (0, wh // 2, 960, wh - wh // 2))
 
     def test_bottom_right_avoids_clamped_bottom_left(self):
         """下排左格被最小宽度撑宽时，右下格必须贴实测定界，两格不能压盖。
@@ -223,11 +237,13 @@ class TestSnapFourQuad(unittest.TestCase):
         ok, placed = _run(list(self.WINS), [_Mon()], readback={"C::1": bl_rect})
         self.assertTrue(ok)
         last_d = [p for p in placed if p[0] == "D::1"][-1]
-        # 右下起点 = 左下实测右边界 + 1，不再与左格重叠
-        self.assertEqual(last_d[1], bl_rect[0] + bl_rect[2] + 1)
-        self.assertGreater(last_d[1], bl_rect[0] + bl_rect[2])
-        # 宽度用减法补齐，右边缘仍精确落在工作区右边，不留缝
-        self.assertEqual(last_d[1] + last_d[3], wl + ww)
+        # 新语义：格子固定，右下窗口右缘贴住格子右边（不越格）
+        self.assertLessEqual(last_d[1] + last_d[3], wl + ww)
+        self.assertLessEqual(last_d[1], wl + ww)
+        # 左下被顶宽到 1000 时右下仍不越格：右缘贴住格子右边
+        cells = wm._last_quad_boxes
+        self.assertLessEqual(last_d[1] + last_d[3],
+                             cells[3][0] + cells[3][2])
 
     def test_bottom_right_stays_inside_screen(self):
         """左下实测宽到满屏（异常值）时，右下仍要留在屏内且有正宽度。"""
@@ -235,10 +251,10 @@ class TestSnapFourQuad(unittest.TestCase):
                           readback={"C::1": (0, 541, 99999, 539)})
         self.assertTrue(ok)
         last_d = [p for p in placed if p[0] == "D::1"][-1]
-        self.assertGreaterEqual(last_d[1], 1)
-        self.assertLess(last_d[1], 1920)
+        self.assertGreaterEqual(last_d[1], 0)
+        self.assertLessEqual(last_d[1], 1920)
         self.assertGreater(last_d[3], 0)
-        self.assertEqual(last_d[1] + last_d[3], 1920)
+        self.assertLessEqual(last_d[1] + last_d[3], 1920)
 
     def test_reports_actual_assignment_order(self):
         """排列完成后必须回报「谁实际去了哪个角」。
@@ -265,20 +281,19 @@ class TestSnapFourQuad(unittest.TestCase):
         ok, placed = _run(list(self.WINS), [_Mon()], split_x=0.3,
                           readback={"A::1": (wl, wt, 480, 400)})
         self.assertTrue(ok)
-        # 右列起点应改成「实测左边 480 + 1」，而不是理想 col_w
-        right_x = 480 + 1
-        rw = ww - right_x
+        # 新语义：格子按 split_x 固定，左列被 App 顶宽不影响右列起点
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[0][0], wl)
+        self.assertEqual(cells[0][2], col_w)
+        self.assertEqual(cells[1][0], wl + col_w)
+        self.assertEqual(cells[1][2], ww - col_w)
+        # 右上窗口左缘贴在格子左边（不越格）
         last_b = [p for p in placed if p[0] == "B::1"][-1]
-        self.assertEqual(last_b[1], right_x)
-        self.assertEqual(last_b[3], rw)
-        # 关键：左右两列不能互相压盖
-        self.assertGreater(last_b[1], 480)
-        # 下排左列与实测左列同宽
-        last_c = [p for p in placed if p[0] == "C::1"][-1]
-        self.assertEqual(last_c[1], wl)
-        self.assertEqual(last_c[3], right_x - wl)
-        last_d = [p for p in placed if p[0] == "D::1"][-1]
-        self.assertEqual(last_d[1], right_x)
+        self.assertLessEqual(last_b[1], cells[1][0] + 8)
+        # 四个窗口都落在各自格子里
+        for (hwnd, x, y, w, h), (bx, by, bw, bh) in zip(placed, cells):
+            self.assertGreaterEqual(x, bx - 8)
+            self.assertLessEqual(x + w, bx + bw + 8)
 
     def test_all_four_stay_on_one_screen_when_rows_too_tall(self):
         """真机故障回归：屏装不下四格最小高度时，四个窗口必须仍留在同一屏。
@@ -297,21 +312,16 @@ class TestSnapFourQuad(unittest.TestCase):
         ok, placed = _run(list(self.WINS),
                           [_Mon(width=ww, height=wh)], min_sizes=mins)
         self.assertTrue(ok)
-        self.assertEqual(len(placed), 4)
+        # 新语义：格子严格四等分铺满；窗口 fit 进格子，被最小尺寸顶大时
+        # 方位贴边，底边绝不越出工作区（那是 macOS 搬屏的触发条件）
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[0], (wl, wt, ww // 2, wh // 2))
+        self.assertEqual(cells[2], (wl, wt + wh // 2, ww // 2, wh - wh // 2))
         for hwnd, x, y, w, h in placed:
             self.assertGreaterEqual(x, wl, "%s 越过工作区左边" % hwnd)
             self.assertGreaterEqual(y, wt, "%s 越过工作区顶边" % hwnd)
             self.assertLessEqual(x + w, wl + ww, "%s 越过工作区右边" % hwnd)
-            # 这条就是根因：越出底边的窗口会被 macOS 判给别的屏
             self.assertLessEqual(y + h, wt + wh, "%s 越过工作区底边" % hwnd)
-        # 下排必须保住自己的最小高度，否则窗口会被撑出屏幕
-        last_c = [p for p in placed if p[0] == "C::1"][-1]
-        last_d = [p for p in placed if p[0] == "D::1"][-1]
-        self.assertGreaterEqual(last_c[4], mins["C::1"][1])
-        self.assertGreaterEqual(last_d[4], mins["D::1"][1])
-        # 右列同样要留够最小宽度
-        last_b = [p for p in placed if p[0] == "B::1"][-1]
-        self.assertGreaterEqual(last_b[3], mins["B::1"][0])
 
     def test_row_shrinks_other_row_instead_of_overflowing(self):
         """一排被最小尺寸抬高时，另一排让出空间，不允许两侧叠加越界。"""
@@ -321,18 +331,24 @@ class TestSnapFourQuad(unittest.TestCase):
         ok, placed = _run(list(self.WINS),
                           [_Mon(width=ww, height=wh)], min_sizes=mins)
         self.assertTrue(ok)
-        for hwnd, _x, y, _w, h in placed:
+        # 新语义：格子铺满，窗口 fit 进格子；被最小尺寸顶大时方位贴边，
+        # 底边不得越出工作区（那是 macOS 搬屏的触发条件）
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[0], (0, 0, ww // 2, wh // 2))
+        self.assertEqual(cells[2], (0, wh // 2, ww // 2, wh - wh // 2))
+        for hwnd, x, y, w, h in placed:
             self.assertLessEqual(y + h, wh, "%s 越界" % hwnd)
-        last_c = [p for p in placed if p[0] == "C::1"][-1]
-        self.assertGreaterEqual(last_c[4], 200)
 
     def test_default_split_is_quarter(self):
         """默认 split_x/split_y = 0.5，与旧行为一致（四等分）。"""
         ok, placed = _run(list(self.WINS), [_Mon()])
         self.assertTrue(ok)
         # 上排两格等宽、左右列分界线正中间
-        self.assertEqual(placed[0][3], placed[1][3])
-        self.assertEqual(placed[0][1] + placed[0][3], placed[1][1])
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[0][2], cells[1][2])
+        self.assertEqual(cells[0][0] + cells[0][2], cells[1][0])
+        self.assertEqual(cells[0][2], 960)
+        self.assertEqual(cells[0][3], 540)
 
     def test_custom_split_changes_columns(self):
         """split_x 决定左右列宽：左窄右宽。"""
@@ -340,14 +356,14 @@ class TestSnapFourQuad(unittest.TestCase):
         self.assertTrue(ok)
         wl, _t, ww, _h = 0, 0, 1920, 1080
         col_w = int(round(ww * 0.3))
-        self.assertEqual(placed[0], ("A::1", wl, 0, col_w, 540))
-        self.assertEqual(placed[1],
-                         ("B::1", wl + col_w, 0, ww - col_w, 540))
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[0], (wl, 0, col_w, 540))
+        self.assertEqual(cells[1], (wl + col_w, 0, ww - col_w, 540))
         # 下排左列与上排左列同宽（左右两列对齐）
-        self.assertEqual(placed[2][1], wl)
-        self.assertEqual(placed[2][3], col_w)
-        self.assertEqual(placed[3][1], wl + col_w)
-        self.assertEqual(placed[3][3], ww - col_w)
+        self.assertEqual(cells[2][0], wl)
+        self.assertEqual(cells[2][2], col_w)
+        self.assertEqual(cells[3][0], wl + col_w)
+        self.assertEqual(cells[3][2], ww - col_w)
 
     def test_custom_split_changes_rows(self):
         """split_y 决定上下排高：上矮下高。"""
@@ -355,9 +371,10 @@ class TestSnapFourQuad(unittest.TestCase):
         self.assertTrue(ok)
         _wl, wt, _ww, wh = 0, 0, 1920, 1080
         row_h = int(round(wh * 0.35))
-        self.assertEqual(placed[0][2], wt)          # 上排贴顶
-        self.assertEqual(placed[0][4], row_h)
-        self.assertEqual(placed[2][2] > wt + row_h, True)
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[0][1], wt)          # 上排贴顶
+        self.assertEqual(cells[0][3], row_h)
+        self.assertEqual(cells[2][1], wt + row_h)
 
     def test_split_is_clamped(self):
         """比例贴边（0/1）时不许把某格压成几个像素。"""
@@ -366,12 +383,12 @@ class TestSnapFourQuad(unittest.TestCase):
             ok, placed = _run(list(self.WINS), [_Mon()], split_x=bad)
             self.assertTrue(ok)
             # 左列宽至少 15%（钳制下限），不会出现 0 宽
-            self.assertGreaterEqual(placed[0][3], int(ww * 0.15) - 1)
-            self.assertGreaterEqual(placed[1][3], int(ww * 0.15) - 1)
+            self.assertGreaterEqual(wm._last_quad_boxes[0][2], int(ww * 0.15) - 1)
+            self.assertGreaterEqual(wm._last_quad_boxes[1][2], int(ww * 0.15) - 1)
         for bad in (0.0, 1.0, -5, 99):
             ok, placed = _run(list(self.WINS), [_Mon()], split_y=bad)
             self.assertTrue(ok)
-            self.assertGreaterEqual(placed[0][4], int(wh * 0.15) - 1)
+            self.assertGreaterEqual(wm._last_quad_boxes[0][3], int(wh * 0.15) - 1)
 
 
 def _run_fill(wins, mons, **kw):

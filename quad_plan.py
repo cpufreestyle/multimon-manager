@@ -69,12 +69,10 @@ def plan_quad_smart(wins, work_w, work_h, min_ratio=0.15, max_ratio=0.85):
     for sx in _grid(sx_hint, lo, hi):
         for sy in _grid(sy_hint, lo, hi):
             for perm in itertools.permutations(wins):
-                # 四格的真实几何要带上各窗口的最小尺寸：格子比下限还小时，
-                # App 会把窗口撑出屏幕、被 macOS 搬到别的屏（见 grid_geometry）。
-                corner_mins = [(float(w.get("min_w") or 0),
-                                float(w.get("min_h") or 0)) for w in perm]
+                # 格子严格按比例铺满（与 windows 侧一致）：最小尺寸不抬格，
+                # 只通过 _fit_cost 的惩罚影响「谁去哪个角 / 用什么比例」。
                 c1, c2, r1, r2, ov_x, ov_y = grid_geometry(
-                    work_w, work_h, sx, sy, corner_mins)
+                    work_w, work_h, sx, sy)
                 sizes = ((c1, r1), (c2, r1), (c1, r2), (c2, r2))
                 cost = sum(_fit_cost(w, cw, ch)
                            for w, (cw, ch) in zip(perm, sizes))
@@ -125,44 +123,42 @@ def _fit_cost(win, cw, ch):
     if w <= 0 or h <= 0:
         # 尺寸未知：只按比例 1.0 估，不做面积惩罚
         return abs(cw / ch - 1.0)
-    min_w = float(win.get("min_w") or 0)
-    min_h = float(win.get("min_h") or 0)
     # 硬约束：格子至少要有窗口的 min_frac（宽和高各自都要达到）。
     # 达不到就直接判为「不合适」，成本抬到很高，让搜索主动避开这种切法。
+    # 判据用窗口当前尺寸，不用 App 最小尺寸：格子铺满语义下窗口 fit 进格子、
+    # 被 App 顶大是常态（由 reanchor 贴边处理），拿最小尺寸罚会把算法逼去
+    # 「把大窗口全塞进高排」的极端比例（真机实测 sy 被压到 0.2）。
     if cw < w * MIN_CELL_FRAC or ch < h * MIN_CELL_FRAC:
         return 100.0 + (w * MIN_CELL_FRAC - cw) / w + (h * MIN_CELL_FRAC - ch) / h
     ratio_pen = abs(cw / ch - w / h) / (w / h)
     area_pen = max(0.0, (w * h - cw * ch) / (w * h))
     cost = ratio_pen + area_pen
-    # 绝对下限（App 硬限制，实测值）：格子比下限还小时，系统会为了满足下限
-    # 把窗口撑出格子、越出屏幕，macOS 随即把整个窗口搬到别的屏。
-    # grid_geometry 已按下限抬高格子，这里再罚一次，兜住调用方没传下限的情况。
-    if min_w and cw < min_w:
-        cost += 100.0 + (min_w - cw) / min_w
-    if min_h and ch < min_h:
-        cost += 100.0 + (min_h - ch) / min_h
     return cost
 
 
-def fit_frame(win, cw, ch):
+def fit_frame(win, cw, ch, corner=0):
     """窗口等比缩放进格子后，在格子里占的相对框 (rx, ry, rw, rh)。
 
     这是 Moom 的 Relative Frame 语义：窗口放进格子不变形、也不被拉伸到
-    格子大小，而是取「能塞进格子的最大等比尺寸」，在格子里居中。
+    格子大小，而是取「能塞进格子的最大等比尺寸」。位置贴方位：
+    corner=0 左上 / 1 右上 / 2 左下 / 3 右下，窗口落在格子的对应角。
     返回的四个值都是 0~1（相对格子，不是相对屏幕）；调用方再叠加格子
     在工作区中的位置即可得到最终矩形。
 
-    格子比窗口还小时 scale > 1：此时窗口被放大到格子内（App 的最小尺寸
-    会把它顶回来，但那由 set_window_rect 的闭环处理）。
+    只缩小、不放大小窗口（100x100 放大 5.4 倍填满格子很离谱）。
     """
     w = float(win.get("w") or 0)
     h = float(win.get("h") or 0)
     if w <= 0 or h <= 0 or cw <= 0 or ch <= 0:
         return (0.0, 0.0, 1.0, 1.0)
-    scale = min(cw / w, ch / h)
+    # 位置贴方位而不是居中：左上格贴左上、右上格贴右上、左下贴左下、
+    # 右下贴右下。小窗口（不放大时）落在格子的对应角，符合方位直觉。
+    scale = min(1.0, cw / w, ch / h)
+    anchor_x = 1.0 if corner in (1, 3) else 0.0
+    anchor_y = 1.0 if corner in (2, 3) else 0.0
     fw, fh = w * scale, h * scale
-    return (round((cw - fw) / (2.0 * cw), 6),
-            round((ch - fh) / (2.0 * ch), 6),
+    return (round((cw - fw) * anchor_x / cw, 6),
+            round((ch - fh) * anchor_y / ch, 6),
             round(fw / cw, 6),
             round(fh / ch, 6))
 
