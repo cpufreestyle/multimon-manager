@@ -40,6 +40,10 @@ VK_DOWN = 0x28
 VK_Z = ord("z")
 # B 键（回到上次摆放位）
 VK_B = ord("b")
+# S 键（暂存窗口）
+VK_S = ord("s")
+# D 键（取回暂存窗口）
+VK_D = ord("d")
 
 # 数字键 1-9 的 Windows 虚拟键码（与 ASCII 一致，如 "1" = 0x31）。
 DIGIT_KEYS = {d: ord(str(d)) for d in range(10)}

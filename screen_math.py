@@ -9,6 +9,8 @@
    不允许把窗口摆到屏幕外（否则 macOS 会把它搬到主屏）。
 """
 
+import sys
+
 
 def rect_intersection_area(a, b):
     """两个矩形 (x, y, w, h) 的交集面积；不相交返回 0。"""
@@ -98,6 +100,95 @@ def best_work_for_rect(monitors, x, y, w, h):
     idx = monitor_index_by_intersection(monitors, x, y, w, h)
     m = monitors[idx] if idx < len(monitors) else monitors[0]
     return (m.work_left, m.work_top, m.work_width, m.work_height)
+
+
+def adjacent_monitor_index(monitors, cur_idx, direction, ignore=None):
+    """按几何邻接关系找「左边/右边」的显示器。
+
+    Rectangle Pro 的 AdjacentScreens 做法：两块屏算邻接，看的是它们在某个
+    方向上的投影是否重叠、以及沿该方向的距离；不是按下标顺序循环。三块屏
+    摆成 L 形时，右下角的屏往右没有邻居，下标顺序却会绕回左上角那块——
+    用户看到的就是「往右移却跑到了上面」。
+
+    direction: -1 左 / 1 右（也接受 "left"/"right"）。
+    ignore: 要跳过的索引集合（例如竖屏不参与左右邻接）。
+    找不到邻居时返回 None，由调用方决定是否退化成下标循环。
+    """
+    if not monitors or not (0 <= cur_idx < len(monitors)):
+        return None
+    if direction in ("left", -1):
+        direction = -1
+    else:
+        direction = 1
+    cur = monitors[cur_idx]
+    # 当前屏沿该方向的「出发边」
+    cur_a = cur.left if direction < 0 else cur.left + cur.width
+    cur_lo, cur_hi = cur.top, cur.top + cur.height
+    skip = set(ignore or ())
+    best_idx, best_gap = None, None
+    for i, m in enumerate(monitors):
+        if i == cur_idx or i in skip:
+            continue
+        m_lo, m_hi = m.top, m.top + m.height
+        # 沿运动方向的投影必须重叠，否则是上下前后的邻居，不算左右相邻
+        overlap = min(cur_hi, m_hi) - max(cur_lo, m_lo)
+        if overlap <= 0:
+            continue
+        edge = m.left + m.width if direction < 0 else m.left
+        gap = (cur_a - edge) if direction < 0 else (edge - cur_a)
+        if gap < -1:
+            continue  # 在反方向，不算
+        if best_gap is None or gap < best_gap:
+            best_idx, best_gap = i, gap
+    return best_idx
+
+
+def display_uuids(monitors):
+    """取每块显示器的稳定 UUID（macOS；其它平台返回空 dict）。
+
+    Rectangle Pro 用 CGDisplayCreateUUIDFromDisplayID 做布局绑定：UUID 比
+    分辨率指纹稳得多——两台同为 1920x1080 的显示器插在不同的位置，指纹
+    无法区分，UUID 可以；重启 / 重插后 UUID 不变，指纹却可能因排列变化而变。
+
+    monitors 需带 device_path（CG display id 字符串）。取不到 UUID 的屏
+    （非 macOS / API 缺失）直接不进字典，调用方按「没有 UUID」处理。
+    """
+    out = {}
+    if sys.platform != "darwin" or not monitors:
+        return out
+    try:
+        import ctypes
+        import ctypes.util
+        lib = ctypes.CDLL(
+            "/System/Library/Frameworks/ApplicationServices.framework/"
+            "ApplicationServices")
+        cf = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/"
+            "CoreFoundation")
+        lib.CGDisplayCreateUUIDFromDisplayID.restype = ctypes.c_void_p
+        lib.CGDisplayCreateUUIDFromDisplayID.argtypes = [ctypes.c_uint32]
+        cf.CFUUIDCreateString.restype = ctypes.c_void_p
+        cf.CFUUIDCreateString.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFStringGetCString.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+    except Exception:  # noqa: BLE001
+        return out
+    for m in monitors:
+        try:
+            did = int(str(getattr(m, "device_path", "")).strip())
+        except (TypeError, ValueError):
+            continue
+        ref = lib.CGDisplayCreateUUIDFromDisplayID(did)
+        if not ref:
+            continue
+        s = cf.CFUUIDCreateString(None, ctypes.c_void_p(ref))
+        if not s:
+            continue
+        buf = ctypes.create_string_buffer(128)
+        if cf.CFStringGetCString(ctypes.c_void_p(s), buf, 128, 0x08000100):
+            out[m.device_path] = buf.value.decode("utf-8", "replace")
+    return out
 
 
 # 吸附方位 -> 该方位必须贴住的那条边。App 的最小/固定尺寸把窗口钳小时，

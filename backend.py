@@ -41,8 +41,10 @@ try:
     VK_DOWN = hotkeys.VK_DOWN
     VK_Z = hotkeys.VK_Z
     VK_B = getattr(hotkeys, "VK_B", 0)
+    VK_S = getattr(hotkeys, "VK_S", 0)
+    VK_D = getattr(hotkeys, "VK_D", 0)
 except Exception:  # noqa: BLE001
-    VK_LEFT = VK_RIGHT = VK_UP = VK_DOWN = VK_Z = VK_B = 0
+    VK_LEFT = VK_RIGHT = VK_UP = VK_DOWN = VK_Z = VK_B = VK_S = VK_D = 0
 
 MOD_ALT = getattr(hotkeys, "MOD_ALT", 1)
 MOD_CONTROL = getattr(hotkeys, "MOD_CONTROL", 2)
@@ -76,6 +78,9 @@ DragSnapWatcher = dragsnap.DragSnapWatcher
 register_display_callback = display_notify.register
 # 撤销上一次窗口移动（F7）
 undo_last_move = windows.undo_last_move
+# 窗口暂存（复刻 Rectangle Pro 的 Stash）
+stash_active = getattr(windows, "stash_active", lambda *a, **k: False)
+unstash_first = getattr(windows, "unstash_first", lambda *a, **k: (None, False))
 # 回到上次被程序摆好的位置（第二层撤销；Moom 的 snap back 思路）
 return_to_last_arranged = getattr(windows, "return_to_last_arranged", None)
 # snap() 最近一次实测报告：[(hwnd, want, got)]，UI 据此提示「被应用钳制」

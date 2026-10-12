@@ -476,6 +476,66 @@ class App:
         msg = "已回到上次摆放位" if ok else "该窗口没有被程序摆放过"
         self.root.after(0, lambda m=msg: self.status_var.set(m))
 
+    def _stash_active_shortcut(self):
+        """快捷键版暂存：作用于当前活动窗口。"""
+        if getattr(b, "stash_active", None) is None:
+            return
+        try:
+            ok = b.stash_active(use_pinned=False)
+        except Exception:  # noqa: BLE001
+            ok = False
+        msg = ("已暂存到屏幕顶边（⌘⌥+D 取回）" if ok
+               else "暂存失败：没有可操作的活动窗口")
+        self.root.after(0, lambda m=msg: self.status_var.set(m))
+
+    def _unstash_active_shortcut(self):
+        """快捷键版取回：取回最早暂存的窗口。"""
+        if getattr(b, "unstash_first", None) is None:
+            return
+        try:
+            hwnd, ok = b.unstash_first()
+        except Exception:  # noqa: BLE001
+            ok, hwnd = False, None
+        if ok:
+            msg = "已取回最早暂存的窗口，位置尺寸原样恢复"
+        elif hwnd is None:
+            msg = "暂存列表是空的（或最早的窗口已关闭）"
+        else:
+            msg = "取回失败：窗口可能已关闭"
+        self.root.after(0, lambda m=msg: self.status_var.set(m))
+
+    def _stash_action(self):
+        """暂存目标窗口到屏幕顶边。"""
+        if getattr(b, "stash_active", None) is None:
+            self.status_var.set("当前平台暂不支持暂存窗口")
+            return
+        try:
+            ok = b.stash_active(use_pinned=True)
+        except Exception as e:  # noqa: BLE001
+            self.status_var.set(f"暂存失败：{e}")
+            return
+        if ok:
+            self.status_var.set("已暂存到屏幕顶边（「取回」可还原，快捷键 ⌘⌥+D）")
+        else:
+            self.status_var.set("暂存失败：请先在「目标窗口」选择一个窗口")
+
+    def _unstash_action(self):
+        """取回最早暂存的窗口。"""
+        if getattr(b, "unstash_first", None) is None:
+            self.status_var.set("当前平台暂不支持取回窗口")
+            return
+        try:
+            hwnd, ok = b.unstash_first()
+        except Exception as e:  # noqa: BLE001
+            self.status_var.set(f"取回失败：{e}")
+            return
+        if ok:
+            self.status_var.set("已取回最早暂存的窗口，位置尺寸原样恢复")
+        elif hwnd is None:
+            self.status_var.set("暂存列表是空的（或最早的窗口已关闭）")
+        else:
+            self.status_var.set("取回失败：窗口可能已关闭")
+
     def _snap_btn(self, zone):
         """吸附按钮的统一入口：摆完后在状态栏如实报告钳制情况。
 
@@ -606,6 +666,19 @@ class App:
         self._tooltip(back_btn,
                       "把目标窗口送回上次被本程序摆好的位置"
                       "（窗口被拖乱后一键归位）")
+        # 暂存 / 取回（复刻 Rectangle Pro 的 Stash）：把不用的窗口收到屏幕顶边，
+        # 再按一次取回最早那个，位置尺寸原样恢复。
+        stash_btn = ttk.Button(snap_rows[1], text="暂存",
+                               command=self._stash_action)
+        stash_btn.pack(side="left", padx=(8, 1))
+        self._tooltip(stash_btn,
+                      "把目标窗口收到当前屏幕顶边（只露一小条），"
+                      "位置尺寸会记住，之后用「取回」还原（快捷键 ⌘⌥+S）")
+        unstash_btn = ttk.Button(snap_rows[1], text="取回",
+                                 command=self._unstash_action)
+        unstash_btn.pack(side="left", padx=1)
+        self._tooltip(unstash_btn,
+                      "取回最早暂存的窗口到它原来的位置（快捷键 ⌘⌥+D）")
         # 窗口间距：吸附/排列时窗口之间、窗口与屏幕边之间留出缝隙。
         # 借鉴 Rectangle Pro 的 GapCalculation：间距一是让四格清清楚楚分开，
         # 二是吸收 App 最小尺寸把窗口顶大时的溢出，避免立刻越界被搬屏。
@@ -2069,7 +2142,12 @@ class App:
             except Exception:  # noqa: BLE001
                 pass
             data.append(item)
-        layouts.save_layout(name, data, monitor_sig=self._monitor_signature())
+        # 同时存分辨率指纹与显示器 UUID：指纹用于「配置整体变化」的粗判，
+        # UUID 用于精确认出「这块屏还是原来那块」（两台同分辨率也能区分）。
+        layouts.save_layout(name, data,
+                            monitor_sig=self._monitor_signature(),
+                            monitor_uuids=screen_math.display_uuids(
+                                list(self.monitors or [])))
         self._refresh_layout_list()
         self.layout_var.set(name)
         s = settings.load()
@@ -2088,6 +2166,27 @@ class App:
                     != tuple(tuple(item) for item in current))
         except Exception:  # noqa: BLE001
             return False
+
+    def _layout_uuid_matched(self, name):
+        """按显示器 UUID 判断「保存时的屏现在是否都还在」。
+
+        返回 (matched, saved, current)：
+          matched=True 表示每块保存过的屏都能按 UUID 找到，可以按绝对坐标
+          精确还原——这是 UUID 绑定比分辨率指纹强的地方：两台同为 1920x1080
+          的屏换个位置，指纹说「变了」，UUID 说「还是那两块」。
+        保存时没有 UUID（老方案 / 非 macOS）时 matched=False。
+        """
+        saved = layouts.monitor_uuids(name)
+        if not saved:
+            return (False, None, None)
+        current = screen_math.display_uuids(list(self.monitors or []))
+        if not current:
+            return (False, saved, None)
+        cur_by_uuid = {v: k for k, v in current.items()}
+        for _path, u in saved.items():
+            if u not in cur_by_uuid:
+                return (False, saved, current)
+        return (True, saved, current)
 
     def _apply_layout(self):
         self._apply_layout_by_name(self.layout_var.get())
@@ -2108,10 +2207,13 @@ class App:
         monitors_now = list(self.monitors or [])
         if self._layout_monitor_changed(name):
             layouts.apply_relative_frames(name, monitors_now)
+        # UUID 能对上时按绝对坐标还原（最精确）；对不上才走相对框重映射。
+        uuid_ok, _saved_u, _cur_u = self._layout_uuid_matched(name)
         has_rel = any(isinstance(w.get("rel"), (list, tuple)) and len(w.get("rel")) == 4
                       for w in layout.get("windows", [])
                       if isinstance(w, dict))
-        if self._layout_monitor_changed(name) and not has_rel:
+        changed = self._layout_monitor_changed(name)
+        if changed and not has_rel and not uuid_ok:
             if not silent:
                 self.show()   # 托盘触发时主窗口可能已隐藏，弹窗前先亮出来
                 if not messagebox.askyesno(
@@ -2121,6 +2223,10 @@ class App:
                         "还原后窗口位置可能不在预期的屏幕上。\n\n仍要继续吗？"):
                     self.status_var.set("已取消：显示器配置与布局保存时不一致")
                     return False
+        if changed and uuid_ok and not silent:
+            # 指纹变了但 UUID 对得上：不弹警告，按绝对坐标还原
+            self.status_var.set(
+                f"布局「{name}」：显示器排列有变，但 UUID 匹配，按原坐标还原")
         ok, miss = 0, 0
         current = {w["hwnd"]: w["owner"] for w in b.list_target_windows()}
         adapt_n = 0
@@ -3802,6 +3908,7 @@ class App:
                 f"{sym}+1/2/3/4 : 左/右/上/下半屏\n"
                 f"{sym}+5/6 : 最大化 / 居中\n"
                 f"{sym}+Z : 撤销上一次移动 · {sym}+B : 回到上次摆放位\n"
+                f"{sym}+S : 暂存窗口 · {sym}+D : 取回最早暂存的窗口\n"
                 f"{sym}+7/8/9 : 三分屏（左/中/右）\n"
                 f"{sym}+Shift+1/2/3/4 : 四象限（左上/右上/左下/右下）")
 
@@ -3877,6 +3984,11 @@ class App:
                 # ⌘⌥+B：活动窗口回到上次被程序摆好的位置（snap back）
                 self.hk.register(mods, getattr(b, "VK_B", 0),
                                  lambda: self._back_to_active_arranged())
+                # ⌘⌥+S：暂存活动窗口；⌘⌥+D：取回最早暂存的窗口
+                self.hk.register(mods, getattr(b, "VK_S", 0),
+                                 lambda: self._stash_active_shortcut())
+                self.hk.register(mods, getattr(b, "VK_D", 0),
+                                 lambda: self._unstash_active_shortcut())
                 # 四象限：修饰键+Shift+数字 1-4（左上/右上/左下/右下）
                 for vk, zone in ((dk[1], "quad-tl"), (dk[2], "quad-tr"),
                                  (dk[3], "quad-bl"), (dk[4], "quad-br")):

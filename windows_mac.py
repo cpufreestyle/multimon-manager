@@ -152,6 +152,10 @@ _GAP_ZONES = {
     "quad-tr": (1, 0, 0, 1),
     "quad-bl": (0, 1, 1, 0),
     "quad-br": (1, 1, 0, 0),
+    # 水平三分屏：横屏直接用；竖屏上 portrait_zone 会把左右三分旋转成这三项
+    "top-third": (0, 0, 1, 1),
+    "middle-third-h": (0, 1, 1, 1),
+    "bottom-third": (0, 1, 1, 0),
 }
 
 
@@ -205,6 +209,32 @@ def gap_rect(zone, x, y, w, h, work_left, work_top, work_width, work_height):
     if nw < 1 or nh < 1:
         return (x, y, w, h)
     return (nx, ny, nw, nh)
+
+
+# 竖屏上自动旋转成水平切分的方位（Rectangle Pro 的 OrientationAware /
+# PortraitSideThirdsCompoundCalculation：竖屏三分屏改为横向三等分）。
+_PORTRAIT_ZONES = {
+    "left": "top",             # 左半屏 -> 上半屏
+    "right": "bottom",         # 右半屏 -> 下半屏
+    "top": "left",
+    "bottom": "right",
+    "left-third": "top-third",
+    "middle-third": "middle-third",
+    "right-third": "bottom-third",
+    "top-third": "left-third",
+    "bottom-third": "right-third",
+}
+
+
+def portrait_zone(zone, work_width, work_height):
+    """竖屏上把方位旋转 90 度；横屏原样返回。
+
+    竖屏（高 > 宽）上左右切分只会得到两条窄条，上下切分才符合视觉。
+    输入 work_width/work_height 用于判断朝向，无需额外传显示器对象。
+    """
+    if work_height <= work_width:
+        return zone
+    return _PORTRAIT_ZONES.get(zone, zone)
 _undo_lock = threading.Lock()
 _suppress_undo = False
 # 「上次摆放位」记忆（Moom 的 Last Moom Frame 思路）：窗口被本程序摆过
@@ -1041,6 +1071,8 @@ def move_to_monitor(hwnd, monitor, activate=True):
 def snap(hwnd, monitor, zone, activate=True):
     wl, wt, ww, wh = monitor.work_rect
     _x, _y, w, h = get_window_rect(hwnd)
+    # 竖屏自动旋转方位（Rectangle Pro 的 OrientationAware）
+    zone = portrait_zone(zone, ww, wh)
     targets = {
         "left": (wl, wt, ww // 2, wh),
         "right": (wl + ww // 2, wt, ww - ww // 2, wh),
@@ -1051,6 +1083,9 @@ def snap(hwnd, monitor, zone, activate=True):
         "left-third": (wl, wt, ww // 3, wh),
         "middle-third": (wl + ww // 3, wt, ww // 3, wh),
         "right-third": (wl + 2 * (ww // 3), wt, ww - 2 * (ww // 3), wh),
+        "top-third": (wl, wt, ww, wh // 3),
+        "middle-third-h": (wl, wt + wh // 3, ww, wh // 3),
+        "bottom-third": (wl, wt + 2 * (wh // 3), ww, wh - 2 * (wh // 3)),
         "quad-tl": (wl, wt, ww // 2, wh // 2),
         "quad-tr": (wl + ww // 2, wt, ww - ww // 2, wh // 2),
         "quad-bl": (wl, wt + wh // 2, ww // 2, wh - wh // 2),
@@ -2029,8 +2064,15 @@ def move_active_to_next_monitor(direction=1, use_pinned=True, activate=True):
         logger.warning("未找到可操作的前台窗口（可能只剩本程序自己）")
         return
     idx = _monitor_by_relative(ms, hwnd)
-    n = len(ms)
-    nxt = (idx + direction) % n
+    # 优先按几何邻接找左右屏（Rectangle Pro 的 AdjacentScreens）：三块屏摆成
+    # L 形时下标循环会把「往右移」绕到上面的屏，几何邻接才不会。
+    # 竖屏不参与左右邻接（用户明确要求不适合竖屏的窗口不发到竖屏）；
+    # 找不到几何邻居时才退化成下标循环，保证总有反应。
+    ignore = {i for i, m in enumerate(ms) if m.height > m.width}
+    nxt = screen_math.adjacent_monitor_index(ms, idx, direction, ignore=ignore)
+    if nxt is None:
+        n = len(ms)
+        nxt = (idx + direction) % n
     move_to_monitor(hwnd, ms[nxt], activate=activate)
 
 
@@ -2049,6 +2091,59 @@ def snap_active(zone, use_pinned=True, activate=True):
         return
     idx = _monitor_by_relative(ms, hwnd)
     snap(hwnd, ms[idx], zone, activate=activate)
+
+
+def stash_active(use_pinned=True, activate=False):
+    """把当前/目标窗口暂存到屏幕顶边（复刻 Rectangle Pro 的 Stash）。
+
+    返回 True 表示已暂存。已经暂存过的窗口不重复登记。
+    """
+    import stash
+    ms = monitors.enum_monitors()
+    if not ms:
+        return False
+    hwnd = get_foreground_window(use_pinned=use_pinned)
+    if not hwnd:
+        logger.warning("暂存：未找到可操作的前台窗口")
+        return False
+    if any(i.get("hwnd") == hwnd for i in stash.list_stashed()):
+        logger.info("暂存：%s 已在暂存列表，跳过", hwnd)
+        return False
+    x, y, w, h = get_window_rect(hwnd)
+    if not (x or y or w or h):
+        return False
+    idx = _monitor_by_relative(ms, hwnd)
+    sx, sy, sw, sh = stash.stash_rect(ms[idx])
+    set_window_rect(hwnd, sx, sy, sw, sh, activate=activate)
+    stash.push({"hwnd": hwnd, "owner": hwnd.split("::")[0],
+                "x": x, "y": y, "w": w, "h": h})
+    logger.info("已暂存 %s（原位 %s）", hwnd, (x, y, w, h))
+    return True
+
+
+def unstash_first(activate=False):
+    """取回最早暂存的窗口到它原来的位置（FIFO）。
+
+    返回 (hwnd, True) 或 (None, False)。窗口已关闭时返回 None。
+    """
+    import stash
+    item = stash.pop()
+    if not item:
+        return (None, False)
+    hwnd = item.get("hwnd")
+    if not hwnd:
+        return (None, False)
+    if _find_window(hwnd) is None:
+        logger.info("取回：%s 已关闭，跳过", hwnd)
+        return (None, False)
+    try:
+        set_window_rect(hwnd, item["x"], item["y"], item["w"], item["h"],
+                        activate=activate)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("取回 %s 失败: %s", hwnd, e)
+        return (hwnd, False)
+    logger.info("已取回 %s -> %s", hwnd, (item["x"], item["y"], item["w"], item["h"]))
+    return (hwnd, True)
 
 
 if __name__ == "__main__":

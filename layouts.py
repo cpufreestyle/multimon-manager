@@ -29,7 +29,7 @@ def load_layout(name):
     return _load().get(name)
 
 
-def save_layout(name, windows, monitor_sig=None):
+def save_layout(name, windows, monitor_sig=None, monitor_uuids=None):
     """保存（覆盖）一个名为 name 的布局方案。
 
     windows: [{"hwnd", "owner", "name", "x", "y", "w", "h"}, ...]
@@ -41,10 +41,17 @@ def save_layout(name, windows, monitor_sig=None):
         rel = w.get("rel")
         if not (isinstance(rel, (list, tuple)) and len(rel) == 4):
             w.pop("rel", None)
+    # 显示器 UUID 映射（device_path -> uuid）：比分辨率指纹稳，两台同为
+    # 1920x1080 的屏插在不同位置时指纹分不清，UUID 可以；重启/重插后 UUID
+    # 不变，指纹却可能因排列变化而变。Rectangle Pro 用同一 API 做布局绑定。
+    uuids = None
+    if monitor_uuids:
+        uuids = {str(k): str(v) for k, v in monitor_uuids.items()}
     data[name] = {
         "windows": windows,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
         "monitor_sig": [list(item) for item in monitor_sig] if monitor_sig else None,
+        "monitor_uuids": uuids,
     }
     _save(data)
 
@@ -101,6 +108,17 @@ def monitor_signature(name):
     sig = layout.get("monitor_sig")
     if isinstance(sig, list) and sig:
         return sig
+    return None
+
+
+def monitor_uuids(name):
+    """返回方案保存时的 {device_path: uuid}；老方案没有该字段时返回 None。"""
+    layout = _load().get(name)
+    if not isinstance(layout, dict):
+        return None
+    u = layout.get("monitor_uuids")
+    if isinstance(u, dict) and u:
+        return u
     return None
 
 
