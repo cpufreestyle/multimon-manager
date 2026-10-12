@@ -28,6 +28,13 @@ TASKBAR_POS = {"底部": "bottom", "顶部": "top"}
 TRIG_EVENT_KEY = {v: k for k, v in triggers.EVENT_LABELS.items()}
 TRIG_ACTION_KEY = {v: k for k, v in triggers.ACTION_LABELS.items()}
 ZONE_KEY = {v: k for k, v in rules.ZONE_LABELS.items()}
+# 吸附方位 -> 状态栏短文案
+_SNAP_ZONE_LABELS = {
+    "left": "左半屏", "right": "右半屏", "top": "上半屏", "bottom": "下半屏",
+    "maximize": "整屏", "center": "居中",
+    "left-third": "左1/3", "middle-third": "中1/3", "right-third": "右1/3",
+    "quad-tl": "左上角", "quad-tr": "右上角", "quad-bl": "左下角", "quad-br": "右下角",
+}
 
 VK_LEFT = b.VK_LEFT
 VK_UP = b.VK_UP
@@ -469,6 +476,43 @@ class App:
         msg = "已回到上次摆放位" if ok else "该窗口没有被程序摆放过"
         self.root.after(0, lambda m=msg: self.status_var.set(m))
 
+    def _snap_btn(self, zone):
+        """吸附按钮的统一入口：摆完后在状态栏如实报告钳制情况。
+
+        App 的最小/固定尺寸会吃掉一部分吸附请求（真机 UU远程固定 921x680、
+        CrossPaste 固定 600x700），windows 层已把该贴的边重新钉到边界上，
+        这里把实测几何与目标格子的差值报给用户，避免「点了没反应」的错觉。
+        """
+        def run():
+            try:
+                b.snap_active(zone, activate=False)
+                self._report_snap_status(zone)
+            finally:
+                self._keep_front()
+        return run
+
+    def _report_snap_status(self, zone):
+        report = getattr(b, "last_snap_report", None) or []
+        if not report:
+            return
+        hwnd, want, got = report[-1]
+        app = (hwnd or "").split("::")[0] or "窗口"
+        label = _SNAP_ZONE_LABELS.get(zone, zone)
+        if got is None:
+            self.status_var.set(f"吸附「{app}」到{label}失败：读不到窗口几何")
+            return
+        gx, gy, gw, gh = got
+        tx, ty, tw, th = want
+        dev = max(abs(g - t) for g, t in zip((gx, gy, gw, gh), (tx, ty, tw, th)))
+        if dev <= 2:
+            # 与 set_window_rect 的收敛容差一致：2px 内视为完全贴合，
+            # 不用「被钳制」的文案吓用户
+            self.status_var.set(f"已吸附「{app}」到{label}，与目标一致")
+            return
+        self.status_var.set(
+            f"已吸附「{app}」到{label}：该贴的边已贴住；"
+            f"应用把尺寸钳制为 {gw}×{gh}（与目标差 {dev}px）")
+
     def _build_window_tools(self, parent):
         f = ttk.LabelFrame(parent, text="窗口工具")
         f.pack(fill="x", padx=8, pady=6)
@@ -503,31 +547,31 @@ class App:
              "把目标窗口按相对位置移到上一块显示器"),
             ("移到下一屏", lambda: b.move_active_to_next_monitor(1, activate=False),
              "把目标窗口按相对位置移到下一块显示器"),
-            ("左半", lambda: b.snap_active("left", activate=False),
+            ("左半", self._snap_btn("left"),
              "目标窗口贴到当前屏幕的左半屏"),
-            ("右半", lambda: b.snap_active("right", activate=False),
+            ("右半", self._snap_btn("right"),
              "目标窗口贴到当前屏幕的右半屏"),
-            ("上半", lambda: b.snap_active("top", activate=False),
+            ("上半", self._snap_btn("top"),
              "目标窗口贴到当前屏幕的上半屏"),
-            ("下半", lambda: b.snap_active("bottom", activate=False),
+            ("下半", self._snap_btn("bottom"),
              "目标窗口贴到当前屏幕的下半屏"),
-            ("最大化", lambda: b.snap_active("maximize", activate=False),
+            ("最大化", self._snap_btn("maximize"),
              "目标窗口铺满当前屏幕的工作区"),
-            ("居中", lambda: b.snap_active("center", activate=False),
+            ("居中", self._snap_btn("center"),
              "目标窗口在当前屏幕居中，尺寸不变"),
-            ("左1/3", lambda: b.snap_active("left-third", activate=False),
+            ("左1/3", self._snap_btn("left-third"),
              "目标窗口占当前屏幕左三分之一"),
-            ("中1/3", lambda: b.snap_active("middle-third", activate=False),
+            ("中1/3", self._snap_btn("middle-third"),
              "目标窗口占当前屏幕中间三分之一"),
-            ("右1/3", lambda: b.snap_active("right-third", activate=False),
+            ("右1/3", self._snap_btn("right-third"),
              "目标窗口占当前屏幕右三分之一"),
-            ("左上", lambda: b.snap_active("quad-tl", activate=False),
+            ("左上", self._snap_btn("quad-tl"),
              "目标窗口占当前屏幕左上角四分之一"),
-            ("右上", lambda: b.snap_active("quad-tr", activate=False),
+            ("右上", self._snap_btn("quad-tr"),
              "目标窗口占当前屏幕右上角四分之一"),
-            ("左下", lambda: b.snap_active("quad-bl", activate=False),
+            ("左下", self._snap_btn("quad-bl"),
              "目标窗口占当前屏幕左下角四分之一"),
-            ("右下", lambda: b.snap_active("quad-br", activate=False),
+            ("右下", self._snap_btn("quad-br"),
              "目标窗口占当前屏幕右下角四分之一"),
         ]
         # 窗口置顶切换（当前仅 Windows 提供实现，其它平台自动隐藏入口）

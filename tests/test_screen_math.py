@@ -79,6 +79,50 @@ class TestClampToWork(unittest.TestCase):
                                                -53, -900, 1600, 900)
         self.assertEqual(y + h, -900 + 900)
 
+
+class TestReanchorEdge(unittest.TestCase):
+    """App 钳制尺寸后，吸附方位该贴的边必须仍贴住工作区边界。"""
+
+    def test_right_zone_hugs_right_edge(self):
+        # UU远程固定 921 宽 > 半屏 756：右缘应贴住 1512，而不是停在 756 悬空
+        ax, ay = screen_math.reanchor_edge(
+            "right", 756, 33, 921, 680, 0, 33, 1512, 949)
+        self.assertEqual((ax, ay), (1512 - 921, 33))
+
+    def test_bottom_zone_hugs_bottom_edge(self):
+        # 高度被钳到 680 < 949：底缘应贴住 982
+        ax, ay = screen_math.reanchor_edge(
+            "bottom", 0, 482, 600, 680, 0, 33, 1512, 949)
+        self.assertEqual((ax, ay), (0, 33 + 949 - 680))
+
+    def test_left_zone_keeps_position(self):
+        # 左侧方位本来就贴左：钳制后位置不动
+        ax, ay = screen_math.reanchor_edge(
+            "left", 0, 33, 921, 680, 0, 33, 1512, 949)
+        self.assertEqual((ax, ay), (0, 33))
+
+    def test_maximize_pins_origin(self):
+        ax, ay = screen_math.reanchor_edge(
+            "maximize", 10, 60, 1500, 900, 0, 33, 1512, 949)
+        self.assertEqual((ax, ay), (0, 33))
+
+    def test_quad_br_hugs_both_edges(self):
+        ax, ay = screen_math.reanchor_edge(
+            "quad-br", 756, 508, 921, 680, 0, 33, 1512, 949)
+        self.assertEqual(ax, 1512 - 921)
+        self.assertEqual(ay, 33 + 949 - 680)
+
+    def test_middle_third_centers(self):
+        ax, ay = screen_math.reanchor_edge(
+            "middle-third", 504, 33, 900, 949, 0, 33, 1512, 949)
+        self.assertEqual((ax, ay), ((1512 - 900) // 2, 33))
+
+    def test_wider_than_screen_falls_back_to_left(self):
+        # 窗口比工作区还宽：再钉右缘会把左缘推出屏外，退回贴左
+        ax, ay = screen_math.reanchor_edge(
+            "right", 756, 33, 1600, 680, 0, 33, 1512, 949)
+        self.assertEqual((ax, ay), (0, 33))
+
     def test_zero_work_area_is_noop(self):
         self.assertEqual(screen_math.clamp_to_work(5, 5, 100, 100, 0, 0, 0, 0),
                          (5, 5, 100, 100))

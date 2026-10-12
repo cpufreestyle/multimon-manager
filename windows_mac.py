@@ -39,6 +39,10 @@ _suppress_undo = False
 _last_arranged = {}
 _last_arranged_lock = threading.Lock()
 
+# snap() 最近一次的实测报告：[(hwnd, want, got)]，供 UI 状态栏如实提示
+# 「被应用最小/固定尺寸钳制，贴的是哪条边」。
+_last_snap_report = []
+
 
 def push_undo(hwnd, rect):
     """记录一次移动前几何（hwnd, (x, y, w, h)）；保留最近 20 步。"""
@@ -859,35 +863,44 @@ def move_to_monitor(hwnd, monitor, activate=True):
 def snap(hwnd, monitor, zone, activate=True):
     wl, wt, ww, wh = monitor.work_rect
     _x, _y, w, h = get_window_rect(hwnd)
-    if zone == "left":
-        set_window_rect(hwnd, wl, wt, ww // 2, wh, activate=activate)
-    elif zone == "right":
-        set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh, activate=activate)
-    elif zone == "top":
-        set_window_rect(hwnd, wl, wt, ww, wh // 2, activate=activate)
-    elif zone == "bottom":
-        set_window_rect(hwnd, wl, wt + wh // 2, ww, wh - wh // 2, activate=activate)
-    elif zone == "maximize":
-        set_window_rect(hwnd, wl, wt, ww, wh, activate=activate)
-    elif zone == "center":
-        set_window_rect(hwnd, wl + (ww - w) // 2, wt + (wh - h) // 2, w, h,
-                        activate=activate)
-    elif zone == "left-third":
-        set_window_rect(hwnd, wl, wt, ww // 3, wh, activate=activate)
-    elif zone == "middle-third":
-        set_window_rect(hwnd, wl + ww // 3, wt, ww // 3, wh, activate=activate)
-    elif zone == "right-third":
-        set_window_rect(hwnd, wl + 2 * (ww // 3), wt, ww - 2 * (ww // 3), wh,
-                        activate=activate)
-    elif zone == "quad-tl":
-        set_window_rect(hwnd, wl, wt, ww // 2, wh // 2, activate=activate)
-    elif zone == "quad-tr":
-        set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh // 2, activate=activate)
-    elif zone == "quad-bl":
-        set_window_rect(hwnd, wl, wt + wh // 2, ww // 2, wh - wh // 2, activate=activate)
-    elif zone == "quad-br":
-        set_window_rect(hwnd, wl + ww // 2, wt + wh // 2, ww - ww // 2, wh - wh // 2,
-                        activate=activate)
+    targets = {
+        "left": (wl, wt, ww // 2, wh),
+        "right": (wl + ww // 2, wt, ww - ww // 2, wh),
+        "top": (wl, wt, ww, wh // 2),
+        "bottom": (wl, wt + wh // 2, ww, wh - wh // 2),
+        "maximize": (wl, wt, ww, wh),
+        "center": (wl + (ww - w) // 2, wt + (wh - h) // 2, w, h),
+        "left-third": (wl, wt, ww // 3, wh),
+        "middle-third": (wl + ww // 3, wt, ww // 3, wh),
+        "right-third": (wl + 2 * (ww // 3), wt, ww - 2 * (ww // 3), wh),
+        "quad-tl": (wl, wt, ww // 2, wh // 2),
+        "quad-tr": (wl + ww // 2, wt, ww - ww // 2, wh // 2),
+        "quad-bl": (wl, wt + wh // 2, ww // 2, wh - wh // 2),
+        "quad-br": (wl + ww // 2, wt + wh // 2, ww - ww // 2, wh - wh // 2),
+    }
+    if zone not in targets:
+        logger.warning("snap: 未知区域 %s", zone)
+        return
+    tx, ty, tw, th = targets[zone]
+    set_window_rect(hwnd, tx, ty, tw, th, activate=activate)
+    # App 的最小/固定尺寸会把请求尺寸钳制（真机实测 UU远程固定 921x680、
+    # CrossPaste 固定 600x700、Marvis 最小宽 900）。尺寸到不了目标格子时，
+    # 「用户要贴的那条边」必须重新钉到工作区边界上——右列贴右缘、下排贴底缘
+    # ——否则窗口停在格子起点上悬空，看起来就是「没有吸附到边上」。
+    got = _readback_rect(hwnd, (tx, ty, tw, th))
+    if not got or got == (0, 0, 0, 0):
+        _last_snap_report[:] = [(hwnd, (tx, ty, tw, th), None)]
+        return
+    ax, ay = screen_math.reanchor_edge(zone, got[0], got[1], got[2], got[3],
+                                       wl, wt, ww, wh)
+    if (ax, ay) != (got[0], got[1]):
+        set_window_rect(hwnd, ax, ay, got[2], got[3], activate=activate)
+        # 重锚后再读一次：报告里存「最终实际几何」，不能存重锚前被系统
+        # 搬到别的屏的中间态（真机实测 y=-471 的过渡值会把状态栏吓到人）
+        final = _readback_rect(hwnd, (ax, ay, got[2], got[3]))
+        if final and final != (0, 0, 0, 0):
+            got = final
+    _last_snap_report[:] = [(hwnd, (tx, ty, tw, th), tuple(got))]
 
 
 def _monitor_index_by_rect(monitors_list, x, y, w, h):
@@ -1201,6 +1214,72 @@ def _fresh_rect(hwnd):
     except Exception:  # noqa: BLE001
         return (0, 0, 0, 0)
     return got if got else (0, 0, 0, 0)
+
+
+def _ax_read_rect(app, win_sel):
+    """经 AX 选择子直接读一个窗口的 position/size；失败返回 None。"""
+    script = (
+        f'tell application "System Events"\n'
+        f'  tell process "{app}"\n'
+        f'    set p to position of {win_sel}\n'
+        f'    set s to size of {win_sel}\n'
+        f'    return (item 1 of p as text) & "," & (item 2 of p as text) '
+        f'& "," & (item 1 of s as text) & "," & (item 2 of s as text)\n'
+        f'  end tell\n'
+        f'end tell\n'
+    )
+    out = _osa(script)
+    try:
+        x, y, w, h = (int(float(v)) for v in out.split(","))
+        return (x, y, w, h)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _readback_rect(hwnd, target):
+    """写入后读回「刚被写入的那个窗口」的几何。
+
+    get_window_rect 对无序号 hwnd 按 owner 兜底到该应用最前窗口——应用有多
+    个同名窗口时（真机 UU远程 拉起 5 个空名窗口）会读到另一个窗口，把假几何
+    喂给重锚/报告，甚至据此把正确的窗口搬到别的屏（真机实测 y=840 被拖去
+    Sidecar）。这里按写入目标做消歧：多个同名窗口时取与目标矩形偏差最小者；
+    CG 全列表都没有时（窗口在别的 Space）经 AX 几何选择子直读。
+    """
+    app, name, seq = parse_hwnd(hwnd)
+    try:
+        cands = [w for w in list_windows_front_to_back(min_size=1)
+                 if w["owner"] == app and (w["name"] or "") == (name or "")]
+    except Exception:  # noqa: BLE001
+        cands = []
+    if cands and seq:
+        if len(cands) >= seq:
+            w = cands[seq - 1]
+            return (w["x"], w["y"], w["w"], w["h"])
+    elif cands:
+        if len(cands) == 1:
+            w = cands[0]
+            return (w["x"], w["y"], w["w"], w["h"])
+        if target:
+            tx, ty, tw, th = target
+
+            def dev(w):
+                return (abs(w["x"] - tx) + abs(w["y"] - ty)
+                        + abs(w["w"] - tw) + abs(w["h"] - th))
+
+            best = min(cands, key=dev)
+            rect = (best["x"], best["y"], best["w"], best["h"])
+            _last_rect[hwnd] = rect
+            return rect
+    # CG 没有该窗口（可能在别的 Space / 刚被系统隐藏）：走 AX 直读，
+    # 选择子与 set_window_rect 相同——按已知几何匹配，读的就是写的那个。
+    known = _last_rect.get(hwnd) or target
+    sel = (_ax_window_by_geometry(app, known, name)
+           or _ax_window_selector(hwnd) or "window 1")
+    rect = _ax_read_rect(app, sel)
+    if rect:
+        _last_rect[hwnd] = rect
+        return rect
+    return _fresh_rect(hwnd)
 
 
 def _probe_min_size(hwnd, at_x, at_y):

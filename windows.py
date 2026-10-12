@@ -20,6 +20,9 @@ _suppress_undo = False
 # 上次被程序摆到的位置（Moom 的 Last Moom Frame 思路）。
 _last_arranged = {}
 _last_arranged_lock = threading.Lock()
+# snap() 最近一次的实测报告：[(hwnd, want, got)]，供 UI 状态栏如实提示
+# 「被应用最小/固定尺寸钳制，贴的是哪条边」。
+_last_snap_report = []
 
 
 def push_undo(hwnd, rect):
@@ -525,42 +528,38 @@ def snap(hwnd, monitor, zone, activate=True):
     if need_restore:
         user32.ShowWindow(hwnd, SW_RESTORE)
     ok = False
-    if zone == "left":
-        ok = set_window_rect(hwnd, wl, wt, ww // 2, wh, activate=activate, exact=True)
-    elif zone == "right":
-        ok = set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh,
-                             activate=activate, exact=True)
-    elif zone == "top":
-        ok = set_window_rect(hwnd, wl, wt, ww, wh // 2, activate=activate, exact=True)
-    elif zone == "bottom":
-        ok = set_window_rect(hwnd, wl, wt + wh // 2, ww, wh - wh // 2,
-                             activate=activate, exact=True)
-    elif zone == "center":
-        ok = set_window_rect(hwnd, wl + (ww - w) // 2, wt + (wh - h) // 2, w, h,
-                             activate=activate, exact=True)
-    elif zone == "left-third":
-        ok = set_window_rect(hwnd, wl, wt, ww // 3, wh, activate=activate, exact=True)
-    elif zone == "middle-third":
-        ok = set_window_rect(hwnd, wl + ww // 3, wt, ww // 3, wh,
-                             activate=activate, exact=True)
-    elif zone == "right-third":
-        ok = set_window_rect(hwnd, wl + 2 * (ww // 3), wt, ww - 2 * (ww // 3), wh,
-                             activate=activate, exact=True)
-    elif zone == "quad-tl":
-        ok = set_window_rect(hwnd, wl, wt, ww // 2, wh // 2,
-                             activate=activate, exact=True)
-    elif zone == "quad-tr":
-        ok = set_window_rect(hwnd, wl + ww // 2, wt, ww - ww // 2, wh // 2,
-                             activate=activate, exact=True)
-    elif zone == "quad-bl":
-        ok = set_window_rect(hwnd, wl, wt + wh // 2, ww // 2, wh - wh // 2,
-                             activate=activate, exact=True)
-    elif zone == "quad-br":
-        ok = set_window_rect(hwnd, wl + ww // 2, wt + wh // 2, ww - ww // 2,
-                             wh - wh // 2, activate=activate, exact=True)
-    else:
+    targets = {
+        "left": (wl, wt, ww // 2, wh),
+        "right": (wl + ww // 2, wt, ww - ww // 2, wh),
+        "top": (wl, wt, ww, wh // 2),
+        "bottom": (wl, wt + wh // 2, ww, wh - wh // 2),
+        "center": (wl + (ww - w) // 2, wt + (wh - h) // 2, w, h),
+        "left-third": (wl, wt, ww // 3, wh),
+        "middle-third": (wl + ww // 3, wt, ww // 3, wh),
+        "right-third": (wl + 2 * (ww // 3), wt, ww - 2 * (ww // 3), wh),
+        "quad-tl": (wl, wt, ww // 2, wh // 2),
+        "quad-tr": (wl + ww // 2, wt, ww - ww // 2, wh // 2),
+        "quad-bl": (wl, wt + wh // 2, ww // 2, wh - wh // 2),
+        "quad-br": (wl + ww // 2, wt + wh // 2, ww - ww // 2, wh - wh // 2),
+    }
+    if zone not in targets:
         logger.warning("snap: 未知区域 %s", zone)
         return False
+    tx, ty, tw, th = targets[zone]
+    ok = set_window_rect(hwnd, tx, ty, tw, th, activate=activate, exact=True)
+    # App 的最小/固定尺寸会钳制请求尺寸。读回实际尺寸后，把「用户要贴的
+    # 那条边」重新钉到工作区边界（右列贴右缘、下排贴底缘），并如实记录。
+    got = get_window_rect(hwnd)
+    if got and got != (0, 0, 0, 0):
+        ax, ay = screen_math.reanchor_edge(zone, got[0], got[1], got[2], got[3],
+                                           wl, wt, ww, wh)
+        if (ax, ay) != (got[0], got[1]):
+            set_window_rect(hwnd, ax, ay, got[2], got[3],
+                            activate=activate, exact=True)
+            final = get_window_rect(hwnd)
+            if final and final != (0, 0, 0, 0):
+                got = final
+        _last_snap_report[:] = [(hwnd, (tx, ty, tw, th), tuple(got))]
     if prev:
         user32.SetForegroundWindow(prev)
     return ok

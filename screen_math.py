@@ -98,3 +98,41 @@ def best_work_for_rect(monitors, x, y, w, h):
     idx = monitor_index_by_intersection(monitors, x, y, w, h)
     m = monitors[idx] if idx < len(monitors) else monitors[0]
     return (m.work_left, m.work_top, m.work_width, m.work_height)
+
+
+# 吸附方位 -> 该方位必须贴住的那条边。App 的最小/固定尺寸把窗口钳小时，
+# 尺寸到不了目标格子，但「用户要贴的边」必须仍然贴住工作区边界。
+RIGHT_ZONES = ("right", "right-third", "quad-tr", "quad-br")
+BOTTOM_ZONES = ("bottom", "quad-bl", "quad-br")
+
+
+def reanchor_edge(zone, got_x, got_y, got_w, got_h,
+                  work_left, work_top, work_width, work_height):
+    """按吸附方位把被钳制的窗口重新钉到用户要贴的那条边上。
+
+    返回应写入的 (x, y)——尺寸保持钳制后的 (got_w, got_h) 不变，只挪位置：
+      - left / left-third / quad-tl / top  ：本来就贴左/贴顶，位置不动；
+      - right / right-third / quad-tr      ：右缘钉到工作区右边界；
+      - bottom / quad-bl                   ：底缘钉到工作区下边界；
+      - maximize                           ：左上角钉到工作区原点；
+      - middle-third                       ：在屏宽上水平居中；
+      - center                             ：在屏宽高上居中。
+    例：右半屏 756 宽的格子装不下 UU远程 固定的 921 宽，改写 x = 右边界 - 921，
+    让右缘贴住屏幕右边缘，而不是停在 756 处悬空。
+    """
+    ax, ay = got_x, got_y
+    if zone in RIGHT_ZONES:
+        # 窗口已经比工作区还宽时再钉右缘会把左缘推出屏外，改为贴左
+        ax = (work_left + work_width - got_w if got_w < work_width
+              else work_left)
+    if zone in BOTTOM_ZONES:
+        ay = (work_top + work_height - got_h if got_h < work_height
+              else work_top)
+    if zone == "maximize":
+        ax, ay = work_left, work_top
+    elif zone == "middle-third":
+        ax = work_left + (work_width - got_w) // 2
+    elif zone == "center":
+        ax = work_left + (work_width - got_w) // 2
+        ay = work_top + (work_height - got_h) // 2
+    return int(ax), int(ay)
