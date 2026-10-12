@@ -144,6 +144,29 @@ def _fit_cost(win, cw, ch):
     return cost
 
 
+def fit_frame(win, cw, ch):
+    """窗口等比缩放进格子后，在格子里占的相对框 (rx, ry, rw, rh)。
+
+    这是 Moom 的 Relative Frame 语义：窗口放进格子不变形、也不被拉伸到
+    格子大小，而是取「能塞进格子的最大等比尺寸」，在格子里居中。
+    返回的四个值都是 0~1（相对格子，不是相对屏幕）；调用方再叠加格子
+    在工作区中的位置即可得到最终矩形。
+
+    格子比窗口还小时 scale > 1：此时窗口被放大到格子内（App 的最小尺寸
+    会把它顶回来，但那由 set_window_rect 的闭环处理）。
+    """
+    w = float(win.get("w") or 0)
+    h = float(win.get("h") or 0)
+    if w <= 0 or h <= 0 or cw <= 0 or ch <= 0:
+        return (0.0, 0.0, 1.0, 1.0)
+    scale = min(cw / w, ch / h)
+    fw, fh = w * scale, h * scale
+    return (round((cw - fw) / (2.0 * cw), 6),
+            round((ch - fh) / (2.0 * ch), 6),
+            round(fw / cw, 6),
+            round(fh / ch, 6))
+
+
 def grid_geometry(work_w, work_h, sx, sy, mins=None):
     """把一次横向/纵向切分算成四格的实际几何（含各窗口最小尺寸）。
 

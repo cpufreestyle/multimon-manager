@@ -1247,7 +1247,10 @@ def _readback_rect(hwnd, target):
     """
     app, name, seq = parse_hwnd(hwnd)
     try:
-        cands = [w for w in list_windows_front_to_back(min_size=1)
+        # 与 list_target_windows 用同一个枚举阈值：seq 序号是按那批窗口的
+        # z 序分配的，这里若用 min_size=1 会把小窗也数进去，#3 就会指到
+        # 另一个窗口（真机实测 #3 想读 1133x600 的主窗，读到 1133x44 的小条）
+        cands = [w for w in list_windows_front_to_back()
                  if w["owner"] == app and (w["name"] or "") == (name or "")]
     except Exception:  # noqa: BLE001
         cands = []
@@ -1259,12 +1262,18 @@ def _readback_rect(hwnd, target):
         if len(cands) == 1:
             w = cands[0]
             return (w["x"], w["y"], w["w"], w["h"])
-        if target:
-            tx, ty, tw, th = target
+        # 多个同名窗口：优先用**写入前的已知几何**定位（写坏的正是那个），
+        # 已知几何不可用时才退回按目标矩形找最近——目标矩形可能恰好等于
+        # 另一个同名窗口的位置（真机实测 #1 的写入目标正好是 #3 的所在），
+        # 那时按目标找会把 #1 读成 #3。
+        known = _last_rect.get(hwnd)
+        anchor = known if (known and known != (0, 0, 0, 0)) else target
+        if anchor:
+            ax_, ay_, aw_, ah_ = anchor
 
             def dev(w):
-                return (abs(w["x"] - tx) + abs(w["y"] - ty)
-                        + abs(w["w"] - tw) + abs(w["h"] - th))
+                return (abs(w["x"] - ax_) + abs(w["y"] - ay_)
+                        + abs(w["w"] - aw_) + abs(w["h"] - ah_))
 
             best = min(cands, key=dev)
             rect = (best["x"], best["y"], best["w"], best["h"])
@@ -1294,6 +1303,9 @@ def _probe_min_size(hwnd, at_x, at_y):
     窗口搬走。写完留下的几何无所谓，紧接着的正式排布会把它放进自己的格子。
     """
     app, name, _seq = parse_hwnd(hwnd)
+    # 探测用的选择子在探测前算好：探测会把窗口缩到 320x120，之后任何按几何
+    # 匹配都会因偏差过大而失效（真机实测偏差 2939），序号选择又会落到别的
+    # 同名窗口上——这正是「四宫格把窗口送到 Sidecar」的根因。
     sel = (_ax_window_by_geometry(app, _last_rect.get(hwnd), name)
            or _ax_window_selector(hwnd) or "window 1")
     script = (
@@ -1311,7 +1323,8 @@ def _probe_min_size(hwnd, at_x, at_y):
     for _ in range(2):
         _osa(script)
         time.sleep(_probe_settle_secs)
-        got = _fresh_rect(hwnd)
+        got = _readback_rect(hwnd, (int(at_x), int(at_y),
+                                    _PROBE_W, _PROBE_H))
         if not got or got == (0, 0, 0, 0):
             continue
         cur = (got[2], got[3])
@@ -1393,6 +1406,9 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # 「装不下 / 被搬屏」报在这一次成功的排列上
     global _last_quad_notes
     _last_quad_notes.clear()
+    # 用户在下拉里选过但已不可用（关掉/改名）的窗口：如实报出来，不能静默
+    # 用别的窗口顶上——那正是「智能/非智能都不准」的观感来源之一
+    _missing_windows = []
 
     cands = [w for w in list_target_windows()
              if w["pid"] not in _OWN_PIDS and w["owner"]]
@@ -1403,6 +1419,12 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
         w = None
         if want:
             w = cands_by_hwnd.get(want) or _find_window(want)
+            if w is None and want not in seen:
+                # 下拉里选中的窗口已经关掉/改名：如实说明，不能静默换一个
+                # 别的窗口顶上（真机实测选 CodeBuddy 的格子被换成了 ChatGPT，
+                # 用户看到的就是「智能/非智能都不准」）
+                logger.warning("四宫格：指定的窗口 %s 已不可用", want)
+                _missing_windows.append(want)
         elif use_pinned and _pinned_target and _pinned_target not in seen:
             w = _find_window(_pinned_target)
         if w is None:
@@ -1433,8 +1455,53 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
 
     # 1) 实测四个窗口的最小尺寸
     mins = {}
+    pre_probe = {}
+    pinned_windows = []
     for h, _w in picked:
+        # 探测前先记下当前几何：探测会把窗口缩得很小，排布前要放回原状，
+        # 但只在几何真的被探测改动过才放（无谓的复位会白占一步撤销栈）
+        try:
+            pre_probe[h] = _readback_rect(h, (_w["x"], _w["y"], _w["w"], _w["h"]))
+        except Exception:  # noqa: BLE001
+            pre_probe[h] = None
         mins[h] = _probe_min_size(h, wl + 1, wt + 1)
+        # 探测前后几何完全没变 = 窗口被系统钉死（真机实测 Sidecar 上的
+        # UU远程 窗口，任何 AX 写入都被忽略）。这类窗口不参与比例计算，
+        # 否则智能分配会把活窗口的空间分给一个动不了窗口。
+        try:
+            post = _readback_rect(h, pre_probe.get(h))
+            was = pre_probe.get(h)
+            if was and post == was and post != (0, 0, 0, 0):
+                cx = post[0] + post[2] / 2.0
+                if not (mon.left <= cx < mon.left + mon.width):
+                    pinned_windows.append(h)
+        except Exception:  # noqa: BLE001
+            pass
+    # 探测最小尺寸会把窗口缩到很小，这会让 App 的最小尺寸把窗口撑出格子、
+    # 甚至触发 macOS 搬屏。探测完把每个窗口放回它**原来的位置**：后面正式
+    # 排布按当前几何重新定位，不会带着探测后的残局排（真机实测 UU远程 探测后
+    # 停在工作区外，直接排就把它判给了 Sidecar）。
+    for h, w in picked:
+        try:
+            was = pre_probe.get(h)
+            cur = _readback_rect(h, was or (w["x"], w["y"], w["w"], w["h"]))
+            if (cur and cur != (0, 0, 0, 0)
+                    and was and was != (0, 0, 0, 0)
+                    and cur != was):
+                set_window_rect(h, w["x"], w["y"], w["w"], w["h"],
+                                activate=False)
+                # 放回后把探测前的几何重新登记：正式排布的 AX 几何匹配靠它
+                _last_rect[h] = was
+        except Exception:  # noqa: BLE001
+            pass
+    if pinned_windows:
+        # 钉死的窗口（系统拒绝任何 AX 写入）不参与比例计算：它的最小
+        # 尺寸就是当前尺寸，参与计算只会把活窗口的空间挤掉。
+        for h in pinned_windows:
+            cur = _readback_rect(h, pre_probe.get(h)) or (0, 0, 0, 0)
+            mins[h] = (cur[2], cur[3])
+            logger.warning("四宫格：%s 被系统钉死，按当前尺寸 %dx%d 参与",
+                        h, cur[2], cur[3])
     corners = [(mins[h][0], mins[h][1]) for h, _w in picked]
     need_w, need_h = quad_plan.quad_requirements(corners)
     logger.info("四格最小尺寸需求 %dx%d（屏幕 %s %dx%d）：%s",
@@ -1465,8 +1532,16 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
         # 会拿到不同的顺序与几何，重排时按 (owner, name) 匹配就会错位
         # （真机实测 plan 说豆包去 TL，实际 ChatGPT 去了 TR）。
         try:
+            # 钉死的窗口仍算一个角（保持 4 个），但把它的最小尺寸记为 0：
+            # grid_geometry 不会为它抬格，智能分配按活窗口的宽高比优化，
+            # 钉死的窗口排最后，写不动就在原地并如实说明。
+            plan_mins = dict(mins)
+            for h in pinned_windows:
+                plan_mins[h] = (0, 0)
+            picked = ([p for p in picked if p[0] not in pinned_windows]
+                      + [p for p in picked if p[0] in pinned_windows])
             planned, sx2, sy2 = quad_plan.plan_quad_smart(
-                [dict(w, hwnd=h, min_w=mins[h][0], min_h=mins[h][1])
+                [dict(w, hwnd=h, min_w=plan_mins[h][0], min_h=plan_mins[h][1])
                  for h, w in picked], ww, wh)
         except ValueError as e:  # noqa: BLE001
             logger.warning("智能分配失败，退回手动比例: %s", e)
@@ -1505,7 +1580,7 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # （实测 ChatGPT 请求 454 读回 480），左列比格子宽时右列按理想值排会互相
     # 压盖；左列比格子窄时按理想值排又会在两列之间留下一道空洞。
     set_window_rect(picked[0][0], wl, wt, c1, r1, activate=False)
-    tl_rect = _fresh_rect(picked[0][0])
+    tl_rect = _readback_rect(picked[0][0], (wl, wt, c1, r1))
     right_x = wr - c2
     if tl_rect and tl_rect != (0, 0, 0, 0) and tl_rect[2] > 0:
         right_x = tl_rect[0] + tl_rect[2] + 1
@@ -1526,7 +1601,7 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # 重叠：重叠只是难看，被搬走才是用户报的故障。
     top_bottom = wt + r1
     for h, _w in picked[:2]:
-        rect = _fresh_rect(h)
+        rect = _readback_rect(h, (wl, wt, c1, r1))
         if rect and rect != (0, 0, 0, 0) and rect[3] > 0:
             top_bottom = max(top_bottom, rect[1] + rect[3])
     bot_y = top_bottom + 1
@@ -1537,7 +1612,7 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     set_window_rect(picked[2][0], wl, bot_y, half_w, bot_h, activate=False)
     # 下排左格同样可能被 App 的最小宽度撑宽（与上排左格同源）。若右下格仍按
     # 理想 half_w 起排，两格会互相压盖——用户看到的就是「右下窗口叠在左下上」。
-    bl_rect = _fresh_rect(picked[2][0])
+    bl_rect = _readback_rect(picked[2][0], (wl, bot_y, half_w, bot_h))
     br_x = wl + half_w
     if bl_rect and bl_rect != (0, 0, 0, 0) and bl_rect[2] > 0:
         br_x = max(br_x, bl_rect[0] + bl_rect[2] + 1)
@@ -1561,11 +1636,30 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
              (wl, bot_y, half_w, bot_h),
              (br_x, bot_y, br_w, bot_h)]
     for (h, _w), want in zip(picked, boxes):
-        got = _fresh_rect(h)
+        got = _readback_rect(h, want)
         if not got or got == (0, 0, 0, 0):
             report.append((h, want, None))
             notes.append("%s 读不到几何" % h.split("::")[0])
             continue
+        # 写入后几何完全没变、且窗口中心不在目标屏：这个窗口被系统钉住了
+        # （真机实测 Sidecar 上的 UU远程 窗口，任何 AX 写入都被忽略）。
+        # 必须与「被最小尺寸钳制」区分开——钳制会变，钉死不变。
+        if got == want:
+            pass
+        elif (abs(got[0] - want[0]) <= 2 and abs(got[1] - want[1]) <= 2
+                and abs(got[2] - want[2]) <= 2 and abs(got[3] - want[3]) <= 2):
+            pass
+        else:
+            cx, cy = got[0] + got[2] / 2.0, got[1] + got[3] / 2.0
+            on_target = (mon.left <= cx < mon.left + mon.width
+                         and mon.top <= cy < mon.top + mon.height)
+            if not on_target:
+                pre = _last_rect.get(h)
+                if pre and pre == got:
+                    notes.append(
+                        "%s 被系统钉在当前位置，无法移动到目标格"
+                        % h.split("::")[0])
+                    logger.warning("四宫格：%s 钉死不动 -> %s", h, got)
         dev = max(abs(g - t) for g, t in zip(got, want))
         report.append((h, want, got))
         # 窗口被系统判给了别的屏：中心点不在目标屏范围内。这是「四窗不在
@@ -1583,6 +1677,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     _last_quad_report = report
     global _last_quad_order
     _last_quad_order = [h for h, _w in picked]
+    if _missing_windows:
+        # 说明用了别的窗口顶上：界面据此提示用户重新选择
+        names = "、".join(x.split("::")[0] for x in _missing_windows[:3])
+        notes.insert(0, "指定的窗口 %s 已关闭/改名，用了其它窗口顶上" % names)
     # 重叠量用实测值算：前面 ov_x / ov_y 是理想几何的估计，而 App 的最小尺寸、
     # 标题栏占位都会让窗口实际比格子大，只有实测才反映用户看到的重叠。
     # 上排 = 顶边较小的两格、下排 = 其余两格（摆放时就是按这个顺序写的）。

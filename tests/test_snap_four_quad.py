@@ -55,7 +55,8 @@ def _run(wins, mons, **kw):
     prev = {}
     for attr in ("list_target_windows", "monitors", "_find_window",
                  "get_window_rect", "set_window_rect", "push_undo",
-                 "_osa", "_probe_min_size"):
+                 "_osa", "_probe_min_size", "list_windows_front_to_back",
+                 "_readback_rect"):
         prev[attr] = getattr(wm, attr)
 
     class _Mons:
@@ -86,6 +87,14 @@ def _run(wins, mons, **kw):
     wm._osa = lambda script: ""
     wm._probe_min_size = lambda hwnd, at_x, at_y: tuple(
         min_sizes.get(hwnd, (0, 0)))
+    # _readback_rect 会走真实 CG 枚举（list_windows_front_to_back）去找
+    # 「刚写入的那个窗口」——单测里没有真机窗口，必须换成 fake 的读回。
+    wm.list_windows_front_to_back = lambda *a, **k: wins
+
+    def _readback(hwnd, target=None):
+        return readback.get(hwnd) or state.get(hwnd) or (0, 0, 0, 0)
+
+    wm._readback_rect = _readback
 
     def _place(hwnd, x, y, w, h, activate=True):
         placed.append((hwnd, x, y, w, h))
