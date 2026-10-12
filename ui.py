@@ -13,6 +13,7 @@ import config_io
 import profiles
 import settings
 import layouts
+import screen_math
 import scenarios
 import snap_preview
 import rules
@@ -107,6 +108,9 @@ class App:
         self.monitor_watch = None
         self._display_poll_id = None
         self._last_mon_sig = None
+        # 显示器插拔后的稳定等待：签名停止变化后才套用情景（Moom wake 思路）
+        self._display_settle_id = None
+        self._pending_mon_sig = None
         # 拖拽吸附预览（F3）：浮层懒创建，监听器按开关启停
         self._snap_preview = None
         self._drag_watcher = None
@@ -422,6 +426,49 @@ class App:
             self.root.after(0, lambda: self.status_var.set("已撤销上一次窗口移动"))
             self.root.after(0, self._keep_front)
 
+    def _back_to_arranged(self):
+        """把目标窗口送回上次被程序摆好的位置（第二层撤销 / snap back）。"""
+        if getattr(b, "return_to_last_arranged", None) is None:
+            self.status_var.set("当前平台暂不支持回到上次摆放位")
+            return
+        hwnd = self._current_target_hwnd()
+        if not hwnd:
+            self.status_var.set("请先在「目标窗口」选择一个窗口")
+            return
+        try:
+            ok = b.return_to_last_arranged(hwnd)
+        except Exception as e:  # noqa: BLE001
+            self.status_var.set(f"回到上次摆放位失败：{e}")
+            return
+        if ok:
+            self.status_var.set("已回到上次摆放位")
+        else:
+            self.status_var.set("该窗口没有被程序摆放过，没有可回的位置")
+
+    def _current_target_hwnd(self):
+        """当前界面选中的目标窗口 hwnd；「自动」时返回 None。"""
+        target_map = getattr(self, "_target_map", None) or {}
+        label = self.target_var.get()
+        return target_map.get(label) if label else None
+
+    def _back_to_active_arranged(self):
+        """快捷键版「回到摆放位」：作用于当前活动窗口（不依赖界面选择）。"""
+        if getattr(b, "return_to_last_arranged", None) is None:
+            return
+        try:
+            hwnd = b.get_foreground_window(False)
+        except Exception:  # noqa: BLE001
+            hwnd = None
+        if not hwnd:
+            self.root.after(0, lambda: self.status_var.set("没有可回摆放位的活动窗口"))
+            return
+        try:
+            ok = b.return_to_last_arranged(hwnd)
+        except Exception:  # noqa: BLE001
+            ok = False
+        msg = "已回到上次摆放位" if ok else "该窗口没有被程序摆放过"
+        self.root.after(0, lambda m=msg: self.status_var.set(m))
+
     def _build_window_tools(self, parent):
         f = ttk.LabelFrame(parent, text="窗口工具")
         f.pack(fill="x", padx=8, pady=6)
@@ -509,6 +556,12 @@ class App:
                               command=self._undo_move)
         undo_btn.pack(side="left", padx=(8, 1))
         self._tooltip(undo_btn, "回退上一次窗口的移动/缩放（快捷键 F7）")
+        back_btn = ttk.Button(snap_rows[1], text="回摆放位",
+                              command=self._back_to_arranged)
+        back_btn.pack(side="left", padx=(8, 1))
+        self._tooltip(back_btn,
+                      "把目标窗口送回上次被本程序摆好的位置"
+                      "（窗口被拖乱后一键归位）")
         # 移到指定屏：只有"上一屏/下一屏"时，三屏以上要连点好几次才能到位，
         # 这里直接选目标屏一次跳过去（下拉与并排/竖排共用同一份显示器列表）。
         mon_row = ttk.Frame(f)
@@ -1920,9 +1973,20 @@ class App:
         name = simpledialog.askstring("保存布局", "方案名称：", parent=self.root)
         if not name:
             return
-        data = [{"hwnd": w["hwnd"], "owner": w["owner"], "name": w["name"],
-                 "x": w["x"], "y": w["y"], "w": w["w"], "h": w["h"]}
-                for w in wins]
+        data = []
+        for w in wins:
+            item = {"hwnd": w["hwnd"], "owner": w["owner"], "name": w["name"],
+                    "x": w["x"], "y": w["y"], "w": w["w"], "h": w["h"]}
+            # 记下窗口在所在屏工作区上的相对框：屏幕组合变化后还原时按
+            # 比例重映射（Moom 的 Relative Frame 思路），不再一换屏就错位
+            try:
+                wl, wt, ww, wh = screen_math.best_work_for_rect(
+                    list(self.monitors or []), w["x"], w["y"], w["w"], w["h"])
+                item["rel"] = [round(v, 6) for v in screen_math.normalize_to_work(
+                    w["x"], w["y"], w["w"], w["h"], wl, wt, ww, wh)]
+            except Exception:  # noqa: BLE001
+                pass
+            data.append(item)
         layouts.save_layout(name, data, monitor_sig=self._monitor_signature())
         self._refresh_layout_list()
         self.layout_var.set(name)
@@ -1957,8 +2021,15 @@ class App:
             if not silent:
                 messagebox.showwarning("提示", f"布局方案不存在：{name}")
             return False
-        # 显示器配置变了（数量/分辨率/相对位置）时，按保存时的绝对坐标还原必然错位
+        # 显示器配置变了（数量/分辨率/相对位置）时：老布局（没记相对框）才提示
+        # 并继续按绝对坐标还原；新布局按相对框重映射到新屏，自适应不再错位。
+        monitors_now = list(self.monitors or [])
         if self._layout_monitor_changed(name):
+            layouts.apply_relative_frames(name, monitors_now)
+        has_rel = any(isinstance(w.get("rel"), (list, tuple)) and len(w.get("rel")) == 4
+                      for w in layout.get("windows", [])
+                      if isinstance(w, dict))
+        if self._layout_monitor_changed(name) and not has_rel:
             if not silent:
                 self.show()   # 托盘触发时主窗口可能已隐藏，弹窗前先亮出来
                 if not messagebox.askyesno(
@@ -1970,24 +2041,43 @@ class App:
                     return False
         ok, miss = 0, 0
         current = {w["hwnd"]: w["owner"] for w in b.list_target_windows()}
+        adapt_n = 0
         for item in layout["windows"]:
             hwnd = item["hwnd"]
             # 精确匹配；否则按应用名兜底（窗口标题可能已变化）
             target = hwnd if hwnd in current else next(
                 (h for h, o in current.items() if o == item["owner"]), None)
+            # 匹配不上时按邻近度兜底：窗口标题全变了但还开着，也能按
+            # 「当前哪个窗口离这个格子最近」归位（Moom 的 Proximity 匹配思路）
+            if not target:
+                target = self._nearest_layout_window(item, current)
             if not target:
                 miss += 1
                 continue
             try:
-                b.set_window_rect(target, item["x"], item["y"], item["w"], item["h"],
-                                 activate=False)
+                tx, ty, tw, th = item["x"], item["y"], item["w"], item["h"]
+                rel = item.get("rel")
+                if (self._layout_monitor_changed(name)
+                        and isinstance(rel, (list, tuple)) and len(rel) == 4
+                        and monitors_now):
+                    wl, wt, ww, wh = screen_math.best_work_for_rect(
+                        monitors_now, tx, ty, tw, th)
+                    tx, ty, tw, th = screen_math.denormalize_to_work(
+                        rel, wl, wt, ww, wh)
+                    tx, ty, tw, th = screen_math.clamp_to_work(
+                        tx, ty, tw, th, wl, wt, ww, wh)
+                    adapt_n += 1
+                b.set_window_rect(target, tx, ty, tw, th, activate=False)
                 ok += 1
             except Exception:  # noqa: BLE001
                 miss += 1
         s = settings.load()
         s["last_layout"] = name
         settings.save(s)
-        self.status_var.set(f"已还原布局「{name}」：成功 {ok}，未找到 {miss}")
+        status = f"已还原布局「{name}」：成功 {ok}，未找到 {miss}"
+        if adapt_n:
+            status += f"，按比例重映射 {adapt_n} 个（显示器配置已变化）"
+        self.status_var.set(status)
         if silent:
             return True
         if miss:
@@ -1998,6 +2088,26 @@ class App:
         else:
             messagebox.showinfo("完成", f"布局「{name}」已全部还原（{ok} 个窗口）")
         return True
+
+    def _nearest_layout_window(self, item, current):
+        """布局格没匹配到窗口时，按中心点距离取最近的未占用窗口（邻近度兜底）。"""
+        try:
+            tx = item["x"] + item["w"] // 2
+            ty = item["y"] + item["h"] // 2
+        except Exception:  # noqa: BLE001
+            return None
+        best, best_d = None, None
+        wins = {w["hwnd"]: w for w in b.list_target_windows()
+                if w["hwnd"] in current and w.get("x") is not None}
+        for h, w in wins.items():
+            try:
+                d = ((w["x"] + w["w"] // 2 - tx) ** 2
+                     + (w["y"] + w["h"] // 2 - ty) ** 2)
+            except Exception:  # noqa: BLE001
+                continue
+            if best_d is None or d < best_d:
+                best, best_d = h, d
+        return best
 
     def _delete_layout(self):
         name = self.layout_var.get()
@@ -2247,11 +2357,41 @@ class App:
             sig = self._monitor_signature()
             if sig is not None and sig != self._last_mon_sig:
                 self._last_mon_sig = sig
-                self._handle_display_change()
+                # 插拔后屏幕配置往往还要再变几次（分辨率握手、主屏切换）。
+                # Moom 唤醒恢复的做法是先等屏稳定再套布局（standing by for
+                # additional displays）；这里同样延迟 2.5s，签名再变就重排
+                # 等待，稳定在同一个签名后才真正套用情景/布局。
+                self._pending_mon_sig = sig
+                if self._display_settle_id is not None:
+                    try:
+                        self.root.after_cancel(self._display_settle_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                self._display_settle_id = self.root.after(
+                    2500, self._apply_display_change_if_settled)
         except Exception:  # noqa: BLE001
             pass
         if self.watch_enabled.get():
             self._display_poll_id = self.root.after(1500, self._poll_display)
+
+    def _apply_display_change_if_settled(self):
+        """延迟到期且签名未再变化时才处理显示器变化（等待配置稳定）。"""
+        self._display_settle_id = None
+        if not self.watch_enabled.get():
+            self._pending_mon_sig = None
+            return
+        try:
+            sig = self._monitor_signature()
+        except Exception:  # noqa: BLE001
+            sig = None
+        if sig is not None and sig != self._pending_mon_sig:
+            # 等待期间配置又变了：重置等待窗口，避免在中间态上套布局
+            self._pending_mon_sig = sig
+            self._display_settle_id = self.root.after(
+                2500, self._apply_display_change_if_settled)
+            return
+        self._pending_mon_sig = None
+        self._handle_display_change()
 
     def _handle_display_change(self):
         """显示器配置变化后：刷新列表，并按当前组合套用匹配情景（F2）。
@@ -3061,7 +3201,12 @@ class App:
         self.status_var.set(f"规则引擎：已应用规则，移动 {moved} 个窗口")
 
     def _poll_rules(self):
-        """主线程轮询：新窗口套规则；窗口移动/出现触发触发器；并检查情景定时触发。"""
+        """主线程轮询：新窗口套规则；窗口移动/出现触发触发器；并检查情景定时触发。
+
+        Moom 用 AXObserver 事件驱动代替全量轮询；macOS 的 AX 回调与
+        Tk 主循环并发容易踩原生崩溃，这里第一版先保留轮询兜底，
+        后续版本再做事件驱动。
+        """
         try:
             auto = (getattr(self, "rules_auto", None) is not None
                     and self.rules_auto.get())
@@ -3574,6 +3719,7 @@ class App:
         return (f"{sym}+←/→ : 活动窗口移到上一/下一屏\n"
                 f"{sym}+1/2/3/4 : 左/右/上/下半屏\n"
                 f"{sym}+5/6 : 最大化 / 居中\n"
+                f"{sym}+Z : 撤销上一次移动 · {sym}+B : 回到上次摆放位\n"
                 f"{sym}+7/8/9 : 三分屏（左/中/右）\n"
                 f"{sym}+Shift+1/2/3/4 : 四象限（左上/右上/左下/右下）")
 
@@ -3646,6 +3792,9 @@ class App:
                 # F7：⌘⌥+Z 撤销上一次窗口移动
                 self.hk.register(mods, VK_Z,
                                  lambda: self._undo_move())
+                # ⌘⌥+B：活动窗口回到上次被程序摆好的位置（snap back）
+                self.hk.register(mods, getattr(b, "VK_B", 0),
+                                 lambda: self._back_to_active_arranged())
                 # 四象限：修饰键+Shift+数字 1-4（左上/右上/左下/右下）
                 for vk, zone in ((dk[1], "quad-tl"), (dk[2], "quad-tr"),
                                  (dk[3], "quad-bl"), (dk[4], "quad-br")):
@@ -3687,6 +3836,12 @@ class App:
             except Exception:  # noqa: BLE001
                 pass
             self._display_poll_id = None
+        if self._display_settle_id is not None:
+            try:
+                self.root.after_cancel(self._display_settle_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self._display_settle_id = None
         if self.hk:
             self.hk.stop()
         self.root.destroy()

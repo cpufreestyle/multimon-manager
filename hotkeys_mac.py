@@ -68,6 +68,8 @@ VK_UP = 126
 VK_DOWN = 125
 # Z 键（撤销），macOS CGKeycode
 VK_Z = 6
+# B 键（回到上次摆放位），macOS CGKeycode
+VK_B = 11
 
 # 数字键 1-9 的 macOS 虚拟键码（CGKeycode）。注意它与 ASCII 不同：
 # 例如 "1" 的 CGKeycode 是 18 而非 ord("1")=49，用 ord() 注册会导致快捷键

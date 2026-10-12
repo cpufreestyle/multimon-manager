@@ -8,6 +8,7 @@ from ctypes import wintypes
 import monitors
 
 import quad_plan
+import screen_math
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,10 @@ logger = logging.getLogger(__name__)
 _undo_stack = []
 _undo_lock = threading.Lock()
 _suppress_undo = False
+# 「上次摆放位」记忆：窗口被本程序摆过后又被用户拖走时，可一键回到
+# 上次被程序摆到的位置（Moom 的 Last Moom Frame 思路）。
+_last_arranged = {}
+_last_arranged_lock = threading.Lock()
 
 
 def push_undo(hwnd, rect):
@@ -23,6 +28,20 @@ def push_undo(hwnd, rect):
         _undo_stack.append((hwnd, tuple(rect)))
         if len(_undo_stack) > 20:
             _undo_stack.pop(0)
+
+
+def remember_arranged(hwnd, rect):
+    """记录窗口被程序摆到的位置（hwnd -> (x, y, w, h)），最多 40 个。"""
+    with _last_arranged_lock:
+        _last_arranged[hwnd] = tuple(rect)
+        while len(_last_arranged) > 40:
+            _last_arranged.pop(next(iter(_last_arranged)))
+
+
+def last_arranged(hwnd):
+    """返回该窗口上次被程序摆到的位置；没记录时返回 None。"""
+    with _last_arranged_lock:
+        return _last_arranged.get(hwnd)
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -377,6 +396,7 @@ def set_window_rect(hwnd, x, y, w, h, activate=True, exact=False):
             push_undo(hwnd, get_window_rect(hwnd))
         except Exception:  # noqa: BLE001
             pass
+    _internal = _suppress_undo
     if exact:
         l, t, r, b = frame_insets(hwnd)
         x, y, w, h = x - l, y - t, w + l + r, h + t + b
@@ -386,6 +406,11 @@ def set_window_rect(hwnd, x, y, w, h, activate=True, exact=False):
     ok = user32.SetWindowPos(hwnd, None, int(x), int(y), int(w), int(h), flags)
     if activate:
         user32.SetForegroundWindow(hwnd)
+    if ok and not _internal:
+        try:
+            remember_arranged(hwnd, (x, y, w, h))
+        except Exception:  # noqa: BLE001
+            pass
     return bool(ok)
 
 
@@ -407,14 +432,24 @@ def undo_last_move():
     return hwnd
 
 
+def return_to_last_arranged(hwnd):
+    """把窗口送回它上次被程序摆到的位置（第二层撤销 / snap back）。"""
+    rect = last_arranged(hwnd)
+    if not rect:
+        return False
+    global _suppress_undo
+    _suppress_undo = True
+    try:
+        set_window_rect(hwnd, rect[0], rect[1], rect[2], rect[3], activate=False)
+    finally:
+        _suppress_undo = False
+    return True
+
+
 def _monitor_by_relative(monitors_list, src_hwnd):
-    """根据窗口当前所在屏幕，返回其索引。"""
+    """根据窗口当前所在屏幕，返回其索引（交集最长优先）。"""
     x, y, w, h = get_window_rect(src_hwnd)
-    cx, cy = x + w // 2, y + h // 2
-    for i, m in enumerate(monitors_list):
-        if m.left <= cx < m.left + m.width and m.top <= cy < m.top + m.height:
-            return i
-    return 0
+    return screen_math.monitor_index_by_intersection(monitors_list, x, y, w, h)
 
 
 def move_to_monitor(hwnd, monitor, src=None, activate=True):
@@ -744,12 +779,8 @@ def _find_window(hwnd):
 
 
 def _monitor_index_by_rect(monitors_list, x, y, w, h):
-    """按给定矩形（而非 hwnd）判断所在显示器索引。"""
-    cx, cy = x + w // 2, y + h // 2
-    for i, m in enumerate(monitors_list):
-        if m.left <= cx < m.left + m.width and m.top <= cy < m.top + m.height:
-            return i
-    return 0
+    """按给定矩形（而非 hwnd）判断所在显示器索引：交集最长优先。"""
+    return screen_math.monitor_index_by_intersection(monitors_list, x, y, w, h)
 
 
 def _place_window(hwnd, x, y, w, h):

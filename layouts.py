@@ -3,13 +3,16 @@
 每个方案记录若干窗口的几何信息（位置/大小）与来源标识（"应用::窗口"），
 还原时按标识匹配当前窗口并调用 backend.set_window_rect 复位。
 
-还会记录保存时的**显示器配置指纹**：显示器数量/分辨率/相对位置变化后，
-按绝对坐标还原必然错位，应用前据此提示用户。
+还会记录保存时的**显示器配置指纹**，以及每个窗口在**当时所在屏工作区上的
+相对框**（0~1 比例，Moom 同款思路）：屏幕数量或分辨率变化后，不再只按绝对
+坐标硬套，而是先按相对框重映射到新屏再钉回工作区——布局可以跨显示器组合
+自适应，而不是一换屏就提示“会错位”。
 """
 import json
 import os
 from datetime import datetime
 
+import screen_math
 import settings
 
 # 源码运行在仓库内；打包运行用用户数据目录（_MEIPASS 是临时目录，会丢配置）
@@ -33,12 +36,61 @@ def save_layout(name, windows, monitor_sig=None):
     monitor_sig: 保存时的显示器配置指纹（可迭代对象，可为 None）
     """
     data = _load()
+    windows = [dict(w) for w in windows]
+    for w in windows:
+        rel = w.get("rel")
+        if not (isinstance(rel, (list, tuple)) and len(rel) == 4):
+            w.pop("rel", None)
     data[name] = {
         "windows": windows,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
         "monitor_sig": [list(item) for item in monitor_sig] if monitor_sig else None,
     }
     _save(data)
+
+
+def apply_relative_frames(name, monitors):
+    """给老布局补算相对框：按窗口矩形当时所在的屏（交集最长）归一化。
+
+    monitors 为当前显示器对象列表（带 left/top/width/height 与
+    work_left/work_top/work_width/work_height）。老布局保存时没记 rel，
+    在还原前用此函数升级一次并写回，后续还原即可走自适应路径。
+    返回 (更新条数, 跳过条数)。
+    """
+    layout = _load().get(name)
+    if not isinstance(layout, dict):
+        return (0, 0)
+    windows = layout.get("windows")
+    if not isinstance(windows, list) or not monitors:
+        return (0, 0)
+    updated, skipped = 0, 0
+    changed = False
+    for w in windows:
+        if not isinstance(w, dict):
+            continue
+        rel = w.get("rel")
+        if isinstance(rel, (list, tuple)) and len(rel) == 4:
+            norm = [float(v) for v in rel]
+            if norm != list(rel):
+                w["rel"] = norm
+                changed = True
+            continue
+        try:
+            wl, wt, ww, wh = screen_math.best_work_for_rect(
+                monitors, w["x"], w["y"], w["w"], w["h"])
+            w["rel"] = [
+                round(v, 6) for v in screen_math.normalize_to_work(
+                    w["x"], w["y"], w["w"], w["h"], wl, wt, ww, wh)]
+            updated += 1
+            changed = True
+        except Exception:  # noqa: BLE001
+            skipped += 1
+    if changed:
+        data = _load()
+        if isinstance(data.get(name), dict):
+            data[name]["windows"] = windows
+            _save(data)
+    return (updated, skipped)
 
 
 def monitor_signature(name):

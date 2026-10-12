@@ -40,8 +40,9 @@ try:
     VK_UP = hotkeys.VK_UP
     VK_DOWN = hotkeys.VK_DOWN
     VK_Z = hotkeys.VK_Z
+    VK_B = getattr(hotkeys, "VK_B", 0)
 except Exception:  # noqa: BLE001
-    VK_LEFT = VK_RIGHT = VK_UP = VK_DOWN = VK_Z = 0
+    VK_LEFT = VK_RIGHT = VK_UP = VK_DOWN = VK_Z = VK_B = 0
 
 MOD_ALT = getattr(hotkeys, "MOD_ALT", 1)
 MOD_CONTROL = getattr(hotkeys, "MOD_CONTROL", 2)
@@ -75,6 +76,10 @@ DragSnapWatcher = dragsnap.DragSnapWatcher
 register_display_callback = display_notify.register
 # 撤销上一次窗口移动（F7）
 undo_last_move = windows.undo_last_move
+# 回到上次被程序摆好的位置（第二层撤销；Moom 的 snap back 思路）
+return_to_last_arranged = getattr(windows, "return_to_last_arranged", None)
+# 当前活动窗口标识（快捷键路径使用）
+get_foreground_window = windows.get_foreground_window
 
 
 def move_target_to_monitor(index, use_pinned=True, activate=False):

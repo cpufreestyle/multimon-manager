@@ -26,6 +26,7 @@ import monitors_mac as monitors
 from monitors_mac import CGRect
 
 import quad_plan
+import screen_math
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,10 @@ logger = logging.getLogger(__name__)
 _undo_stack = []
 _undo_lock = threading.Lock()
 _suppress_undo = False
+# 「上次摆放位」记忆（Moom 的 Last Moom Frame 思路）：窗口被本程序摆过
+# 之后又被用户拖走时，记住它上次被程序摆到的位置，撤销/吸附恢复时可回去。
+_last_arranged = {}
+_last_arranged_lock = threading.Lock()
 
 
 def push_undo(hwnd, rect):
@@ -41,6 +46,20 @@ def push_undo(hwnd, rect):
         _undo_stack.append((hwnd, tuple(rect)))
         if len(_undo_stack) > 20:
             _undo_stack.pop(0)
+
+
+def remember_arranged(hwnd, rect):
+    """记录窗口被程序摆到的位置（hwnd -> (x, y, w, h)），最多 40 个。"""
+    with _last_arranged_lock:
+        _last_arranged[hwnd] = tuple(rect)
+        while len(_last_arranged) > 40:
+            _last_arranged.pop(next(iter(_last_arranged)))
+
+
+def last_arranged(hwnd):
+    """返回该窗口上次被程序摆到的位置；没记录时返回 None。"""
+    with _last_arranged_lock:
+        return _last_arranged.get(hwnd)
 
 
 # ── AppleScript 执行 ─────────────────────────────────────────────────
@@ -694,6 +713,8 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
     """
     if not hwnd:
         return
+    # 「上次摆放位」只记程序摆放，不记撤销/回位这类内部复位
+    _internal = _suppress_undo
     if not _suppress_undo:
         try:
             push_undo(hwnd, get_window_rect(hwnd))
@@ -765,6 +786,13 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
                 break
         prev = c
         logger.info("幂等重设 第%d次 实测=%s 偏差=%d", attempt + 1, c, dev)
+    if not _internal:
+        # 记住「上次摆放位」：窗口之后被用户拖乱时，可一键回到程序摆好的
+        # 位置（撤销/回位本身不覆盖这个记忆）
+        try:
+            remember_arranged(hwnd, (tx, ty, tw, th))
+        except Exception:  # noqa: BLE001
+            pass
     if activate:
         _osa(f'tell application "{app}" to activate')
 
@@ -787,13 +815,33 @@ def undo_last_move():
     return hwnd
 
 
+def return_to_last_arranged(hwnd):
+    """把窗口送回它上次被程序摆到的位置（第二层撤销 / snap back）。
+
+    与 undo_last_move 的分工：undo 栈是「还原你动手前的样子」；
+    这里是「回到程序上次摆好的样子」——窗口被摆好后被拖乱，一键回去。
+    """
+    rect = last_arranged(hwnd)
+    if not rect:
+        return False
+    global _suppress_undo
+    _suppress_undo = True
+    try:
+        set_window_rect(hwnd, rect[0], rect[1], rect[2], rect[3], activate=False)
+    finally:
+        _suppress_undo = False
+    return True
+
+
 def _monitor_by_relative(monitors_list, src_hwnd):
+    """窗口归属屏索引：交集最长优先（Moom 的 Intersection Length 思路）。
+
+    中心点法在窗口横跨两块屏交界时会随机判给其中一块；按窗口与哪块屏
+    交集面积最大判，才符合用户看到的真实归属。中心点完全脱离所有屏
+    （读回异常）时由 screen_math 退回中心点法/首屏，行为只强不弱。
+    """
     x, y, w, h = get_window_rect(src_hwnd)
-    cx, cy = x + w // 2, y + h // 2
-    for i, m in enumerate(monitors_list):
-        if m.left <= cx < m.left + m.width and m.top <= cy < m.top + m.height:
-            return i
-    return 0
+    return screen_math.monitor_index_by_intersection(monitors_list, x, y, w, h)
 
 
 def move_to_monitor(hwnd, monitor, activate=True):
@@ -843,12 +891,8 @@ def snap(hwnd, monitor, zone, activate=True):
 
 
 def _monitor_index_by_rect(monitors_list, x, y, w, h):
-    """按给定矩形（而非 hwnd）判断所在显示器索引。"""
-    cx, cy = x + w // 2, y + h // 2
-    for i, m in enumerate(monitors_list):
-        if m.left <= cx < m.left + m.width and m.top <= cy < m.top + m.height:
-            return i
-    return 0
+    """按给定矩形（而非 hwnd）判断所在显示器索引：交集最长优先。"""
+    return screen_math.monitor_index_by_intersection(monitors_list, x, y, w, h)
 
 
 def _resolve_monitor_index(monitors_list, monitor):
