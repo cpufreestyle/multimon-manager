@@ -331,11 +331,13 @@ class TestSnapFourQuad(unittest.TestCase):
         ok, placed = _run(list(self.WINS),
                           [_Mon(width=ww, height=wh)], min_sizes=mins)
         self.assertTrue(ok)
-        # 新语义：格子铺满，窗口 fit 进格子；被最小尺寸顶大时方位贴边，
-        # 底边不得越出工作区（那是 macOS 搬屏的触发条件）
+        # 新语义：格子仍铺满工作区，但切分按实测最小尺寸校正——上排要 800
+        # 高就给它 800，下排只需要 200 就拿剩下的 200，两排都不溢出。
         cells = wm._last_quad_boxes
-        self.assertEqual(cells[0], (0, 0, ww // 2, wh // 2))
-        self.assertEqual(cells[2], (0, wh // 2, ww // 2, wh - wh // 2))
+        self.assertEqual(cells[0], (0, 0, ww // 2, 800))
+        self.assertEqual(cells[2], (0, 800, ww // 2, 200))
+        # 两排高度之和仍等于工作区高（铺满、不留缝）
+        self.assertEqual(cells[0][3] + cells[2][3], wh)
         for hwnd, x, y, w, h in placed:
             self.assertLessEqual(y + h, wh, "%s 越界" % hwnd)
 

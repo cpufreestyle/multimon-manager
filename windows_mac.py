@@ -30,8 +30,181 @@ import screen_math
 
 logger = logging.getLogger(__name__)
 
+# ── 写入前临时关掉目标 App 的窗口动画 ─────────────────────────────
+# 来源：Rectangle Pro 3.94 静态分析（字符串 "AXEnhancedUserInterface was
+# enabled, will disable before resizing"）。System Events 写入后系统会播放
+# 移动/缩放动画，一次写入只「部分应用」，于是要靠幂等重设反复推；中间态越多，
+# 越容易在某一帧越出屏幕底边，被 macOS 把整个窗口判给别的屏（真机实测
+# ChatGPT 被搬到 RV200 Pro）。关掉动画后写入立即生效：实测 2.96s -> 0.88s，
+# 且一次命中目标。用完立刻恢复原值，异常也恢复。
+_AX_LIB = None
+_AX_ATTR_ENHANCED = None
+
+
+def _load_ax():
+    """懒加载 ApplicationServices 与 AXEnhancedUserInterface 的 CFString。"""
+    global _AX_LIB, _AX_ATTR_ENHANCED
+    if _AX_LIB is not None:
+        return _AX_LIB
+    try:
+        from ctypes import cdll, util
+        lib = cdll.LoadLibrary(ctypes.util.find_library("ApplicationServices"))
+        lib.AXUIElementCreateApplication.restype = ctypes.c_void_p
+        lib.AXUIElementCreateApplication.argtypes = [ctypes.c_int]
+        lib.AXUIElementCopyAttributeValue.restype = ctypes.c_int
+        lib.AXUIElementCopyAttributeValue.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        lib.AXUIElementSetAttributeValue.restype = ctypes.c_int
+        lib.AXUIElementSetAttributeValue.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        cf = cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        _AX_ATTR_ENHANCED = cf.CFStringCreateWithCString(
+            None, b"AXEnhancedUserInterface", 0x08000100)
+        lib._kCFBooleanTrue = ctypes.c_void_p.in_dll(cf, "kCFBooleanTrue")
+        lib._kCFBooleanFalse = ctypes.c_void_p.in_dll(cf, "kCFBooleanFalse")
+        _AX_LIB = lib
+    except Exception as e:  # noqa: BLE001
+        logger.warning("AX 动画开关不可用，退回默认写入: %s", e)
+        _AX_LIB = False
+    return _AX_LIB
+
+
+class _AppAnimationOff:
+    """写入期间临时关掉目标 App 的窗口动画；退出时恢复原值。
+
+    读不到原始值时不动它（不猜），只在我们确实拿到布尔值时才关/复。
+    """
+
+    def __init__(self, app_name):
+        self.app_name = app_name
+        self.pid = None
+        self.was_on = None
+
+    def __enter__(self):
+        lib = _load_ax()
+        if not lib or not self.app_name:
+            return self
+        try:
+            pid = None
+            for w in list_windows_front_to_back():
+                if w.get("owner") == self.app_name:
+                    pid = w.get("pid")
+                    break
+            if not pid:
+                return self
+            el = lib.AXUIElementCreateApplication(int(pid))
+            if not el:
+                return self
+            out = ctypes.c_void_p()
+            if lib.AXUIElementCopyAttributeValue(
+                    ctypes.c_void_p(el), _AX_ATTR_ENHANCED,
+                    ctypes.byref(out)) != 0 or not out.value:
+                return self
+            # 取不到布尔本值时不当成 True：只在确实是 kCFBooleanTrue 时才关
+            if out.value != lib._kCFBooleanTrue.value:
+                return self
+            self.pid = int(pid)
+            self.was_on = True
+            lib.AXUIElementSetAttributeValue(
+                ctypes.c_void_p(el), _AX_ATTR_ENHANCED, lib._kCFBooleanFalse)
+        except Exception as e:  # noqa: BLE001
+            logger.info("关闭窗口动画失败（不影响写入）: %s", e)
+        return self
+
+    def __exit__(self, *_exc):
+        if self.pid is None or not self.was_on:
+            return False
+        lib = _load_ax()
+        if not lib:
+            return False
+        try:
+            el = lib.AXUIElementCreateApplication(self.pid)
+            lib.AXUIElementSetAttributeValue(
+                ctypes.c_void_p(el), _AX_ATTR_ENHANCED, lib._kCFBooleanTrue)
+        except Exception as e:  # noqa: BLE001
+            logger.info("恢复窗口动画失败: %s", e)
+        return False
+
 # ── 撤销栈：记录每次移动/缩放前的窗口几何，供"撤销移动"使用（F7）──
 _undo_stack = []
+
+
+# ── 窗口间距（借鉴 Rectangle Pro 的 GapCalculation / EdgeGapField）────────
+# 「格子之间留缝、窗口不顶边」有两个直接好处：
+#   1. 观感：四格清清楚楚分开，不再是四个窗口挤成一片；
+#   2. 容错：App 的最小尺寸把窗口顶大时，超出的部分先吃掉间距，不会立刻
+#      越出屏幕边界触发 macOS 搬屏。
+# 语义与 Rectangle Pro 一致：窗口之间隔 gap，屏幕边是否也隔由
+# gap_screen_edges 决定。
+_GAP_ZONES = {
+    # zone: (left, top, right, bottom) 哪些边需要让出间距
+    "left": (0, 0, 1, 0),          # 左半屏：右边让缝
+    "right": (1, 0, 0, 0),         # 右半屏：左边让缝
+    "top": (0, 0, 0, 1),
+    "bottom": (0, 1, 0, 0),
+    "left-third": (0, 0, 1, 0),
+    "middle-third": (1, 0, 1, 0),
+    "right-third": (1, 0, 0, 0),
+    "quad-tl": (0, 0, 1, 1),
+    "quad-tr": (1, 0, 0, 1),
+    "quad-bl": (0, 1, 1, 0),
+    "quad-br": (1, 1, 0, 0),
+}
+
+
+# 四宫格的四个方位对应的 zone 名（与 snap() 的 quad-* 一致）
+_QUAD_GAP_ZONE = ("quad-tl", "quad-tr", "quad-bl", "quad-br")
+
+
+def _gap_settings():
+    """读取窗口间距设置：(gap, gap_screen_edges)。异常时按关闭处理。"""
+    try:
+        import settings
+        s = settings.load()
+        gap = int(s.get("window_gap", 0) or 0)
+        edges = bool(s.get("gap_screen_edges", False))
+    except Exception:  # noqa: BLE001
+        return (0, False)
+    return (max(0, gap), edges)
+
+
+def gap_rect(zone, x, y, w, h, work_left, work_top, work_width, work_height):
+    """按 zone 把矩形向内让出间距；间距关闭时原样返回。
+
+    work_* 用来判断哪些边贴在工作区边界上——只有 gap_screen_edges 打开时
+    外边才让间距，否则四格仍贴住屏幕四边，只在窗口之间留缝。
+
+    window_gap 的语义是「可见缝隙」：窗口之间、窗口与屏幕边之间的实际缝隙
+    等于 window_gap。因此每个窗口在相应方向只让出一半，两边各让一半才凑成
+    一个完整缝隙（与 yabai 的 window margin 模型一致）。
+    """
+    gap, edges = _gap_settings()
+    half = gap / 2.0
+    if half <= 0 or w <= gap or h <= gap:
+        return (x, y, w, h)
+    ins = _GAP_ZONES.get(zone)
+    if ins is None:
+        # maximize / center 没有邻居：四边都算外边，只有勾选屏幕边才让
+        ins = (0, 0, 0, 0)
+    l, t, r, b = ins
+    if x <= work_left:
+        l = l or edges
+    if y <= work_top:
+        t = t or edges
+    if x + w >= work_left + work_width:
+        r = r or edges
+    if y + h >= work_top + work_height:
+        b = b or edges
+    nx = int(round(x + (half if l else 0)))
+    ny = int(round(y + (half if t else 0)))
+    nw = int(round(w - (half if l else 0) - (half if r else 0)))
+    nh = int(round(h - (half if t else 0) - (half if b else 0)))
+    if nw < 1 or nh < 1:
+        return (x, y, w, h)
+    return (nx, ny, nw, nh)
 _undo_lock = threading.Lock()
 _suppress_undo = False
 # 「上次摆放位」记忆（Moom 的 Last Moom Frame 思路）：窗口被本程序摆过
@@ -739,6 +912,10 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
     best_dev = None
     stall = 0
     logger.info("移动窗口: 进程=%s -> content x=%d y=%d w=%d h=%d", app, tx, ty, tw, th)
+    # 写入期间关掉该 App 的窗口动画（Rectangle Pro 同款做法）：动画会让一次
+    # 写入只部分应用、读回读到中间帧，中间态越界还会触发 macOS 搬屏。
+    anim = _AppAnimationOff(app)
+    anim.__enter__()
     # 退出 zoom/全屏态，否则 size 变更可能被忽略
     _osa(
         f'tell application "System Events"\n'
@@ -790,6 +967,7 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
                 break
         prev = c
         logger.info("幂等重设 第%d次 实测=%s 偏差=%d", attempt + 1, c, dev)
+    anim.__exit__()
     if not _internal:
         # 记住「上次摆放位」：窗口之后被用户拖乱时，可一键回到程序摆好的
         # 位置（撤销/回位本身不覆盖这个记忆）
@@ -882,6 +1060,8 @@ def snap(hwnd, monitor, zone, activate=True):
         logger.warning("snap: 未知区域 %s", zone)
         return
     tx, ty, tw, th = targets[zone]
+    # 窗口之间留缝（默认 0，行为与以前完全一致）
+    tx, ty, tw, th = gap_rect(zone, tx, ty, tw, th, wl, wt, ww, wh)
     set_window_rect(hwnd, tx, ty, tw, th, activate=activate)
     # App 的最小/固定尺寸会把请求尺寸钳制（真机实测 UU远程固定 921x680、
     # CrossPaste 固定 600x700、Marvis 最小宽 900）。尺寸到不了目标格子时，
@@ -1606,6 +1786,33 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # App 的最小尺寸顶大时只会朝「不贴边的那一侧」溢出，贴边的一侧仍然准确。
     col_x = (wl, wl + c1)
     row_y = (wt, wt + r1)
+    # 用实测最小尺寸校正切分：两排/两列都装得下时，按各自需求重切，
+    # 剩余空间仍按原比例分。只在「装得下」时调整，所以不会把某一边压成
+    # 几个像素；装不下才允许溢出（由后面的贴边 + 如实报告处理）。
+    # 没有这一层，ChatGPT 最小高 600 会被塞进 358 高的格子，向下溢出 240px
+    # 压住下排——真机实测四宫格上下重叠 246px 就是这么来的。
+    need_t = max(mins[picked[0][0]][1], mins[picked[1][0]][1])
+    need_b = max(mins[picked[2][0]][1], mins[picked[3][0]][1])
+    if need_t + need_b <= wh and (r1 < need_t or r2 < need_b):
+        slack = wh - (need_t + need_b)
+        share = (r1 / float(r1 + r2)) if (r1 + r2) > 0 else 0.5
+        r1 = min(wh - need_b, need_t + int(round(slack * share)))
+        r1 = max(r1, need_t)
+        r2 = wh - r1
+        row_y = (wt, wt + r1)
+        logger.info("四宫格：按最小高度重切上排 %d / 下排 %d（需求 %d / %d）",
+                    r1, r2, need_t, need_b)
+    need_l = max(mins[picked[0][0]][0], mins[picked[2][0]][0])
+    need_r = max(mins[picked[1][0]][0], mins[picked[3][0]][0])
+    if need_l + need_r <= ww and (c1 < need_l or c2 < need_r):
+        slack = ww - (need_l + need_r)
+        share = (c1 / float(c1 + c2)) if (c1 + c2) > 0 else 0.5
+        c1 = min(ww - need_r, need_l + int(round(slack * share)))
+        c1 = max(c1, need_l)
+        c2 = ww - c1
+        col_x = (wl, wl + c1)
+        logger.info("四宫格：按最小宽度重切左列 %d / 右列 %d（需求 %d / %d）",
+                    c1, c2, need_l, need_r)
     cells = [(col_x[0], row_y[0], c1, r1),
              (col_x[1], row_y[0], c2, r1),
              (col_x[0], row_y[1], c1, r2),
@@ -1613,6 +1820,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # 窗口在格子里的最终矩形：等比缩放 + 居中
     finals = []
     for (h, w), (bx, by, bw, bh) in zip(picked, cells):
+        # 先让出窗口间距再 fit：间距吸收 App 最小尺寸造成的溢出，四格也
+        # 清清楚楚分开（Rectangle Pro 的 GapCalculation）
+        bx, by, bw, bh = gap_rect(_QUAD_GAP_ZONE[idx], bx, by, bw, bh,
+                                  wl, wt, ww, wh)
         rx, ry, rw, rh = quad_plan.fit_frame(w, bw, bh, corner=idx)
         finals.append((int(round(bx + rx * bw)),
                        int(round(by + ry * bh)),

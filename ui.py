@@ -606,6 +606,33 @@ class App:
         self._tooltip(back_btn,
                       "把目标窗口送回上次被本程序摆好的位置"
                       "（窗口被拖乱后一键归位）")
+        # 窗口间距：吸附/排列时窗口之间、窗口与屏幕边之间留出缝隙。
+        # 借鉴 Rectangle Pro 的 GapCalculation：间距一是让四格清清楚楚分开，
+        # 二是吸收 App 最小尺寸把窗口顶大时的溢出，避免立刻越界被搬屏。
+        gap_row = ttk.Frame(f)
+        gap_row.pack(fill="x", padx=6, pady=(1, 1))
+        ttk.Label(gap_row, text="间距:").pack(side="left")
+        self.window_gap_var = tk.IntVar(
+            value=int(settings.load().get("window_gap", 0) or 0))
+        gap_spin = ttk.Spinbox(gap_row, from_=0, to=60, width=4,
+                               textvariable=self.window_gap_var,
+                               command=self._on_gap_change)
+        gap_spin.pack(side="left", padx=(4, 2))
+        gap_spin.bind("<FocusOut>", lambda _e: self._on_gap_change())
+        gap_spin.bind("<Return>", lambda _e: self._on_gap_change())
+        self._tooltip(gap_spin,
+                      "窗口之间的可见缝隙（像素）。0 = 不留缝，与以前一致。"
+                      "每个窗口在相应方向让出一半，两边凑成一个完整缝隙。")
+        self.gap_edges_var = tk.BooleanVar(
+            value=bool(settings.load().get("gap_screen_edges", False)))
+        gap_edges_cb = ttk.Checkbutton(
+            gap_row, text="屏幕边也留", variable=self.gap_edges_var,
+            command=self._on_gap_change)
+        gap_edges_cb.pack(side="left", padx=(4, 0))
+        self._tooltip(gap_edges_cb,
+                      "勾选后窗口与屏幕四边之间也留出间距；不勾则四格仍贴住屏幕边，"
+                      "只在窗口之间留缝。")
+
         # 移到指定屏：只有"上一屏/下一屏"时，三屏以上要连点好几次才能到位，
         # 这里直接选目标屏一次跳过去（下拉与并排/竖排共用同一份显示器列表）。
         mon_row = ttk.Frame(f)
@@ -842,6 +869,17 @@ class App:
             "窗口比勾选的屏少时有几屏铺几屏，多出来的屏不动。")
         # 勾选框按当前屏数生成（屏数为 1 时跨屏铺满等价于最大化，故不显示）
         self._rebuild_spread_checks()
+
+    def _on_gap_change(self):
+        """窗口间距改动即存盘：吸附/排列函数每次都会重新读设置。"""
+        try:
+            gap = int(self.window_gap_var.get())
+        except Exception:  # noqa: BLE001
+            gap = 0
+        s = settings.load()
+        s["window_gap"] = max(0, min(60, gap))
+        s["gap_screen_edges"] = bool(self.gap_edges_var.get())
+        settings.save(s)
 
     def _refresh_targets(self):
         """刷新可选窗口列表，尽量保留当前选择。"""
