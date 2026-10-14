@@ -1908,9 +1908,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
              (col_x[1], row_y[0], c2, r1),
              (col_x[0], row_y[1], c1, r2),
              (col_x[1], row_y[1], c2, r2)]
-    # 窗口在格子里的最终矩形：等比缩放 + 居中
+    # 窗口在格子里的最终矩形：等比缩放 + 贴方位角（fit_frame 用 corner 参数
+    # 决定贴哪个角，这里逐个传入，不再依赖循环外残留的 idx 变量）
     finals = []
-    for (h, w), (bx, by, bw, bh) in zip(picked, cells):
+    for idx, ((h, w), (bx, by, bw, bh)) in enumerate(zip(picked, cells)):
         # 先让出窗口间距再 fit：间距吸收 App 最小尺寸造成的溢出，四格也
         # 清清楚楚分开（Rectangle Pro 的 GapCalculation）
         bx, by, bw, bh = gap_rect(_QUAD_GAP_ZONE[idx], bx, by, bw, bh,

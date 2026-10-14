@@ -274,7 +274,7 @@ class TestSnapFourQuad(unittest.TestCase):
                          ["D::1", "C::1", "B::1", "A::1"])
 
     def test_right_column_follows_measured_left(self):
-        """左列被最小宽度撑宽时，右列必须贴着实测左边界，不能重叠。"""
+        """格子按 split_x 固定；窗口用 fit_frame 贴各自方位角。"""
         wl, wt, ww, wh = 0, 0, 1920, 1080
         col_w = int(round(ww * 0.3))          # 请求左列 576
         # 真机实测：ChatGPT 请求 454 读回 480（最小窗口宽度钳制）
@@ -287,13 +287,21 @@ class TestSnapFourQuad(unittest.TestCase):
         self.assertEqual(cells[0][2], col_w)
         self.assertEqual(cells[1][0], wl + col_w)
         self.assertEqual(cells[1][2], ww - col_w)
-        # 右上窗口左缘贴在格子左边（不越格）
+        # 新语义：窗口在格子里等比 fit + 贴方位角（corner 参数）。
+        # B 100x100 在 1344x540 格子里不放大，贴右上角。
         last_b = [p for p in placed if p[0] == "B::1"][-1]
-        self.assertLessEqual(last_b[1], cells[1][0] + 8)
-        # 四个窗口都落在各自格子里
+        # 贴右上角：右缘 = 格子右缘 1920，宽 100 -> 左缘 1820
+        self.assertEqual(last_b[1], 1820)
+        # placed 元组是 (hwnd, x, y, w, h)：y=0、w=100、h=100
+        self.assertEqual(last_b[2], 0)
+        self.assertEqual(last_b[3], 100)
+        self.assertEqual(last_b[4], 100)
+        # 四个窗口都落在各自格子里（不越格）
         for (hwnd, x, y, w, h), (bx, by, bw, bh) in zip(placed, cells):
-            self.assertGreaterEqual(x, bx - 8)
-            self.assertLessEqual(x + w, bx + bw + 8)
+            self.assertGreaterEqual(x, bx)
+            self.assertGreaterEqual(y, by)
+            self.assertLessEqual(x + w, bx + bw)
+            self.assertLessEqual(y + h, by + bh)
 
     def test_all_four_stay_on_one_screen_when_rows_too_tall(self):
         """真机故障回归：屏装不下四格最小高度时，四个窗口必须仍留在同一屏。
