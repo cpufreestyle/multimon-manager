@@ -20,6 +20,7 @@ import rules
 import slideshow
 import taskbar
 import triggers
+import title_match
 import cmd_channel
 
 # 多屏任务栏：界面显示值 → 内部位置值
@@ -705,6 +706,17 @@ class App:
         self._tooltip(gap_edges_cb,
                       "勾选后窗口与屏幕四边之间也留出间距；不勾则四格仍贴住屏幕边，"
                       "只在窗口之间留缝。")
+        # 相邻窗口联动（复刻 Rectangle Pro 的 adjustAdjacentWindows）：
+        # 吸附时若窗口左/上缘移动，相邻窗口自动让位，不会互相压盖。
+        self.adjacent_var = tk.BooleanVar(
+            value=bool(settings.load().get("adjacent_resize", False)))
+        adj_cb = ttk.Checkbutton(gap_row, text="联动相邻",
+                                 variable=self.adjacent_var,
+                                 command=self._on_adjacent_change)
+        adj_cb.pack(side="left", padx=(8, 0))
+        self._tooltip(adj_cb,
+                      "吸附时若窗口左/上缘移动，真正相邻的窗口自动让位"
+                      "（不会互相压盖，也不留缝）。默认关闭。")
 
         # 移到指定屏：只有"上一屏/下一屏"时，三屏以上要连点好几次才能到位，
         # 这里直接选目标屏一次跳过去（下拉与并排/竖排共用同一份显示器列表）。
@@ -953,6 +965,14 @@ class App:
         s["window_gap"] = max(0, min(60, gap))
         s["gap_screen_edges"] = bool(self.gap_edges_var.get())
         settings.save(s)
+
+    def _on_adjacent_change(self):
+        """相邻窗口联动开关即存盘。"""
+        s = settings.load()
+        s["adjacent_resize"] = bool(self.adjacent_var.get())
+        settings.save(s)
+        self.status_var.set(
+            "相邻窗口联动已" + ("开启" if self.adjacent_var.get() else "关闭"))
 
     def _refresh_targets(self):
         """刷新可选窗口列表，尽量保留当前选择。"""
@@ -2229,12 +2249,31 @@ class App:
                 f"布局「{name}」：显示器排列有变，但 UUID 匹配，按原坐标还原")
         ok, miss = 0, 0
         current = {w["hwnd"]: w["owner"] for w in b.list_target_windows()}
+        # 标题宽松匹配要用「窗口名」而不是应用名，单独取一份
+        cur_names = {w["hwnd"]: (w.get("name") or "")
+                     for w in b.list_target_windows()}
         adapt_n = 0
+        fuzzy_n = 0
         for item in layout["windows"]:
             hwnd = item["hwnd"]
             # 精确匹配；否则按应用名兜底（窗口标题可能已变化）
             target = hwnd if hwnd in current else next(
                 (h for h, o in current.items() if o == item["owner"]), None)
+            # 应用名兜底仍可能选错：同一 App 开多个窗口时第一个不一定是保存的
+            # 那个。加一层标题宽松匹配（Rectangle Pro 的 lenientMatch /
+            # TitleMatchingMode）：标题变了但实词还在，也能认出来。
+            if not target or not target.startswith(hwnd.split("::")[0] + "::"):
+                same_app = [(h, cur_name.get(h) or "")
+                            for h, cur_name in cur_names.items()
+                            if cur_name and (h.split("::")[0]
+                                             == hwnd.split("::")[0])]
+                if same_app:
+                    cand_h, mode, score = title_match.best_candidate(
+                        hwnd.split("::", 1)[1], same_app)
+                    if cand_h and (not target or cand_h != target
+                                   or mode == "exact"):
+                        target = cand_h
+                        fuzzy_n += 1
             # 匹配不上时按邻近度兜底：窗口标题全变了但还开着，也能按
             # 「当前哪个窗口离这个格子最近」归位（Moom 的 Proximity 匹配思路）
             if not target:
@@ -2265,6 +2304,8 @@ class App:
         status = f"已还原布局「{name}」：成功 {ok}，未找到 {miss}"
         if adapt_n:
             status += f"，按比例重映射 {adapt_n} 个（显示器配置已变化）"
+        if fuzzy_n:
+            status += f"，其中 {fuzzy_n} 个按标题宽松匹配认出"
         self.status_var.set(status)
         if silent:
             return True

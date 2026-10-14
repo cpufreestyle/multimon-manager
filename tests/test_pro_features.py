@@ -144,5 +144,87 @@ def tempfile_dir():
     return d
 
 
+class TestAdjustAdjacent(unittest.TestCase):
+    WL, WT, WW, WH = 0, 0, 1920, 1080
+
+    def test_right_neighbor_follows_new_right_edge(self):
+        """target 左缘右移：右邻左缘贴到 target 新右缘，宽度补齐到工作区右边。"""
+        out = screen_math.adjust_adjacent_rects(
+            (200, 0, 556, 1080), [("B", (756, 0, 1164, 1080))],
+            "x", 200, self.WL, self.WT, self.WW, self.WH)
+        self.assertEqual(len(out), 1)
+        key, (x, y, w, h) = out[0]
+        self.assertEqual(key, "B")
+        self.assertEqual(x, 756)            # 贴住 target 新右缘
+        self.assertEqual(x + w, 1920)       # 右缘仍是工作区右边
+
+    def test_left_neighbor_follows_new_left_edge(self):
+        """target 左缘左移：左邻右缘贴到 target 新左缘。"""
+        out = screen_math.adjust_adjacent_rects(
+            (200, 0, 356, 1080), [("A", (0, 0, 400, 1080))],
+            "x", -200, self.WL, self.WT, self.WW, self.WH)
+        self.assertEqual(len(out), 1)
+        key, (x, y, w, h) = out[0]
+        self.assertEqual(key, "A")
+        self.assertEqual(x, 0)              # 不推出工作区左边
+        self.assertEqual(x + w, 200)        # 右缘贴住 target 新左缘（200）
+
+    def test_target_pushed_out_of_work_is_skipped(self):
+        """target 被推出工作区时不动相邻窗口（避免算出负尺寸）。"""
+        out = screen_math.adjust_adjacent_rects(
+            (-200, 0, 556, 1080), [("A", (0, 0, 400, 1080))],
+            "x", -200, self.WL, self.WT, self.WW, self.WH)
+        self.assertEqual(out, [])
+
+    def test_non_overlapping_axis_is_skipped(self):
+        """垂直投影显著不足的不算左右邻居（只擦到一个角）。"""
+        out = screen_math.adjust_adjacent_rects(
+            (200, 0, 556, 1080), [("B", (756, 0, 1164, 100))],
+            "x", 200, self.WL, self.WT, self.WW, self.WH)
+        self.assertEqual(out, [])
+
+    def test_already_flush_returns_noop(self):
+        """相邻窗口已经贴着 target 新右缘时，不产生重排（等价于没动）。"""
+        out = screen_math.adjust_adjacent_rects(
+            (200, 0, 556, 1080), [("B", (756, 0, 1164, 400))],
+            "x", 200, self.WL, self.WT, self.WW, self.WH)
+        # B 已贴住 target 新右缘 756，新矩形与原矩形一致
+        k, r = out[0]
+        self.assertEqual(r, (756, 0, 1164, 400))
+
+    def test_opposite_side_is_skipped(self):
+        """target 左缘右移时，左边的窗口不动（它不是让位方）。"""
+        out = screen_math.adjust_adjacent_rects(
+            (200, 0, 556, 1080), [("A", (0, 0, 200, 1080))],
+            "x", 200, self.WL, self.WT, self.WW, self.WH)
+        self.assertEqual(out, [])
+
+    def test_vertical_axis(self):
+        """上下方向同理：下邻上缘贴到 target 新底缘。"""
+        out = screen_math.adjust_adjacent_rects(
+            (0, 200, 1920, 556), [("B", (0, 756, 1920, 324))],
+            "y", 200, self.WL, self.WT, self.WW, self.WH)
+        self.assertEqual(len(out), 1)
+        key, (x, y, w, h) = out[0]
+        self.assertEqual(y, 756)
+        self.assertEqual(y + h, 1080)
+
+    def test_zero_delta_noop(self):
+        out = screen_math.adjust_adjacent_rects(
+            (0, 0, 960, 1080), [("B", (960, 0, 960, 1080))],
+            "x", 0, self.WL, self.WT, self.WW, self.WH)
+        self.assertEqual(out, [])
+
+    def test_no_gap_no_overlap_after_move(self):
+        """联动后两窗不压盖、不留缝（这是联动功能的存在理由）。"""
+        new_t = (200, 0, 556, 1080)
+        out = screen_math.adjust_adjacent_rects(
+            new_t, [("B", (756, 0, 1164, 1080))],
+            "x", 200, self.WL, self.WT, self.WW, self.WH)
+        _k, (bx, by, bw, bh) = out[0]
+        self.assertEqual(bx, new_t[0] + new_t[2])
+        self.assertEqual(bx + bw, self.WL + self.WW)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1118,6 +1118,62 @@ def snap(hwnd, monitor, zone, activate=True):
     _last_snap_report[:] = [(hwnd, (tx, ty, tw, th), tuple(got))]
 
 
+def adjust_adjacent(hwnd, old_rect, new_rect, activate=False):
+    """窗口被移动/缩放后，让真正相邻的窗口跟着让位。
+
+    复刻 Rectangle Pro 的 adjustAdjacentWindows(toResized:withInitialRect:)：
+    把左半屏的窗口拖宽时，右半屏的窗口自动左移让位，不会互相压盖，也不留缝。
+    只有沿移动轴投影重叠的窗口才算相邻；让位量受工作区边界限制，推不动就停。
+    返回被调整的窗口数。
+    """
+    if not old_rect or not new_rect:
+        return 0
+    if old_rect == new_rect:
+        return 0
+    ms = monitors.enum_monitors()
+    if not ms:
+        return 0
+    idx = _monitor_index_by_rect(ms, new_rect[0], new_rect[1],
+                                 new_rect[2], new_rect[3])
+    mon = ms[idx]
+    wl, wt, ww, wh = mon.work_rect
+    # 取位移较大的那个轴作为联动轴
+    dx = new_rect[0] - old_rect[0]
+    dy = new_rect[1] - old_rect[1]
+    if abs(dx) < abs(dy):
+        axis, delta = "y", dy
+    else:
+        axis, delta = "x", dx
+    if delta == 0:
+        return 0
+    others = []
+    for w in list_target_windows():
+        h = w.get("hwnd")
+        if not h or h == hwnd:
+            continue
+        if w.get("pid") in _OWN_PIDS:
+            continue
+        r = (w["x"], w["y"], w["w"], w["h"])
+        if not (mon.left <= r[0] + r[2] / 2.0 < mon.left + mon.width
+                and mon.top <= r[1] + r[3] / 2.0 < mon.top + mon.height):
+            continue  # 只联动同屏窗口
+        others.append((h, r))
+    if not others:
+        return 0
+    moved = 0
+    for h, r in screen_math.adjust_adjacent_rects(
+            new_rect, others, axis, delta, wl, wt, ww, wh):
+        try:
+            set_window_rect(h, r[0], r[1], r[2], r[3], activate=activate)
+            moved += 1
+        except Exception as e:  # noqa: BLE001
+            logger.info("联动相邻窗口失败 %s: %s", h, e)
+    if moved:
+        logger.info("相邻窗口联动：%s 移动 %d，带动 %d 个窗口",
+                    hwnd, delta, moved)
+    return moved
+
+
 def _monitor_index_by_rect(monitors_list, x, y, w, h):
     """按给定矩形（而非 hwnd）判断所在显示器索引：交集最长优先。"""
     return screen_math.monitor_index_by_intersection(monitors_list, x, y, w, h)
@@ -2090,7 +2146,17 @@ def snap_active(zone, use_pinned=True, activate=True):
         logger.warning("未找到可操作的前台窗口（可能只剩本程序自己）")
         return
     idx = _monitor_by_relative(ms, hwnd)
+    # 吸附前记下原几何：吸附后若窗口左/上缘移动了，让相邻窗口跟着让位
+    # （Rectangle Pro 的 adjustAdjacentWindows），避免左右两窗互相压盖
+    old_rect = get_window_rect(hwnd)
     snap(hwnd, ms[idx], zone, activate=activate)
+    try:
+        import settings
+        if settings.load().get("adjacent_resize", False):
+            adjust_adjacent(hwnd, old_rect, get_window_rect(hwnd),
+                            activate=activate)
+    except Exception as e:  # noqa: BLE001
+        logger.info("相邻窗口联动跳过: %s", e)
 
 
 def stash_active(use_pinned=True, activate=False):

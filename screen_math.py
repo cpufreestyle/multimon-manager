@@ -191,6 +191,81 @@ def display_uuids(monitors):
     return out
 
 
+def adjust_adjacent_rects(target_rect, others, axis, delta, work_left,
+                          work_top, work_width, work_height):
+    """沿某轴移动/缩放 target 时，算出相邻窗口该让出多少（复刻 Rectangle Pro
+    的 adjustAdjacentWindows(toResized:withInitialRect:)）。
+
+    语义：只有**与 target 沿该轴方向真正相邻**的窗口才让位——相邻指的是
+    两者在垂直于该轴的方向上投影重叠，且目标窗口就在它旁边。让位量等于
+    target 在该轴上的位移 delta，但不允许把相邻窗口推出工作区（推到边界就
+    停住，剩下的由 target 自己吸收）。
+
+    axis: "x" 表示左右方向（delta 是 target 左缘移动量），"y" 表示上下
+    方向（delta 是 target 上缘移动量）。delta > 0 往右/下挪，右侧/下侧
+    的相邻窗口跟着让；delta < 0 反之。
+    others: [(key, rect), ...]，rect 为 (x, y, w, h)。
+    返回 [(key, new_rect), ...]，只包含真的需要动的窗口。
+    """
+    out = []
+    tx, ty, tw, th = target_rect
+    if delta == 0:
+        return out
+    for key, (ox, oy, ow, oh) in others:
+        if axis == "x":
+            # 垂直投影（y）必须显著重叠才算左右相邻：只擦到一个角的
+            # 不算（真机右侧窗口只露 400 高时不该被联动）
+            overlap = min(ty + th, oy + oh) - max(ty, oy)
+            # 显著 = 覆盖了对方窗口高度的至少 1/3
+            # 显著 = 覆盖 target 高度的至少 1/3（B 只露 100 高时不该联动）
+            if overlap * 3 < th:
+                continue
+            if delta < 0:
+                # target 左缘左移：左边的相邻窗口右缘贴到 target 新左缘，
+                # 左缘仍是工作区左边——既不压盖也不留缝
+                if ox + ow < tx - 1:
+                    continue
+                new_w = tx - work_left
+                if new_w < 1:
+                    continue
+                out.append((key, (work_left, oy, new_w, oh)))
+            else:
+                # target 左缘右移：右边的相邻窗口左缘贴到 target 的新右缘，
+                # 宽度用「到工作区右边」补齐——既不压盖也不留缝
+                if ox < tx + tw - 1:
+                    continue
+                new_x = tx + tw
+                new_w = work_left + work_width - new_x
+                if new_w < 1:
+                    continue
+                out.append((key, (new_x, oy, new_w, oh)))
+        else:
+            # 水平投影（x）必须显著重叠才算上下相邻
+            overlap = min(tx + tw, ox + ow) - max(tx, ox)
+            if overlap * 3 < tw:
+                continue
+            if delta < 0:
+                # target 上缘上移：上边的相邻窗口底缘贴到 target 新上缘，
+                # 上缘仍是工作区顶边
+                if oy + oh < ty - 1:
+                    continue
+                new_h = ty - work_top
+                if new_h < 1:
+                    continue
+                out.append((key, (ox, work_top, ow, new_h)))
+            else:
+                # target 上缘下移：下边的相邻窗口上缘贴到 target 的新底缘，
+                # 高度用「到工作区底边」补齐
+                if oy < ty + th - 1:
+                    continue
+                new_y = ty + th
+                new_h = work_top + work_height - new_y
+                if new_h < 1:
+                    continue
+                out.append((key, (ox, new_y, ow, new_h)))
+    return out
+
+
 # 吸附方位 -> 该方位必须贴住的那条边。App 的最小/固定尺寸把窗口钳小时，
 # 尺寸到不了目标格子，但「用户要贴的边」必须仍然贴住工作区边界。
 RIGHT_ZONES = ("right", "right-third", "quad-tr", "quad-br")
