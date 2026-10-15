@@ -77,22 +77,40 @@ class TestSecondScreenOrigin(unittest.TestCase):
                          [(0, "LO"), (2, "HI")])
 
 
-class TestProximityNeverOverridesFit(unittest.TestCase):
-    """权重只够打破平局：宽高比契合的结论不许被距离颠倒。"""
+class TestWideAndTallSplitIntoColumns(unittest.TestCase):
+    """宽窗与竖窗分居两列：谁去宽列由契合定，宽列落哪侧由就近定。
 
-    # 四个窗口全都放在「契合结论的反面」：宽窗在左、竖窗在右
-    WINS = [{"hwnd": "chat", "w": 1500, "h": 900, "x": 0, "y": 0},
-            {"hwnd": "term", "w": 400, "h": 900, "x": 1500, "y": 0},
-            {"hwnd": "code", "w": 1200, "h": 700, "x": 0, "y": 500},
-            {"hwnd": "doc", "w": 700, "h": 1000, "x": 1500, "y": 500}]
+    旧实现把横向搜索 hi 钉在 0.5，搜不到「宽窗确实需要宽列」的切分：要么把
+    竖窗塞进过窄的列（横向溢出），要么把宽窗甩到物理另一侧的宽列（横穿屏幕）
+    ——两者都是「不准」。现在 sx 放开到 [0.15, 0.85]：宽窗去宽列、竖窗去窄列，
+    且宽列落在宽窗本来所在的那一侧，契合与就近不再打架。
+    """
 
-    def test_widest_still_goes_right_column(self):
-        lay, _sx, _sy = plan_quad_smart(self.WINS, 1920, 1080)
-        self.assertEqual({lay[1]["hwnd"], lay[3]["hwnd"]}, {"chat", "code"})
+    # 宽窗在左、竖窗在右
+    WINS = [{"hwnd": "chat", "w": 1200, "h": 700, "x": 0, "y": 0},
+            {"hwnd": "code", "w": 1100, "h": 650, "x": 0, "y": 500},
+            {"hwnd": "term", "w": 450, "h": 900, "x": 1400, "y": 0},
+            {"hwnd": "doc", "w": 500, "h": 850, "x": 1400, "y": 500}]
 
-    def test_tallest_still_goes_left_column(self):
-        lay, _sx, _sy = plan_quad_smart(self.WINS, 1920, 1080)
-        self.assertEqual({lay[0]["hwnd"], lay[2]["hwnd"]}, {"term", "doc"})
+    def _cols(self, lay):
+        return {w["hwnd"]: (0 if i in (0, 2) else 1)
+                for i, w in enumerate(lay)}
+
+    def test_widest_windows_share_one_column(self):
+        lay, sx, _sy = plan_quad_smart(self.WINS, 1920, 1080)
+        cols = self._cols(lay)
+        # 两个宽窗同列、两个竖窗同列，且宽窗那一列正是宽列
+        self.assertEqual(cols["chat"], cols["code"])
+        self.assertEqual(cols["term"], cols["doc"])
+        self.assertNotEqual(cols["chat"], cols["term"])
+        wide_w = 1920 * sx if cols["chat"] == 0 else 1920 * (1 - sx)
+        self.assertGreater(wide_w, 1920 - wide_w)
+
+    def test_wide_column_follows_window_side(self):
+        """宽窗本来在左：宽列也落在左边，窗口不横穿屏幕。"""
+        lay, sx, _sy = plan_quad_smart(self.WINS, 1920, 1080)
+        self.assertEqual(self._cols(lay)["chat"], 0)
+        self.assertGreater(sx, 0.5)
 
 
 class TestProxCostUnits(unittest.TestCase):

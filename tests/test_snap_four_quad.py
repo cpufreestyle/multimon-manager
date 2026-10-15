@@ -186,10 +186,13 @@ class TestSnapFourQuad(unittest.TestCase):
         ok, placed = _run(list(self.WINS)[:3], [_Mon()])
         self.assertTrue(ok)
         self.assertEqual([p[0] for p in placed], ["A::1", "B::1", "C::1"])
-        # 三格仍是 2x2 的左上/右上/左下，右下空着
+        # 三格是 T 形：左上/右上各半屏，左下拉通整宽。旧实现把右下留成整块
+        # 四分之一屏，用户看到的就是一块没人用的死区
         cells = wm._last_quad_boxes
         self.assertEqual(cells[0], (0, 0, 960, 540))
-        self.assertEqual(cells[2], (0, 540, 960, 540))
+        self.assertEqual(cells[1], (960, 0, 960, 540))
+        self.assertEqual(cells[2], (0, 540, 1920, 540))
+        self.assertEqual(cells[3], (960, 540, 0, 540))
         self.assertNotIn("D::1", {p[0] for p in placed})
 
     def test_only_one_window_fails(self):
@@ -234,10 +237,12 @@ class TestSnapFourQuad(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual([p[0] for p in placed], ["A::1", "B::1", "C::1"])
         self.assertNotIn("D::1", {p[0] for p in placed})
-        # 两排两列都有人：仍是标准 2x2，右下角空着
+        # 下排只有左下：这一格拉通整宽排成 T 形，右下角宽 0（不占地方）
         cells = wm._last_quad_boxes
         self.assertEqual(cells[0], (0, 0, 960, 540))
-        self.assertEqual(cells[3], (960, 540, 960, 540))
+        self.assertEqual(cells[1], (960, 0, 960, 540))
+        self.assertEqual(cells[2], (0, 540, 1920, 540))
+        self.assertEqual(cells[3], (960, 540, 0, 540))
 
     def test_monitor_offset(self):
         """指定非主屏时，四宫格应落在该屏工作区内。"""
@@ -327,16 +332,19 @@ class TestSnapFourQuad(unittest.TestCase):
                           tl_hwnd="A::1", tr_hwnd="B::1", smart=True)
         self.assertTrue(ok)
         self.assertEqual(len(placed), 2)
-        # 瘦高的去左上、宽扁的去右上：智能分配按宽高比换角
+        # 宽扁的 A 去左上宽格、瘦高的 B 去右上窄格：智能分配按宽高比换角，
+        # 且 A 本来就在最左（就近），不横穿屏幕
         slots = dict(wm._last_quad_slots)
-        self.assertEqual(slots[0], "B::1")
-        self.assertEqual(slots[1], "A::1")
+        self.assertEqual(slots[0], "A::1")
+        self.assertEqual(slots[1], "B::1")
         # 只有上排有窗口：上排撑满整个工作区高，下排高度为 0
         cells = wm._last_quad_boxes
         self.assertEqual(cells[0][3], 1080)
         self.assertEqual(cells[2][3], 0)
-        # 左窄右宽：瘦高窗占窄格、宽扁窗占宽格
-        self.assertLess(cells[0][2], cells[1][2])
+        # 左宽右窄：宽扁窗占宽格、瘦高窗占窄格
+        self.assertEqual(cells[0], (0, 0, 1248, 1080))
+        self.assertEqual(cells[1], (1248, 0, 672, 1080))
+        self.assertGreater(cells[0][2], cells[1][2])
         # 界面上的竖向分割线必须报「撑满」（1.0），不能报成 0.85
         self.assertAlmostEqual(wm._last_quad_splits[1], 1.0)
 
@@ -354,19 +362,23 @@ class TestSnapFourQuad(unittest.TestCase):
         self.assertEqual(len(placed), 3)
         slots = dict(wm._last_quad_slots)
         self.assertEqual(set(slots), {0, 1, 2})
-        # 按宽高比各就各位：最宽扁的 A(4.0) 去右上宽格、方正的 C(1.0) 去左上
-        # 近方格、瘦高的 B(0.5) 去左下窄高格。三个格子实测宽高比 1.02 / 4.06 /
-        # 0.55，与三个窗口的宽高比几乎一一对应。
-        self.assertEqual(slots[1], "A::1")
+        # 按宽高比各就各位：最宽扁的 A(4.0) 去下拉通整宽的格、方正的 C(1.0)
+        # 去左上近方格、瘦高的 B(0.5) 去右上格。实测格子宽高比 1.40 / 1.14 /
+        # 5.93，与三个窗口的宽高比同序——最宽扁的那个拿最宽的那格。
         self.assertEqual(slots[0], "C::1")
-        self.assertEqual(slots[2], "B::1")
+        self.assertEqual(slots[1], "B::1")
+        self.assertEqual(slots[2], "A::1")
         # 与传入顺序不同：这才是「智能」该有的样子（旧实现三个窗口直接抛
         # ValueError 退化成手动顺序，等于没有智能模式）
         self.assertNotEqual([h for _c, h in wm._last_quad_slots],
                             ["A::1", "B::1", "C::1"])
-        # 右下角空着：右列起点仍由实际分配的窗口定，两列不重叠
+        # T 形：下排只有左下，这一格拉通整宽；右下角宽 0，不留死区
         cells = wm._last_quad_boxes
-        self.assertLess(cells[0][2], cells[1][2])
+        self.assertEqual(cells[0], (0, 0, 1056, 756))
+        self.assertEqual(cells[1], (1056, 0, 864, 756))
+        self.assertEqual(cells[2], (0, 756, 1920, 324))
+        self.assertEqual(cells[3], (1056, 756, 0, 324))
+        # 两列不重叠、下排接在上排底边
         self.assertEqual(cells[0][0] + cells[0][2], cells[1][0])
         self.assertEqual(cells[2][1], cells[0][1] + cells[0][3])
 
@@ -682,6 +694,87 @@ class TestSnapFourQuad(unittest.TestCase):
             ok, placed = _run(list(self.WINS), [_Mon()], split_y=bad)
             self.assertTrue(ok)
             self.assertGreaterEqual(wm._last_quad_boxes[0][3], int(wh * 0.15) - 1)
+
+    def test_oversized_writeback_drops_window_and_restores_it(self):
+        """写入后实测超容要减载：放不下的窗口放回原状，只排装得下的。
+
+        真机 Shadowrocket：探测最小高 319，写入后被 App 钳在 492。预检按 319
+        说这块屏装得下，写进去窗口被撑大，两排需求随之超过工作区——照原样切
+        格子只能按需求占比硬分，上下两排互相压住，用户看到的就是「不准」。
+        写入后必须复检一次：装不下就减载，并把减载的窗口放回探测前的原状，
+        不停在排了一半的位置上。
+        """
+        ww, wh = 1600, 900
+        # 探测值都说放得下：四格需求 1312x572，屏 1600x900 装得下
+        mins = {"A::1": (500, 300), "B::1": (400, 280),
+                "C::1": (700, 260), "D::1": (600, 240)}
+        # D 写入后被 App 撑到 700 高。夹具的 readback 同时充当「排列前的当前
+        # 几何」：中心必须落在屏内（否则被判成钉死），且与 wins 里的初始几何
+        # 不同（否则写入被判成无效）
+        orig = (900, 100, 600, 700)
+        wins = [_win("A::1", x=10, y=20), _win("B::1", x=2000, y=30),
+                _win("C::1", x=10, y=2000),
+                _win("D::1", x=3000, y=20, w=600, h=700)]
+        ok, placed = _run(wins, [_Mon(width=ww, height=wh)],
+                          tl_hwnd="A::1", tr_hwnd="B::1",
+                          bl_hwnd="C::1", br_hwnd="D::1",
+                          min_sizes=mins, readback={"D::1": orig})
+        self.assertTrue(ok)
+        # 只排装得下的三个，D 退出排列——不是四个硬排成重叠成一团
+        self.assertEqual([h for _c, h in wm._last_quad_slots],
+                         ["A::1", "B::1", "C::1"])
+        # 说明里点名谁没排、为什么：用户据此知道该关谁、换谁
+        notes = "；".join(wm._last_quad_notes)
+        self.assertIn("只排出 3/4", notes)
+        self.assertIn("D(最小600x700)", notes)
+        # 被 App 钳制不是写不动：D 不该被报成「写入无效」
+        self.assertNotIn("D::1", wm._last_quad_unwritable)
+        # 减载窗口的最后一次写入 = 放回探测前的原状
+        last = {}
+        for hwnd, x, y, w, h in placed:
+            last[hwnd] = (x, y, w, h)
+        self.assertEqual(last["D::1"], orig)
+        # 排下的三个互不压盖，且一个都不越出工作区
+        keep = [last[h] for h in ("A::1", "B::1", "C::1")]
+        for x, y, w, h in keep:
+            self.assertGreaterEqual(x, 0)
+            self.assertGreaterEqual(y, 0)
+            self.assertLessEqual(x + w, ww)
+            self.assertLessEqual(y + h, wh)
+        for p, q in ((keep[0], keep[1]), (keep[0], keep[2]),
+                     (keep[1], keep[2])):
+            dx = min(p[0] + p[2], q[0] + q[2]) - max(p[0], q[0])
+            dy = min(p[1] + p[3], q[1] + q[3]) - max(p[1], q[1])
+            self.assertEqual(max(0, dx) * max(0, dy), 0)
+
+    def test_writeback_within_gap_tolerance_keeps_all_four(self):
+        """读回只比目标大、但不比格子大时不减载：四个照排，不留任何说明。
+
+        超容判据是「比格子还大 8px 以上」而不是「比目标大」：目标已让出窗口
+        间距，拿间距噪声当超容会触发无谓的重排与减载——用户看到的就是「该排
+        四个却只排了三个」。
+        """
+        ww, wh = 1600, 900
+        mins = {"A::1": (500, 300), "B::1": (400, 280),
+                "C::1": (700, 260), "D::1": (600, 240)}
+        # 读回 = 格子原大：比让出间距后的目标大 6px，但不比格子大
+        readback = {"A::1": (0, 0, 800, 450), "B::1": (800, 0, 800, 450),
+                    "C::1": (0, 450, 800, 450), "D::1": (800, 450, 800, 450)}
+        ok, placed = _run(list(self.WINS), [_Mon(width=ww, height=wh)],
+                          tl_hwnd="A::1", tr_hwnd="B::1",
+                          bl_hwnd="C::1", br_hwnd="D::1",
+                          min_sizes=mins, readback=readback)
+        self.assertTrue(ok)
+        self.assertEqual([p[0] for p in placed],
+                         ["A::1", "B::1", "C::1", "D::1"])
+        self.assertEqual(len(wm._last_quad_slots), 4)
+        # 不减载就不留「放不下」的说明
+        self.assertEqual(wm._last_quad_notes, [])
+        # 每个窗口只写一次，落在让出间距后的格子里：左列贴左、上排贴顶、
+        # 右列贴右、下排贴底，相邻两窗之间正好隔一个窗口间距（12px）
+        self.assertEqual(placed, [
+            ("A::1", 0, 0, 794, 444), ("B::1", 806, 0, 794, 444),
+            ("C::1", 0, 456, 794, 444), ("D::1", 806, 456, 794, 444)])
 
 
 def _run_fill(wins, mons, **kw):

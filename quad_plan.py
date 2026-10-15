@@ -42,6 +42,12 @@ MIN_CELL_FRAC = 0.35
 PROX_WEIGHT = 0.25
 
 
+# 格子装不下窗口 App 最小尺寸时的软惩罚权重。写入后窗口会被 App 顶大：要么
+# 溢出压住邻居，要么被贴角逻辑挤到别处——两者都是「不准」。用软惩罚而不是
+# 硬约束：旧实现把最小尺寸当硬约束时，真机实测 sy 被压到 0.2。
+MIN_PEN_WEIGHT = 3.0
+
+
 def _center(win):
     """窗口当前中心点（全局坐标）；没有几何信息时返回 None。
 
@@ -60,15 +66,15 @@ def _center(win):
     return (x + w / 2.0, y + h / 2.0)
 
 
-def _cell_centers(sizes, ox=0.0, oy=0.0):
-    """四个格子的中心点（全局坐标）。sizes 见 grid_geometry 的返回顺序。"""
-    c1, r1 = sizes[0]
-    c2 = sizes[1][0]
-    r2 = sizes[2][1]
-    return {0: (ox + c1 / 2.0, oy + r1 / 2.0),
-            1: (ox + c1 + c2 / 2.0, oy + r1 / 2.0),
-            2: (ox + c1 / 2.0, oy + r1 + r2 / 2.0),
-            3: (ox + c1 + c2 / 2.0, oy + r1 + r2 / 2.0)}
+def _cell_centers(cells):
+    """四个格子的中心点（全局坐标），按实际矩形算。
+
+    T 形下有格子拉通整宽，四格不再是整齐的 2x2：按 sizes 元组推会把宽格子的
+    中心算到工作区外，proximity 的排序整个反过来。cells 即 quad_cells 的返回，
+    空格子也算进去（不参与成本，只是字典里多几个键）。
+    """
+    return {c: (x + w / 2.0, y + h / 2.0)
+            for c, (x, y, w, h) in enumerate(cells)}
 
 
 def _prox_cost(pairs, cell_centers, diag):
@@ -121,6 +127,81 @@ def _ratio(win):
     return w / h
 
 
+def quad_shape(occ):
+    """按被占用的角推导四宫格形状。纯函数，windows 侧与界面预览共用。
+
+    occ: 被占用的角（0~3 的可迭代）。返回 dict：
+      occ      被占用的角（set）
+      cnt_row  [上排占用数, 下排占用数]
+      cnt_col  [左列占用数, 右列占用数]
+      row_full 只有一排有窗口（n>=2）：该排撑满整个工作区高
+      col_full 只有一列有窗口（n>=2）：该列撑满整个工作区宽
+      wide     [上排只占一格, 下排只占一格]（两排都非空时）：那一格拉通
+               整宽，排成 T 形；空格子落在被拉通的那排时宽度记 0
+
+    一个窗口时不撑满（那是 maximize，不是四宫格），n>=2 才论形状。
+    """
+    occ = set(int(c) for c in occ)
+    cnt_row = [sum(1 for c in occ if c in (0, 1)),
+               sum(1 for c in occ if c in (2, 3))]
+    cnt_col = [sum(1 for c in occ if c in (0, 2)),
+               sum(1 for c in occ if c in (1, 3))]
+    both_rows = cnt_row[0] > 0 and cnt_row[1] > 0
+    return {
+        "occ": occ,
+        "cnt_row": cnt_row,
+        "cnt_col": cnt_col,
+        "row_full": len(occ) >= 2 and (cnt_row[0] == 0 or cnt_row[1] == 0),
+        "col_full": len(occ) >= 2 and (cnt_col[0] == 0 or cnt_col[1] == 0),
+        "wide": [both_rows and cnt_row[0] == 1,
+                 both_rows and cnt_row[1] == 1],
+    }
+
+
+def quad_cells(shape, c1, r1, wl, wt, ww, wh):
+    """按形状与生效切分算四个格子的绝对矩形。纯函数，windows 侧与界面共用。
+
+    c1/r1 是「两排两列都非空」时的列切分 / 排切分毛值；shape 决定哪些格子
+    拉通整宽（wide）、哪一排/列撑满（row_full/col_full）。这样「三窗 T 形」
+    「两窗斜角上下堆」都不会在工作区里留死区——旧实现把空着的那角留成整块的
+    四分之一屏，用户看到的就是「没排好」。
+
+    空格子的矩形约定（既有测试口径）：该排被拉通整宽或该列为空 -> 宽 0；
+    该排为空 -> 高 0；位置仍取该列/排的起点（空格不占地方，分割线才准）。
+    """
+    cnt_row, cnt_col = shape["cnt_row"], shape["cnt_col"]
+    wide, occ = shape["wide"], shape["occ"]
+    if shape["row_full"]:
+        r1 = wh if cnt_row[0] else 0
+    if shape["col_full"]:
+        c1 = ww if cnt_col[0] else 0
+    r2 = wh - r1
+    c2 = ww - c1
+    col_x = (wl, wl + c1)
+    row_y = (wt, wt + r1)
+    cells = []
+    for corner in range(4):
+        ri = 0 if corner in (0, 1) else 1
+        ci = 0 if corner in (0, 2) else 1
+        bx, by = col_x[ci], row_y[ri]
+        bw = c1 if ci == 0 else c2
+        bh = r1 if ri == 0 else r2
+        if corner in occ:
+            if wide[ri]:
+                # 这一排只占一格：拉通整宽，排成 T 形。起点必须回到工作区
+                # 左边——宽格落在右列时 col_x[1] 是列切分点，照它排这一格会
+                # 整个伸出工作区右边界（实测右下窗口跑到 x+w=2880，macOS
+                # 随即将整个窗口判给别的屏，就是「四个窗口不在一个屏幕上」）
+                bx, bw = wl, ww
+        else:
+            if wide[ri] or cnt_col[ci] == 0:
+                bw = 0
+            if cnt_row[ri] == 0:
+                bh = 0
+        cells.append((bx, by, bw, bh))
+    return cells
+
+
 def plan_quad_layout(wins, work_w, work_h, corners=None,
                      min_ratio=0.15, max_ratio=0.85, origin=(0, 0)):
     """算出 1~4 个窗口的四宫格布局：谁去哪个角、用什么分割比例。
@@ -161,8 +242,11 @@ def plan_quad_layout(wins, work_w, work_h, corners=None,
             raise ValueError("角标越界（应为 0~3）: %s" % (corner_list,))
         corner_list = sorted(corner_list)
 
+    # 搜索区间与 snap_four_quad 对手动比例的钳制 [0.15, 0.85] 对齐。旧实现
+    # 把 hi 钉在 0.5，智能模式反倒搜不到「窗口确实需要」的比例：真机 ChatGPT
+    # 最小高 600，需要 600/982 = 61% 的排高，0.5 以内怎么搜都准不了。
     lo = min(max(min_ratio, 0.15), 0.85)
-    hi = min(0.5, max_ratio)
+    hi = min(0.85, max_ratio)
     if hi < lo:
         hi = lo
 
@@ -172,6 +256,10 @@ def plan_quad_layout(wins, work_w, work_h, corners=None,
                any(c in (2, 3) for c in corner_list)]
     has_col = [any(c in (0, 2) for c in corner_list),
                any(c in (1, 3) for c in corner_list)]
+    # 形状只跟「占了哪些角」有关，候选循环里不变。T 形（某排只占一格）时那一格
+    # 拉通整宽，成本模型必须按实际矩形算——否则优化出来的几何与 windows 侧
+    # 真正写出去的几何不是同一个，搜得再「优」也是纸上准。
+    shape = quad_shape(corner_list)
 
     # hint 适配 n<4：按宽高比升序后前 half_n 个当「竖排候选」、其余当「横排
     # 候选」。n=4 时 half_n=2，与旧计划逐字一致。
@@ -202,14 +290,14 @@ def plan_quad_layout(wins, work_w, work_h, corners=None,
                 # 格子严格按比例铺满（与 windows 侧一致）：最小尺寸不抬格，
                 # 只通过 _fit_cost 的惩罚影响「谁去哪个角 / 用什么比例」。
                 pairs = list(zip(wins, perm))
-                c1, c2, r1, r2, ov_x, ov_y = grid_geometry(
-                    work_w, work_h, sx, sy)
-                sizes = ((c1, r1), (c2, r1), (c1, r2), (c2, r2))
+                # 按形状算实际格子：T 形下拉通整宽的那格、堆叠的那格，尺寸
+                # 与 windows 侧 _quad_cells 写出去的完全一致
+                cells = quad_cells(shape, int(round(work_w * sx)),
+                                   int(round(work_h * sy)), ox, oy,
+                                   work_w, work_h)
+                sizes = [(c[2], c[3]) for c in cells]
                 # 只用被占的角算成本：空格子不罚
                 cost = sum(_fit_cost(w, *sizes[c]) for w, c in pairs)
-                # 四格装不下各自的最小尺寸时只能贴边 + 重叠摆放：重叠越多越差，
-                # 让搜索宁可换一个比例 / 换一种摆法
-                cost += (ov_x + ov_y) / float(max(1, work_h)) * 10.0
                 # 面积均衡项：被占格子的「窗口面积占比」应与其「格子面积占比」
                 # 接近。少了这一项，算法会把小窗口挤进极小格、剩下的全给大
                 # 窗口——纯凑比例的话这样总成本更低，但四格大小失衡，
@@ -228,7 +316,7 @@ def plan_quad_layout(wins, work_w, work_h, corners=None,
                 # 「窗口不用横穿屏幕」的那个——权重见 PROX_WEIGHT，只打破
                 # 平局，不颠倒「谁合适去哪个角」的结论。
                 cost += PROX_WEIGHT * _prox_cost(
-                    pairs, _cell_centers(sizes, ox, oy),
+                    pairs, _cell_centers(cells),
                     (work_w ** 2 + work_h ** 2) ** 0.5)
                 if best is None or cost < best[0]:
                     best = (cost, pairs, sx, sy)
@@ -275,14 +363,28 @@ def _fit_cost(win, cw, ch):
     2. 面积不足：格子装不下窗口时按缺口比例罚；格子比窗口大不罚
        （窗口可以有余量，但不该被挤扁）
 
+    3. 最小尺寸不足：格子装不下窗口的 App 最小尺寸时按缺口比例罚
+       （权重 MIN_PEN_WEIGHT，软惩罚）
+
     第 2 项让算法不会为了比例好看把格子切得过窄——窄格子装不下宽窗口，
     面积不足会被狠狠罚。
     """
     w = float(win.get("w") or 0)
     h = float(win.get("h") or 0)
+    # App 最小尺寸软惩罚：格子装不下 min_w/min_h 时，写入后窗口会被 App 顶大,
+    # 要么溢出压住邻居、要么被贴角逻辑挤到别处——两者都是「不准」。软惩罚
+    # （权重 MIN_PEN_WEIGHT）而不是硬约束：硬约束会把算法逼去「把大窗口全塞进
+    # 高排」的极端比例（真机实测 sy 被压到 0.2）。
+    mw = float(win.get("min_w") or 0)
+    mh = float(win.get("min_h") or 0)
+    min_pen = 0.0
+    if mw > 0 and cw < mw:
+        min_pen += (mw - cw) / mw
+    if mh > 0 and ch < mh:
+        min_pen += (mh - ch) / mh
     if w <= 0 or h <= 0:
         # 尺寸未知：只按比例 1.0 估，不做面积惩罚
-        return abs(cw / ch - 1.0)
+        return abs(cw / ch - 1.0) + MIN_PEN_WEIGHT * min_pen
     # 硬约束：格子至少要有窗口的 min_frac（宽和高各自都要达到）。
     # 达不到就直接判为「不合适」，成本抬到很高，让搜索主动避开这种切法。
     # 判据用窗口当前尺寸，不用 App 最小尺寸：格子铺满语义下窗口 fit 进格子、
@@ -292,8 +394,7 @@ def _fit_cost(win, cw, ch):
         return 100.0 + (w * MIN_CELL_FRAC - cw) / w + (h * MIN_CELL_FRAC - ch) / h
     ratio_pen = abs(cw / ch - w / h) / (w / h)
     area_pen = max(0.0, (w * h - cw * ch) / (w * h))
-    cost = ratio_pen + area_pen
-    return cost
+    return ratio_pen + area_pen + MIN_PEN_WEIGHT * min_pen
 
 
 def fit_frame(win, cw, ch, corner=0):

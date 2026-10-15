@@ -11,6 +11,7 @@ import autostart
 import backend as b
 import config_io
 import profiles
+import quad_plan
 import settings
 import layouts
 import screen_math
@@ -837,8 +838,11 @@ class App:
             cb.pack(side="left", padx=(4, 0))
             self._tooltip(cb, f"四宫格{pos}角的窗口。自动 = 取最前面的未占用窗口。")
             setattr(self, "quad_%s_cb" % key, cb)
+            # 选完下拉必须重画网格：只更新容量文字的话，预览还停在旧选择
+            # 上——用户看到的就是「选了没反应」
             cb.bind("<<ComboboxSelected>>",
-                    lambda e: self._update_quad_capacity())
+                    lambda e: (self._update_quad_capacity(),
+                               self._refresh_quad_grid()))
         quad_btn = ttk.Button(quad_row, text="2×2 排列",
                               command=self._snap_four_quad)
         quad_btn.pack(side="left", padx=(6, 0))
@@ -914,6 +918,12 @@ class App:
         for key in self._QUAD_KEYS:
             self._quad_labels[key] = self.quad_grid_canvas.create_text(
                 0, 0, text="空", font=("Helvetica", 7), fill="#333")
+            # 空格子宽或高为 0（T 形、堆叠时那一格不存在），矩形点不到；标签
+            # 浮在格子原点上方（z 序最高），点击绑在标签上——空角照样能点
+            # 一下填入最靠前的未占用窗口，与下拉框等价。
+            self.quad_grid_canvas.tag_bind(
+                self._quad_labels[key], "<Button-1>",
+                lambda e, k=key: self._on_quad_cell_click(k))
         # 分割线一横一竖 + 命中加粗：命中区宽 4px，方便鼠标点中
         self._quad_vline = self.quad_grid_canvas.create_line(
             0, 0, 0, 0, fill="#3b6ea5", width=1)
@@ -1418,15 +1428,24 @@ class App:
         self._refresh_quad_grid()
         self.status_var.set(f"{self._quad_key_names()[key]} ← {pick}")
 
-    def _refresh_quad_grid(self):
-        """按比例与四个方位的当前选择重画网格：格子、分割线、文字一起更新。"""
-        cv = getattr(self, "quad_grid_canvas", None)
-        if cv is None:
-            return
-        # 0.05~0.95：App 的最小尺寸会把某一排顶到 85% 以上（真机 ChatGPT
-        # 最小高 600），按 0.85 钳会让画出来的分割线与实际排出来的位置不符
-        # 上限放到 1.0：放不下四个窗口时剩下的一排会撑满整高，比例报 100%，
-        # 横向分割线贴在底边（看起来就是两列铺满）。按 0.95 钳会多画一条线。
+    def _quad_grid_geom(self, cv):
+        """算预览几何：格子、分割线、比例全部由同一份 shape 决定。
+
+        界面预览必须与 windows 侧 _quad_cells 写出去的几何同源，否则用户
+        看到的就是「预览四格、实际三格还对不上」——那就是「不准」。占用哪
+        几个角、哪排/列撑满、哪格拉通整宽全走 quad_plan.quad_shape /
+        quad_cells，与实排共用同一组纯函数；比例取分割线当前值（智能模式
+        下是排列后写回来的实测比例）。App 最小尺寸对格子的微调预览层看不
+        到，点过「2×2 排列」后比例写回，预览即与实际一致。
+        """
+        occ = [i for i, k in enumerate(self._QUAD_KEYS)
+               if self._quad_var(k).get() not in ("", AUTO_TARGET, None)]
+        shape = quad_plan.quad_shape(occ)
+        # 0.05~1.0：与 windows 侧 splits 的钳制一致。整排/整列空着时
+        # quad_cells 会按 row_full/col_full 把切分顶到满值（比例报 100%），
+        # 此时 sy/sx 取多少都不影响画出来的几何；两排都有窗口时实排侧
+        # _quad_split 保证切分落在 (0, 满值)，写回的比例也到不了 1.0，
+        # 预览不会画出零高度的格子。
         sx = min(max(self._quad_split_x.get(), 0.05), 1.0)
         sy = min(max(self._quad_split_y.get(), 0.05), 1.0)
         cw, ch = cv.winfo_width(), cv.winfo_height()
@@ -1436,65 +1455,130 @@ class App:
         top = 10
         col_x = int(round(cw * sx))
         row_y = top + int(round((ch - top) * sy))
-        boxes = {
-            "TL": (0, top, col_x, row_y),
-            "TR": (col_x, top, cw, row_y),
-            "BL": (0, row_y, col_x, ch),
-            "BR": (col_x, row_y, cw, ch),
-        }
+        # 与 windows 侧 _quad_cells(shape, c1, r1, wl, wt, ww, wh) 同约定：
+        # 工作区矩形 (0, top, cw, ch-top)，切分毛值 (col_x, row_y-top)
+        cells = quad_plan.quad_cells(shape, col_x, row_y - top,
+                                     0, top, cw, ch - top)
+        boxes = {k: (x, y, x + w, y + h)
+                 for k, (x, y, w, h) in zip(self._QUAD_KEYS, cells)}
+        cnt_row, cnt_col = shape["cnt_row"], shape["cnt_col"]
+        # 生效切分与 quad_cells 内部保持一致：row_full/col_full 时它按 shape
+        # 把 r1/c1 顶到满值，分割线与命中区必须按生效值算——否则两窗左右铺满
+        # 时竖线只画到 57px，格子却撑到了 104px，线挂在格子中间
+        if shape["row_full"]:
+            row_y = top + ((ch - top) if cnt_row[0] else 0)
+        if shape["col_full"]:
+            col_x = cw if cnt_col[0] else 0
+        # 竖线只画「有 2 格的那排」：T 形下拉通整宽的那排没有竖线，整列撑满
+        # （两窗上下堆叠）时也没有；线区间跟着那一排的上下缘走
+        show_v = (not shape["col_full"]) and 2 in cnt_row
+        v_y0 = top if cnt_row[0] == 2 else row_y
+        v_y1 = ch if cnt_row[1] == 2 else row_y
+        # 横线只在两排都非空时画：某一排撑满整高时横线贴在画布边上，多余
+        show_h = ((not shape["row_full"])
+                  and cnt_row[0] > 0 and cnt_row[1] > 0)
+        # 生效比例按画出来的几何算，与 windows 侧 splits 同口径：撑满的排/
+        # 列、拉通整宽的格子都让那一轴报 100%
+        occ_keys = [self._QUAD_KEYS[i] for i in occ]
+        occ_boxes = [boxes[k] for k in occ_keys]
+        sx_eff = (1.0 if (shape["col_full"]
+                          or (occ_boxes
+                              and all(x1 - x0 >= cw
+                                      for x0, _y, x1, _y1 in occ_boxes)))
+                  else sx)
+        sy_eff = (1.0 if (shape["row_full"]
+                          or (occ_boxes
+                              and all(y1 - y0 >= ch - top
+                                      for _x, y0, _x1, y1 in occ_boxes)))
+                  else sy)
+        return {"occ": occ, "shape": shape, "sx": sx, "sy": sy,
+                "sx_eff": sx_eff, "sy_eff": sy_eff, "cw": cw, "ch": ch,
+                "top": top, "col_x": col_x, "row_y": row_y,
+                "boxes": boxes, "show_v": show_v, "v_y0": v_y0,
+                "v_y1": v_y1, "show_h": show_h}
+
+    def _refresh_quad_grid(self):
+        """按当前选择重画网格：格子、分割线、文字一起更新。
+
+        格子几何走 _quad_grid_geom（与实排同源的 quad_shape/quad_cells）：
+        选三个窗口是 T 形、选同列两个是上下堆叠、选同行两个是左右铺满，
+        不再是永远四等分加一横一竖两条贯通线。空格子宽或高为 0（那一格在
+        真实排布里不存在，被拉通格覆盖），矩形整个藏起来，只留一个可点的
+        「空」字标在格子原点。
+        """
+        cv = getattr(self, "quad_grid_canvas", None)
+        if cv is None:
+            return
+        g = self._quad_grid_geom(cv)
+        boxes, cw, ch, top = g["boxes"], g["cw"], g["ch"], g["top"]
         for key in self._QUAD_KEYS:
             val = self._quad_var(key).get()
             filled = bool(val) and val != AUTO_TARGET
+            x0, y0, x1, y1 = boxes[key]
             rid = self._quad_cells.get(key)
             if rid is not None:
-                x0, y0, x1, y1 = boxes[key]
-                cv.coords(rid, x0 + 1, y0 + 1, x1, y1)
-                cv.itemconfigure(rid,
-                                 fill="#d8e6ff" if filled else "#e9e9e9")
+                if x1 > x0 and y1 > y0:
+                    cv.itemconfigure(rid, state="normal")
+                    cv.coords(rid, x0 + 1, y0 + 1, x1, y1)
+                    cv.itemconfigure(
+                        rid, fill="#d8e6ff" if filled else "#e9e9e9")
+                else:
+                    # 空格子不占地方：藏起来，别留一条发丝线充当假边界
+                    cv.itemconfigure(rid, state="hidden")
             lid = self._quad_labels.get(key)
             if lid is not None:
-                x0, y0, x1, y1 = boxes[key]
-                cv.coords(lid, (x0 + x1) // 2, (y0 + y1) // 2)
-                cv.itemconfigure(lid,
-                                 text=(self._short_label(val) if filled else "空"),
-                                 fill="#1a3d6d" if filled else "#999")
-        # 分割线贴在格子边界上，命中区加宽到 4px 方便鼠标抓
+                if filled:
+                    cv.coords(lid, (x0 + x1) // 2, (y0 + y1) // 2)
+                    cv.itemconfigure(lid, text=self._short_label(val),
+                                     fill="#1a3d6d")
+                else:
+                    # 空格：标在格子原点（钳进画布内，7 号字也别贴边）
+                    lx = min(max(x0, 8), max(8, cw - 8))
+                    ly = min(max(y0, top + 6), max(top + 6, ch - 6))
+                    cv.coords(lid, lx, ly)
+                    cv.itemconfigure(lid, text="空", fill="#999")
+        # 分割线贴在格子边界上，命中区加宽到 4px 方便鼠标抓；没线的方向
+        # 必须显隐一起处理——留着上一个形状的线就是「预览与实际脱节」
         if getattr(self, "_quad_vline", None) is not None:
-            cv.coords(self._quad_vline, col_x, top, col_x, ch)
-            cv.coords(self._quad_vhit, col_x - 2, top, col_x + 2, ch)
+            if g["show_v"]:
+                cv.itemconfigure(self._quad_vline, state="normal")
+                cv.itemconfigure(self._quad_vhit, state="normal")
+                cv.coords(self._quad_vline, g["col_x"], g["v_y0"],
+                          g["col_x"], g["v_y1"])
+                cv.coords(self._quad_vhit, g["col_x"] - 2, g["v_y0"],
+                          g["col_x"] + 2, g["v_y1"])
+            else:
+                cv.itemconfigure(self._quad_vline, state="hidden")
+                cv.itemconfigure(self._quad_vhit, state="hidden")
         if getattr(self, "_quad_hline", None) is not None:
-            cv.coords(self._quad_hline, 0, row_y, cw, row_y)
-            cv.coords(self._quad_hhit, 0, row_y - 2, cw, row_y + 2)
-        n = sum(1 for k in self._QUAD_KEYS
-                if self._quad_var(k).get() not in ("", AUTO_TARGET, None))
-        cv.itemconfigure(self._quad_title_id,
-                         text=f"已填 {n}/4 · {sx:.0%}/{sy:.0%}")
+            if g["show_h"]:
+                cv.itemconfigure(self._quad_hline, state="normal")
+                cv.itemconfigure(self._quad_hhit, state="normal")
+                cv.coords(self._quad_hline, 0, g["row_y"], cw, g["row_y"])
+                cv.coords(self._quad_hhit, 0, g["row_y"] - 2,
+                          cw, g["row_y"] + 2)
+            else:
+                cv.itemconfigure(self._quad_hline, state="hidden")
+                cv.itemconfigure(self._quad_hhit, state="hidden")
+        sx_eff, sy_eff = g["sx_eff"], g["sy_eff"]
+        cv.itemconfigure(
+            self._quad_title_id,
+            text="已填 %d/4 · %.0f%%/%.0f%%" % (len(g["occ"]),
+                                              sx_eff * 100, sy_eff * 100))
 
     # ---------- 四宫格分割线拖拽 ----------
-    def _quad_canvas_size(self):
-        """网格画布的实际可用尺寸。
-
-        命中判断与拖拽必须按实际尺寸算：画布尺寸一变（改常量、拉伸窗口）
-        还拿旧常量比对，分割线就会与鼠标位置错开，既点不中也拖不动。
-        还没布局完时退回请求尺寸。
-        """
-        cv = self.quad_grid_canvas
-        cw, ch = cv.winfo_width(), cv.winfo_height()
-        if cw < 4 or ch < 4:
-            cw, ch = self._quad_grid_w, self._quad_grid_h
-        return cw, ch
-
     def _quad_hit_which(self, event):
-        """判断鼠标落在哪条分割线的命中区里；不在命中区返回 None。"""
-        sx = min(max(self._quad_split_x.get(), 0.05), 1.0)
-        sy = min(max(self._quad_split_y.get(), 0.05), 1.0)
-        cw, ch = self._quad_canvas_size()
-        top = 10
-        col_x = int(round(cw * sx))
-        row_y = top + int(round((ch - top) * sy))
-        if abs(event.x - col_x) <= 3:
+        """判断鼠标落在哪条分割线的命中区里；不在命中区返回 None。
+
+        命中区跟着实际画出来的线走：竖线只在有 2 格的那排范围内有效（T 形
+        下拉通整宽的那排没有竖线），横线只在两排都非空时有效。预览不画线
+        的地方不响应拖拽——否则拖一条不存在的线，比例改了预览却不动。
+        """
+        g = self._quad_grid_geom(self.quad_grid_canvas)
+        if (g["show_v"] and abs(event.x - g["col_x"]) <= 3
+                and g["v_y0"] - 2 <= event.y <= g["v_y1"] + 2):
             return "v"
-        if abs(event.y - row_y) <= 3:
+        if g["show_h"] and abs(event.y - g["row_y"]) <= 3:
             return "h"
         return None
 
@@ -1516,8 +1600,13 @@ class App:
         """拖动：按鼠标位置更新比例并重画（实时预览）。"""
         if self._quad_drag is None:
             return
-        cw, ch = self._quad_canvas_size()
-        top = 10
+        g = self._quad_grid_geom(self.quad_grid_canvas)
+        cw, ch, top = g["cw"], g["ch"], g["top"]
+        # 这条线当前没画（比如两窗上下堆叠时没有竖线）就不动比例
+        if self._quad_drag == "v" and not g["show_v"]:
+            return
+        if self._quad_drag == "h" and not g["show_h"]:
+            return
         x = min(max(event.x, int(cw * 0.05)), int(cw * 0.95))
         y = min(max(event.y, top + int((ch - top) * 0.05)),
                 top + int((ch - top) * 0.95))
@@ -1528,18 +1617,18 @@ class App:
         self._refresh_quad_grid()
 
     def _on_quad_grid_release(self, _event=None):
-        """松手：还原光标并提示当前比例。"""
+        """松手：还原光标并提示当前比例（按画出来的生效几何报）。"""
         if self._quad_drag is None:
             return
         self._quad_drag = None
         self.quad_grid_canvas.configure(cursor="")
+        g = self._quad_grid_geom(self.quad_grid_canvas)
+        sx, sy = g["sx_eff"], g["sy_eff"]
         self.status_var.set(
             "四宫格比例：横向 %.0f%%（左栏）/ %.0f%%（右栏），"
             "竖向 %.0f%%（上排）/ %.0f%%（下排）——点「2×2 排列」生效" % (
-                self._quad_split_x.get() * 100,
-                (1 - self._quad_split_x.get()) * 100,
-                self._quad_split_y.get() * 100,
-                (1 - self._quad_split_y.get()) * 100))
+                sx * 100, (1 - sx) * 100,
+                sy * 100, (1 - sy) * 100))
 
     def _on_quad_smart_toggle(self):
         """勾选/取消智能分配。智能模式下分割线由程序计算，不接受手动拖。"""

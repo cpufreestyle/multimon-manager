@@ -1695,20 +1695,82 @@ def _cg_rect(hwnd):
             continue      # 带序号的 hwnd 只认同名第 N 个
         return (w["x"], w["y"], w["w"], w["h"])
     return None
+def _quad_split(total, need_a, need_b, base_a, base_b):
+    """把 total 切成 (a, b)：先满足两侧需求，再按原始占比分余量。
 
-
-def _quad_zone(idx, row_full, col_full):
-    """按「哪一排/列有窗口」选间距方位。
-
-    某一排整排空着时，剩下那一排撑满工作区高：这时候它贴的是屏幕上/下边
-    （外边），不再是格子之间的缝，得按 left/right 的方位让间距——否则窗口
-    底部会平白让出半个缝、看起来没贴到底边。列同理（top/bottom）。
+    need_a/need_b 是两侧的最小需求（已含窗口间距），base_a/base_b 是 plan 给出
+    的原始比例切分毛值。装得下就不动（保留 plan 精心算出的比例）；装不下先各自
+    满足需求，剩余按 base 占比分；需求本身就超过 total 时只能按需求占比硬分
+    （允许溢出，由后面的贴边逻辑收尾，并在说明里如实报告）。
     """
-    if row_full:
-        return "left" if idx in (0, 2) else "right"
-    if col_full:
-        return "top" if idx in (0, 1) else "bottom"
-    return _QUAD_GAP_ZONE[idx]
+    if need_a + need_b <= total:
+        if base_a >= need_a and base_b >= need_b:
+            return base_a, total - base_a
+        if need_a and need_b:
+            slack = total - need_a - need_b
+            share = ((base_a / float(base_a + base_b))
+                     if (base_a + base_b) > 0 else 0.5)
+            a = min(total - need_b, need_a + int(round(slack * share)))
+            return max(a, need_a), total - max(a, need_a)
+        if need_a:
+            a = min(need_a, total)
+            return a, total - a
+        b = min(need_b, total)
+        return total - b, b
+    if need_a + need_b <= 0:
+        share = (0.5 if (base_a + base_b) <= 0
+                 else base_a / float(base_a + base_b))
+        a = int(round(total * share))
+        return a, total - a
+    a = int(round(total * need_a / float(need_a + need_b)))
+    return a, total - a
+
+
+def _quad_gap_zone(corner, cells, ww, wh):
+    """按格子实际形状选间距方位（替代按 row_full/col_full 整排判的旧逻辑）。
+
+    格子被拉通整宽（bw>=ww，三窗 T 形某排只占一格）时它贴上/下屏幕边，不再是
+    格子之间的横缝；格子撑满高（bh>=wh，某列只占一格上下堆叠）时同理贴左/右
+    屏幕边。按死角的四宫格方位会让窗口平白让出半条缝、看起来没贴到边。否则按
+    标准四宫格方位留缝（quad-tl/tr/bl/br）。
+    """
+    _x, _y, bw, bh = cells[corner]
+    if bw >= ww:
+        return "top" if corner in (0, 1) else "bottom"
+    if bh >= wh:
+        return "left" if corner in (0, 2) else "right"
+    return _QUAD_GAP_ZONE[corner]
+
+
+def _quad_gap_insets(shape, corner, half, edge_gap):
+    """这一格四边各让出多少间距：(左, 上, 右, 下)，与 gap_rect 同语义。
+
+    判据与 _quad_gap_zone 一致，拆成轴用：拉通整宽的格子只让左右（它贴上/
+    下屏幕边，上下没有邻居），撑满高的格子只让上下。算「格子至少要多大才装得
+    下窗口的最小尺寸」时必须用这个值——整宽格的上下根本没有缝，为不存在的缝
+    预留高度只会把这一排无谓顶高。
+    """
+    ri = 0 if corner in (0, 1) else 1
+    ci = 0 if corner in (0, 2) else 1
+    if shape["wide"][ri] or shape["col_full"]:
+        zone = "top" if ri == 0 else "bottom"
+    elif shape["row_full"]:
+        zone = "left" if ci == 0 else "right"
+    else:
+        zone = _QUAD_GAP_ZONE[corner]
+    l, t, r, b = _GAP_ZONES[zone]
+    # 贴工作区外边：只有勾选屏幕边间距时才让（gap_rect 里的 l or edges）
+    if edge_gap:
+        if ci == 0:
+            l = 1
+        if ci == 1:
+            r = 1
+        if ri == 0:
+            t = 1
+        if ri == 1:
+            b = 1
+    return (half if l else 0.0, half if t else 0.0,
+            half if r else 0.0, half if b else 0.0)
 
 
 def _pick_quad_screen(ms, cur_idx, corners):
@@ -1742,130 +1804,175 @@ def _pick_quad_screen(ms, cur_idx, corners):
     return max(pool, key=lambda i: ms[i].work_rect[2] * ms[i].work_rect[3])
 
 
+def _quad_place(pool, mins, pool_corners, ms, idx, gap, edge_gap,
+                allow_switch, beat=None):
+    """选子集，并在装不下时换一块能多排几个的横屏。返回 (idx, slots, unplaced)。
+
+    抽出成函数是为了两处共用：排布前的子集选择，以及写入后发现「这块屏其实装
+    不下」时的减载（见 snap_four_quad 的装载复检）。两处口径必须一致，否则预检
+    说装得下、减载时又按另一套算法挑子集，用户看到的就是「说不排又不排」。
+
+    beat: 别的屏至少要排几个才值得换过去。缺省 = 当前屏排得下的数量，也就是
+    「当前屏已经装不下全部候选时才去看别的屏」；装载复检传 len(placed)-1：
+    那块屏只要能排同样多就不必丢窗口，优先换屏而不是减载。
+    """
+    mon = ms[idx]
+    wl, wt, ww, wh = mon.work_rect
+    placed_slots, unplaced = quad_plan.choose_quad_slots(
+        pool, mins, ww, wh, gap, edge_gap, corners=pool_corners,
+        origin=(wl, wt))
+    if not allow_switch:
+        return idx, placed_slots, unplaced
+    bar = len(placed_slots) if beat is None else beat
+    cur, best = idx, (idx, placed_slots, unplaced)
+    for i, m in enumerate(ms):
+        if i == idx or m.height > m.width:      # 竖屏不主动送
+            continue
+        _ml, _mt, mw2, mh2 = m.work_rect
+        slots2, unplaced2 = quad_plan.choose_quad_slots(
+            pool, mins, mw2, mh2, gap, edge_gap, corners=pool_corners,
+            origin=(_ml, _mt))
+        # >= len(best[1]) 而不是 >：装载复检传的 bar 比当前数量少 1，另一块屏
+        # 「排得一样多」也值得换——当前屏已经装不下了，换过去照样排这么多个
+        if len(slots2) > bar and len(slots2) >= len(best[1]):
+            logger.info("屏幕 %s 只能排 %d 个，%s 能排 %d 个，改排到 %s",
+                        ms[cur].device_name, len(best[1]),
+                        m.device_name, len(slots2), m.device_name)
+            cur, best = i, (i, slots2, unplaced2)
+    return best
+
+
+def _quad_needs(placed_slots, mins, shape, gap, edge_gap):
+    """每列/排的最小尺寸需求（含窗口间距）：返回 (need_col, need_row)。
+
+    「这块屏放不放得下」和「格子切多大」必须用同一个口径：预检说放得下、切出来
+    却装不下，就是用户看到的「不准」。所以需求算法只留这一份，容量预检
+    （choose_quad_slots）与 _quad_cells 都调它。
+
+    只按实际排放的窗口算：放不下的窗口已经把角让出来了，它的最小尺寸再抬高
+    某一排/列只会压小活窗口的空间。探测不到最小尺寸（0）的窗口不设需求——
+    窗口间距不是硬约束（格子比间距还窄时间距逻辑整体放弃），给未知窗口记上
+    6px 幽灵需求会让 _quad_split 走「按占比分余量」分支，把实测 606 的上排
+    顶到 840。需求按格子形状拆轴算：整宽格的上下没有邻居，撑满高的格子左右
+    没有邻居。
+    """
+    half = gap / 2.0
+    need_col = [0, 0]
+    need_row = [0, 0]
+    for corner, h, _w in placed_slots:
+        ci = 0 if corner in (0, 2) else 1
+        ri = 0 if corner in (0, 1) else 1
+        mw, mh = mins.get(h, (0, 0))
+        gl, gt, gr, gb = _quad_gap_insets(shape, corner, half, edge_gap)
+        if mw > 0:
+            need_col[ci] = max(need_col[ci], int(round(mw + gl + gr)))
+        if mh > 0:
+            need_row[ri] = max(need_row[ri], int(round(mh + gt + gb)))
+    return need_col, need_row
+
+
 def _quad_cells(placed_slots, mins, wl, wt, ww, wh, gap, edge_gap,
                 sx, sy):
-    """按比例 + 实测最小尺寸切出四个格子，并算每个窗口的写入目标。
+    """按形状 + 需求 + 比例切出格子与写入目标。
 
     placed_slots: [(corner, hwnd, win_dict), ...] 实际排放的窗口（1~4 个）
     mins: {hwnd: (min_w, min_h)} 实测最小尺寸
-    返回 (cells, finals, row_full, col_full)：cells 是四个格子的原始矩形，
-    finals 是让出窗口间距后的写入目标 [(corner, hwnd, x, y, w, h), ...]。
+    返回 (cells, finals, splits)：cells 是四个格子的原始矩形（空格子宽或高为
+    0），finals 是让出窗口间距后的写入目标 [(corner, hwnd, x, y, w, h)]，
+    splits 是实际生效的 (col_split, row_split)——界面据此画分割线，必须按校正
+    后的真实格子算，否则「分割线与实际位置对不上」。
 
-    格子严格按 sx/sy 铺满工作区：最小尺寸只用来把某一排/列切大（装得下才调），
-    不改变「谁去哪个角」。整排 / 整列空着时，有窗口的那排 / 列撑满整个工作区
-    ——选两个窗口就该铺满屏幕，留半屏空白看起来就是「没排好」。
+    形状由 quad_plan.quad_shape 定：三窗 T 形时那一格拉通整宽、两窗斜角上下
+    堆叠——旧实现把空角留成整块四分之一屏，用户看到的就是「没排好」的死区。
+    格子严格铺满工作区：最小尺寸只通过 _quad_split 把某一排/列切大（装得下才
+    调），不改变「谁去哪个角」。整排/整列空着时有窗口的那排/列撑满整个工作区
+    （选两个窗口就该铺满屏幕，留半屏空白就是「没排好」）。
 
     抽成函数是为了二趟重排：第一遍按探测到的最小尺寸切，写入后读回的是窗口
     **实际**占的尺寸，调用方把实测尺寸并回 mins 后再调一次，格子随之收敛。
     """
-    c1, c2, r1, r2, ov_x, ov_y = quad_plan.grid_geometry(
-        ww, wh, sx, sy)
-
-    # 四个格子严格按 sx/sy 铺满工作区：不再用最小尺寸把某一排/列顶高。
-    # 顶高的直接后果是两排都装不下、必然重叠（真机实测 UU远程 最小高 744
-    # + 下排 570 = 1314 > 898 工作区，怎么切都重叠 400+px）。
-    # Moom 的做法是格子铺满 + 窗口在格子里等比缩放（fit_frame），窗口被
-    # App 的最小尺寸顶大时只会朝「不贴边的那一侧」溢出，贴边的一侧仍然准确。
-    col_x = (wl, wl + c1)
-    row_y = (wt, wt + r1)
-    # 用实测最小尺寸校正切分：两排/两列都装得下时，按各自需求重切，
-    # 剩余空间仍按原比例分。只在「装得下」时调整，所以不会把某一边压成
-    # 几个像素；装不下才允许溢出（由后面的贴边 + 如实报告处理）。
-    # 没有这一层，ChatGPT 最小高 600 会被塞进 358 高的格子，向下溢出 240px
-    # 压住下排——真机实测四宫格上下重叠 246px 就是这么来的。
-    # 需求只按「实际排放的窗口」算：放不下的窗口已经把角让出来了，它的最小
-    # 尺寸再抬高某一排/列，只会把留给活窗口的空间压小。空着的那排/列不参与
-    # 余量分配——它没有窗口，分到空间只会在排好的那一排里留一块死区。
-    half = gap / 2.0
-    pad = half + (half if edge_gap else 0)   # 每格每轴要让出的窗口间距
-    need_col = [0, 0]      # 左列 / 右列 的最小宽度需求
-    need_row = [0, 0]      # 上排 / 下排 的最小高度需求
-    for corner, h, _w in placed_slots:
-        ci = 0 if corner in (0, 2) else 1      # 0 左列 / 1 右列
-        ri = 0 if corner in (0, 1) else 1      # 0 上排 / 1 下排
-        mw, mh = mins.get(h, (0, 0))
-        need_col[ci] = max(need_col[ci], mw)
-        need_row[ri] = max(need_row[ri], mh)
-    # 哪一排/列有窗口由「选中了哪些角」定，不由最小尺寸定：最小尺寸探测失败
-    # （全 0）时也不能退化成「只排上面半屏、下面半屏空白」。
-    has_row = [False, False]
-    has_col = [False, False]
-    for corner, _h, _w in placed_slots:
-        has_row[0 if corner in (0, 1) else 1] = True
-        has_col[0 if corner in (0, 2) else 1] = True
-    lo_r1 = need_row[0] + pad if need_row[0] else 0
-    lo_r2 = need_row[1] + pad if need_row[1] else 0
-    # 只有一排有窗口时，这一排撑满整个工作区高：选两个窗口就该铺满屏幕，留
-    # 半屏空白看起来就是「没排好」。只有一个窗口时不撑满（那是 maximize，不是
-    # 四宫格）；空着的那排高度为 0，界面上的横向分割线随之贴到底边。
-    row_full = len(placed_slots) >= 2 and has_row[0] != has_row[1]
-    if row_full:
-        # 哪一排有窗口看 has_row，不看 lo_r1：最小尺寸探测不到（全 0）时
-        # lo_r1 也是 0，拿它判会把有窗口的那排判成 0 高——窗口被压成 1px
-        r1 = wh if has_row[0] else 0
-        r2 = wh - r1
-        row_y = (wt, wt + r1)
-        logger.info("四宫格：只有%s有窗口，%s撑满工作区高 %d",
-                    "上排" if has_row[0] else "下排",
-                    "上排" if has_row[0] else "下排", wh)
-    elif lo_r1 + lo_r2 <= wh and (r1 < lo_r1 or r2 < lo_r2):
-        if lo_r1 and lo_r2:
-            slack = wh - lo_r1 - lo_r2
-            share = (r1 / float(r1 + r2)) if (r1 + r2) > 0 else 0.5
-            r1 = min(wh - lo_r2, lo_r1 + int(round(slack * share)))
-            r1 = max(r1, lo_r1)
-        else:
-            # 只有一个窗口落在某一排：那一排拿足自己的需求，剩下的留给空排
-            r1 = lo_r1 or (wh - lo_r2)
-        r2 = wh - r1
-        row_y = (wt, wt + r1)
-        logger.info("四宫格：按最小高度重切上排 %d / 下排 %d（需求 %d / %d）",
-                    r1, r2, need_row[0], need_row[1])
-    lo_c1 = need_col[0] + pad if need_col[0] else 0
-    lo_c2 = need_col[1] + pad if need_col[1] else 0
-    # 与行同理：只有一列有窗口时，这一列撑满整个工作区宽
-    col_full = len(placed_slots) >= 2 and has_col[0] != has_col[1]
-    if col_full:
-        # 同行：哪一列有窗口看 has_col，不看 lo_c1（理由同行）
-        c1 = ww if has_col[0] else 0
-        c2 = ww - c1
-        col_x = (wl, wl + c1)
-        logger.info("四宫格：只有%s有窗口，%s撑满工作区宽 %d",
-                    "左列" if has_col[0] else "右列",
-                    "左列" if has_col[0] else "右列", ww)
-    elif lo_c1 + lo_c2 <= ww and (c1 < lo_c1 or c2 < lo_c2):
-        if lo_c1 and lo_c2:
-            slack = ww - lo_c1 - lo_c2
-            share = (c1 / float(c1 + c2)) if (c1 + c2) > 0 else 0.5
-            c1 = min(ww - lo_c2, lo_c1 + int(round(slack * share)))
-            c1 = max(c1, lo_c1)
-        else:
-            # 只有一个窗口落在某一列：那一列拿足自己的需求，剩下的留给空列
-            c1 = lo_c1 or (ww - lo_c2)
-        c2 = ww - c1
-        col_x = (wl, wl + c1)
-        logger.info("四宫格：按最小宽度重切左列 %d / 右列 %d（需求 %d / %d）",
-                    c1, c2, need_col[0], need_col[1])
-    cells = [(col_x[0], row_y[0], c1, r1),
-             (col_x[1], row_y[0], c2, r1),
-             (col_x[0], row_y[1], c1, r2),
-             (col_x[1], row_y[1], c2, r2)]
-    # 窗口在格子里的最终矩形：直接填满自己那一格 + 让出窗口间距
-    # （fit_frame 只按需传入 corner，早先的等比缩放语义见下面的说明）
+    occ = [c for c, _h, _w in placed_slots]
+    shape = quad_plan.quad_shape(occ)
+    need_col, need_row = _quad_needs(placed_slots, mins, shape, gap, edge_gap)
+    base_c1 = int(round(ww * sx))
+    base_r1 = int(round(wh * sy))
+    # row_full / col_full / wide 都由 quad_shape 定，quad_cells 按 c1/r1 落地：
+    # 只有一排/列有窗口时那一排/列撑满；某排只占一格那一格拉通整宽（T 形）
+    if shape["row_full"]:
+        r1 = wh if shape["cnt_row"][0] else 0
+    else:
+        r1, _r2 = _quad_split(wh, need_row[0], need_row[1], base_r1,
+                              wh - base_r1)
+    if shape["col_full"]:
+        c1 = ww if shape["cnt_col"][0] else 0
+    else:
+        c1, _c2 = _quad_split(ww, need_col[0], need_col[1], base_c1,
+                              ww - base_c1)
+    cells = quad_plan.quad_cells(shape, c1, r1, wl, wt, ww, wh)
+    # 窗口在格子里直接填满自己那一格 + 让出窗口间距（与单窗 quad-* 吸附同语义：
+    # 用户点「2×2 排列」要的就是四块铺满）。间距方位按格子实际形状判。
     finals = []
     for corner, h, _w in placed_slots:
-        # 先让出窗口间距：间距吸收 App 最小尺寸造成的溢出，四格也清清楚楚
-        # 分开（Rectangle Pro 的 GapCalculation）
         bx, by, bw, bh = cells[corner]
-        bx, by, bw, bh = gap_rect(_quad_zone(corner, row_full, col_full),
-                                  bx, by, bw, bh, wl, wt, ww, wh)
-        # 窗口直接填满自己那一格，与单窗 quad-* 吸附（snap）同一套语义：
-        # 用户点「2×2 排列」要的就是四块铺满。早先在这里按原宽高比等比缩放
-        # （fit_frame 只缩小、不放大），真机实测窗口比格子小时停在格子里偏在
-        # 一角、留一块空区——那正是「四格不准」的观感来源。窗口被 App 的最小
-        # 尺寸顶大时，由后面的贴边 / 居中逻辑收尾。
+        bx, by, bw, bh = gap_rect(
+            _quad_gap_zone(corner, cells, ww, wh),
+            bx, by, bw, bh, wl, wt, ww, wh)
         finals.append((corner, h, bx, by, max(1, bw), max(1, bh)))
-    return cells, finals, row_full, col_full
+    # 实际生效的分割比例按**占用格子的真实几何**算。T 形下某个格子拉通整宽，
+    # 直接拿 cells[0] 会把真正的列切分丢掉（cells[0] 可能就是整宽格）。
+    occ_cells = [cells[c] for c, _h, _w in placed_slots]
+    col_split = (1.0 if all(bw >= ww for _x, _y, bw, _bh in occ_cells)
+                 else c1 / float(ww or 1))
+    row_split = (1.0 if all(bh >= wh for _x, _y, _bw, bh in occ_cells)
+                 else r1 / float(wh or 1))
+    splits = (min(max(col_split, 0.05), 1.0),
+              min(max(row_split, 0.05), 1.0))
+    return cells, finals, splits
+
+
+def _quad_overload(placed_slots, mins, ww, wh, gap, edge_gap):
+    """按当前最小尺寸，这个子集还装不装得下这块屏（两个方向都要装下）。
+
+    判据与 choose_quad_slots 的容量预检同源（都走 _quad_needs），只差在用的是
+    哪一份最小尺寸：预检用「写入前探测值」，这里用「写入后实测值」。探测偏小
+    （取到收缩中间帧）时两者能差出 170px 以上——预检说装得下，写进去窗口被
+    App 撑大，两个方向的需求随之超过工作区，这时候照原样切格子只能按需求占比
+    硬分，上下两排互相压住。用户看到的就是「不准」，所以写入后必须再判一次。
+    """
+    if not placed_slots:
+        return False
+    shape = quad_plan.quad_shape([c for c, _h, _w in placed_slots])
+    need_col, need_row = _quad_needs(placed_slots, mins, shape, gap, edge_gap)
+    return (need_col[0] + need_col[1] > ww
+            or need_row[0] + need_row[1] > wh)
+
+
+def _quad_smart_ratio(placed_slots, mins, ww, wh, sx, sy, origin=(0, 0)):
+    """智能比例按**实际排放**的子集重算，返回 (sx, sy)。失败时原样返回。
+
+    第一轮的 sx/sy 里放不上的那几个窗口也占了比例，拿它切两个窗口的屏必然歪
+    （用户报的「2×2 不准」多半源于此）。减载之后子集又少一个，必须按新的子集
+    再算一次——否则大窗口按三窗的比例切两格，格子还是歪的。
+    """
+    if len(placed_slots) < 2:
+        return sx, sy
+    try:
+        sub_wins = []
+        for corner, h, w in placed_slots:
+            d = dict(w)
+            d.update(hwnd=h, min_w=mins.get(h, (0, 0))[0],
+                     min_h=mins.get(h, (0, 0))[1])
+            sub_wins.append(d)
+        sub_corners = [c for c, _h, _w in placed_slots]
+        _sub, sx_s, sy_s = quad_plan.plan_quad_layout(
+            sub_wins, ww, wh, corners=sub_corners, origin=origin)
+        sx = min(max(sx_s, 0.15), 0.85)
+        sy = min(max(sy_s, 0.15), 0.85)
+        logger.info("智能比例按实际排放的 %d 个窗口重算：横向 %.0f%% / 竖向 %.0f%%",
+                    len(placed_slots), sx * 100, sy * 100)
+    except ValueError as e:  # noqa: BLE001
+        logger.warning("智能比例重算失败，沿用原值: %s", e)
+    return sx, sy
 
 
 def _quad_anchor(corner, fx, fy, fw, fh, gw, gh, wl, wt, ww, wh):
@@ -2117,6 +2224,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
             mins[h] = (cur[2], cur[3])
             logger.warning("四宫格：%s 被系统钉死，按当前尺寸 %dx%d 参与",
                         h, cur[2], cur[3])
+    # 每个窗口的原始几何（探测前读回的那一份）：装载复检要把装不下的窗口放回
+    # 原状，而探测会把窗口缩得很小，原状只能是探测前这一份
+    orig_rect = {h: (pre_probe.get(h) or (w["x"], w["y"], w["w"], w["h"]))
+                 for h, w in picked}
     # 四格需求按「用户选中的角」算：点掉了几格，空格子按 0 计入。不能把选中
     # 的窗口挤到别的角上去算——quad_requirements 假定顺序是 左上/右上/左下/右下
     corners = [(0, 0)] * 4
@@ -2213,36 +2324,25 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # 每个窗口原本认哪个角：用户点掉几格后 picked 不满四个，角必须对得上，
     # 否则「左上」的窗口会被排到右上
     pool_corners = [picked_corners[i] for i in pool_idx]
-    placed_slots, unplaced = quad_plan.choose_quad_slots(
-        pool, mins, ww, wh, gap, edge_gap, corners=pool_corners,
-        origin=(wl, wt))
-    # 没点名屏幕时，换一块能多排几个的横屏：放不下四个是常态，能多排一个是
-    # 一个。竖屏不主动送——用户明确说过不适合竖屏的窗口不要发到竖屏屏幕
-    if len(placed_slots) < len(pool) and monitor is None:
-        for i, m in enumerate(ms):
-            if i == idx or m.height > m.width:
-                continue
-            _ml, _mt, mw2, mh2 = m.work_rect
-            slots2, unplaced2 = quad_plan.choose_quad_slots(
-                pool, mins, mw2, mh2, gap, edge_gap, corners=pool_corners,
-                origin=(m.work_rect[0], m.work_rect[1]))
-            if len(slots2) > len(placed_slots):
-                logger.info("屏幕 %s 只能排 %d 个，%s 能排 %d 个，改排到 %s",
-                            mon.device_name, len(placed_slots),
-                            m.device_name, len(slots2), m.device_name)
-                idx, placed_slots, unplaced = i, slots2, unplaced2
-                mon = ms[idx]
-                wl, wt, ww, wh = mon.work_rect
+    # 没点名屏幕时，换一块能多排几个的横屏：放不下四个是常态，能多排一个是一
+    # 个。竖屏不主动送——用户明确说过不适合竖屏的窗口不要发到竖屏屏幕
+    idx, placed_slots, unplaced = _quad_place(
+        pool, mins, pool_corners, ms, idx, gap, edge_gap,
+        allow_switch=monitor is None)
+    mon = ms[idx]
+    wl, wt, ww, wh = mon.work_rect
     logger.info("四宫格：%d/%d 个窗口放得下 %s（工作区 %dx%d）",
                 len(placed_slots), len(picked), mon.device_name, ww, wh)
-    # 格子严格按 sx/sy 铺满：不把最小尺寸传进去顶高某一排/列。
-    # 最小尺寸只影响「窗口在格子里 fit 后能被 App 顶多大」，以及
-    # 顶大后按方位贴边——格子本身永远铺满，两排永不重叠。
+    # 智能比例按**实际排放**的子集重算：放不上的那几个窗口在第一轮的 sx/sy 里
+    # 也占了比例，拿它切两个窗口的屏必然歪（用户报的「2×2 不准」多半源于此）
+    if smart:
+        sx, sy = _quad_smart_ratio(placed_slots, mins, ww, wh, sx, sy,
+                                   origin=(wl, wt))
     notes = []
     # 写入无效的窗口（App 不开放自动化 / 被系统钉住）：写入前后几何一步没变
     unwritable = []
 
-    cells, finals, row_full, col_full = _quad_cells(
+    cells, finals, splits = _quad_cells(
         placed_slots, mins, wl, wt, ww, wh, gap, edge_gap, sx, sy)
     # 二趟重排：第一遍按探测到的最小尺寸切格子，写入后读回的是窗口**实际**占的
     # 尺寸。探测偏小（取到收缩中间帧）时窗口被 App 撑得比格子大，上下两排必然
@@ -2265,22 +2365,58 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
             if (nw, nh) != (mw, mh):
                 mins[h] = (nw, nh)
                 grew = True
-        if not grew:
+        # 装载复检：探测值偏小时预检说「这块屏装得下」，写入后窗口被 App 撑大，
+        # 实测需求跟着超过工作区。这时候照原样切格子只能按需求占比硬分——上下
+        # 两排互相压住、宽窗漂到别处，用户看到的就是「不准」。装不下就减载：
+        # 放不下的窗口退出排列并放回原状，只排装得下的。与 choose_quad_slots
+        # 是同一套语义，判据从「写入前探测值」换成「写入后实测值」。
+        reduced = False
+        if _quad_overload(placed_slots, mins, ww, wh, gap, edge_gap):
+            idx2, slots2, unplaced2 = _quad_place(
+                pool, mins, pool_corners, ms, idx, gap, edge_gap,
+                allow_switch=monitor is None, beat=len(placed_slots) - 1)
+            if len(slots2) < len(placed_slots) or idx2 != idx:
+                if idx2 != idx:
+                    # 另一块屏能排同样多：换屏而不是丢窗口
+                    idx = idx2
+                    mon = ms[idx]
+                    wl, wt, ww, wh = mon.work_rect
+                keep = {h for _c, h, _w in slots2}
+                dropped = [(h, w) for _c, h, w in placed_slots
+                           if h not in keep]
+                for h, _w in dropped:
+                    orig = orig_rect.get(h)
+                    if not orig or orig == (0, 0, 0, 0):
+                        continue
+                    # 这一轮已经写进去过，不撤回来用户看到的就是「排好了又
+                    # 停在半路上」的窗口
+                    set_window_rect(h, orig[0], orig[1], orig[2], orig[3],
+                                    activate=False)
+                    _last_rect[h] = orig
+                placed_slots, unplaced = slots2, unplaced2
+                reduced = True
+                logger.warning(
+                    "四宫格：写入后实测装不下 %s（工作区 %dx%d），%s 放回原位，"
+                    "只排 %d 个", mon.device_name, ww, wh,
+                    "、".join(h.split("::")[0] for h, _w in dropped),
+                    len(placed_slots))
+        if not grew and not reduced:
             break
-        cells2, finals2, rf2, cf2 = _quad_cells(
+        if reduced and smart:
+            sx, sy = _quad_smart_ratio(placed_slots, mins, ww, wh, sx, sy,
+                                       origin=(wl, wt))
+        cells2, finals2, splits2 = _quad_cells(
             placed_slots, mins, wl, wt, ww, wh, gap, edge_gap, sx, sy)
-        if cells2 == cells and finals2 == finals:
+        if cells2 == cells and finals2 == finals and not reduced:
             break
-        cells, finals, row_full, col_full = cells2, finals2, rf2, cf2
+        cells, finals, splits = cells2, finals2, splits2
         logger.info("四宫格：第 %d 遍按实测尺寸重排（最小尺寸已更新）",
                     attempt + 1)
-    # 实际生效的比例必须按**校正后**的格子算：早先按 grid_geometry 的毛值算，
-    # 真机实测把 62%/29% 报成 45%/50%，界面上的分割线与实际排出来的位置对不
-    # 上，用户看到的就是「不准」。上下限放到 0.05~0.95：最小尺寸把某一排顶到
-    # 85% 以上时，按 0.85 钳同样会让分割线与实际位置不符。
     global _last_quad_splits
-    _last_quad_splits = (min(max(cells[0][2] / float(ww or 1), 0.05), 1.0),
-                         min(max(cells[0][3] / float(wh or 1), 0.05), 1.0))
+    # splits 已由 _quad_cells 按**占用格子的真实几何**算好并钳到 0.05~1.0。
+    # 拿 cells[0] 单格反算会把 T 形下拉通整宽的列切分整个丢掉，界面上的分割
+    # 线与实际排出来的位置对不上——这正是用户看到的「不准」
+    _last_quad_splits = splits
     logger.info("四宫格排列完成: %s（屏幕 %s，横向 %.0f%% / 竖向 %.0f%%）",
                 "、".join("%s=%s" % (_QUAD_NAMES[corner], h.split("::")[0])
                          for corner, h, _x, _y, _fw, _fh in finals)

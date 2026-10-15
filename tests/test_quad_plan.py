@@ -211,8 +211,11 @@ class TestPlanQuadLayout(unittest.TestCase):
         self.assertEqual(sorted(id(w) for _c, w in slots),
                          sorted([id(a), id(b), id(c)]))
         # corners 只说明「这三个角参与」，谁去哪个角由宽高比定（见下面的用例）
+        # 三个角是 T 形：下排只占 BL 一格，那一格拉通整宽（1920 宽）。最宽扁的
+        # a(4.0) 去整宽格 BL，方圆 c(1.0) 去较方的 TR，瘦高 b(0.5) 去剩下的
+        # TL——旧实现 3 窗也按 2x2 切、右下留整块死区，宽扁窗还进不了整宽格。
         self.assertEqual([w["hwnd"] for _c, w in slots],
-                         ["c", "a", "b"])
+                         ["b", "c", "a"])
 
     def test_empty_row_gives_full_height_split(self):
         """整排空着：有窗的那排撑满，纵向比例没有选择余地（sy=1.0 / 0.0）。"""
