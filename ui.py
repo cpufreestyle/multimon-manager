@@ -1258,11 +1258,18 @@ class App:
                 head += " · " + assigned
             # 逐格实测 vs 目标：App 有最小窗口尺寸时某一格缩不到目标值，
             # 呈现为「不准」，但那是应用侧钳制、不是坐标算错。如实报出来。
+            # 「写入无效」与「被最小尺寸钳制」必须分开说：前者是窗口一步都没
+            # 动（App 不开放自动化 / 被系统钉住，真机 CrossPaste、Sidecar 上的
+            # UU远程），后者是动了但被 App 的最小尺寸顶到目标值之外。混在一起
+            # 报，用户会以为是自己应用的最小尺寸太大。
+            dead = set(getattr(bm, "_last_quad_unwritable", None) or [])
             clamped = []
             for hwnd, want, got in (getattr(bm, "_last_quad_report", None)
                                     or []):
                 if got is None:
                     clamped.append("读不到")
+                    continue
+                if hwnd in dead:
                     continue
                 dev = max(abs(g - t) for g, t in zip(got, want))
                 if dev > 8:
@@ -1275,11 +1282,16 @@ class App:
             parts = [head]
             if notes:
                 parts.append("｜ " + "；".join(notes[:2]))
+            if dead:
+                names = "、".join((h or "").split("::")[0]
+                                 for h in list(dead)[:4])
+                parts.append("｜ 写入无效（不开放自动化/被系统钉住）：" + names)
             if clamped:
                 parts.append("｜ 被应用最小尺寸钳制：" + "、".join(clamped[:4]))
             self.status_var.set(" ".join(parts))
         else:
-            self.status_var.set("四宫格失败：需要至少四个可操作窗口")
+            self.status_var.set("四宫格失败：至少需要两个可操作窗口"
+                                "（网格里点掉几格可以只排两三个）")
 
     # ---------- 四宫格可视化 ----------
     _QUAD_KEYS = ("TL", "TR", "BL", "BR")

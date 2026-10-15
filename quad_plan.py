@@ -255,7 +255,8 @@ def _grid(center, lo, hi, step=0.05):
     return sorted(set(round(x, 6) for x in vals))
 
 
-def choose_quad_slots(wins, mins, work_w, work_h, gap=0, edge_gap=False):
+def choose_quad_slots(wins, mins, work_w, work_h, gap=0, edge_gap=False,
+                      corners=None):
     """挑「放得下的窗口子集」以及它们各自去哪个角。
 
     真机现场（Built-in 工作区 1512x896）：CC Switch 900x600 + CrossPaste
@@ -266,14 +267,16 @@ def choose_quad_slots(wins, mins, work_w, work_h, gap=0, edge_gap=False):
 
     wins: [(hwnd, win_dict), ...]，顺序即请求的角落顺序 [左上, 右上, 左下, 右下]
     mins: {hwnd: (min_w, min_h)}，App 的最小窗口尺寸（探测不到按 0）
+    corners: wins[i] 原本该去的角（0~3）。用户在界面上点掉了几格时 wins 不满
+        四个，得靠它才知道每个窗口原本认哪个角；缺省按顺序 0,1,2,...
     返回 (slots, unplaced)：
       slots    = [(corner, hwnd, win_dict), ...]，corner 0..3，按 corner 升序
       unplaced = [(hwnd, win_dict), ...]，放不下、保持原状的窗口
 
-    优劣口径（依次比较）：排得多 > 靠前的角 > 不挪用户指定的角 > 格子利用得
-    满 > 下标小。「靠前的角」让放不下四个时剩下的窗口仍读起来是完整的一块
-    （左上→右上→左下→右下依次填）；「不挪用户指定的角」在这之后尽量保留手动
-    模式点名的归属；「格子利用得满」避免为了凑数把两个小窗塞进去、大窗全丢下。
+    优劣口径：排得多最优先；其后按 honor_requested 分两种——传入的窗口不足
+    四个（用户在界面上明确只选了这几个角）时「不挪他选的角」优先，传入四个、
+    要从中挑时「靠前的角」优先（左上→右上→左下→右下依次填，剩下的读起来才
+    是完整的一块，斜对角放两个像出了 bug）；最后看格子利用得满与下标。
     """
     half = gap / 2.0
     # 每个被占的列/排要让出的间距：格子之间的缝由两侧各让一半凑成，勾选
@@ -281,6 +284,13 @@ def choose_quad_slots(wins, mins, work_w, work_h, gap=0, edge_gap=False):
     # 缝，所以需求按 need + pad 算——缝吃完才刚刚好不压盖邻居、不越出工作区。
     pad = half + (half if edge_gap else 0)
     n = len(wins)
+    want_corner = list(corners)[:n] if corners else list(range(n))
+    while len(want_corner) < n:
+        want_corner.append(len(want_corner))
+    # 用户明确只选了这几个角（不足四个）时，他点的角优先——点掉别的格就是不
+    # 要那些角。四个里挑几个时才优先「靠前的角」：剩下的窗口读起来是完整的
+    # 一块，斜对角放两个像出了 bug（真机四窗放不下两个时就这么调过）。
+    honor_requested = n < 4
     best = None
     for mask in range(1, 1 << n):
         idxs = [i for i in range(n) if mask & (1 << i)]
@@ -299,7 +309,8 @@ def choose_quad_slots(wins, mins, work_w, work_h, gap=0, edge_gap=False):
             req = [need[k] + pad if occ[k] else 0 for k in range(4)]
             if req[0] + req[1] > work_w or req[2] + req[3] > work_h:
                 continue              # 这一组摆法在这块屏上必然重叠或越界
-            displaced = sum(1 for i, c in zip(idxs, perm) if c != i)
+            displaced = sum(1 for i, c in zip(idxs, perm)
+                            if c != want_corner[i])
             cols, rows = (req[0], req[1]), (req[2], req[3])
             unused = 0
             for i, c in zip(idxs, perm):
@@ -307,11 +318,12 @@ def choose_quad_slots(wins, mins, work_w, work_h, gap=0, edge_gap=False):
                 cw = cols[0] if c in (0, 2) else cols[1]
                 ch = rows[0] if c in (0, 1) else rows[1]
                 unused += max(0, cw * ch - mw * mh)
-            # 排得多 > 靠前的角（左上→右上→左下→右下，读起来是完整的一块）>
-            # 不挪用户指定的角 > 格子利用得满 > 下标小。放不下四个时，「看
-            # 起来是排好的一块」比「严格守在用户点的角上」更要紧——斜对角放
-            # 两个窗口像出了 bug。
-            key = (-len(idxs), sum(perm), displaced, unused, tuple(idxs))
+            # 四个里挑：排得多 > 靠前的角 > 不挪用户指定的角 > 利用得满。
+            # 明确只选几个：排得多 > 不挪用户选中的角 > 靠前的角 > 利用得满。
+            if honor_requested:
+                key = (-len(idxs), displaced, sum(perm), unused, tuple(idxs))
+            else:
+                key = (-len(idxs), sum(perm), displaced, unused, tuple(idxs))
             if best is None or key < best[0]:
                 best = (key, idxs, perm)
     if best is None:

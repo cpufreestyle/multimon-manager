@@ -1368,6 +1368,9 @@ def _is_portrait(mon):
 # 最近一次四宫格排列的实测报告：[(hwnd, 目标矩形, 实测矩形或None), ...]
 # 供界面说明「哪些格子被应用的最小窗口尺寸钳制了」
 _last_quad_report = []
+# 写入无效的窗口（App 不开放自动化 / 被系统钉住）：几何一步都没变。
+# 与「被最小尺寸钳制」是两回事——钳制会变，写不动是一步不动，状态栏要分开说。
+_last_quad_unwritable = []
 
 
 # 最近一次四宫格实际使用的比例 (split_x, split_y)，智能模式下即程序算出的值，
@@ -1635,6 +1638,30 @@ def _probe_min_size(hwnd, at_x, at_y):
     return best
 
 
+def _cg_rect(hwnd):
+    """窗口的当前几何（CoreGraphics 枚举，不走 AppleScript）。
+
+    判断「写入有没有生效」必须用 CG：App 不开放自动化时 AX 读写都失败（真机
+    微信、CrossPaste 的 AppleScript 恒报 -1719），那时候只有 CG 还看得见这个
+    窗口。get_window_rect 带 _last_rect 缓存，会把上一次的几何当成当前值，
+    所以这里直接枚举、按 (owner + name [+ 序号]) 精确匹配。
+    """
+    if not hwnd:
+        return None
+    app, name, seq = parse_hwnd(hwnd)
+    ordinal = 0
+    for w in list_windows_front_to_back():
+        if w.get("owner") != app:
+            continue
+        if (w.get("name") or "") != (name or ""):
+            continue
+        ordinal += 1
+        if seq and ordinal != seq:
+            continue      # 带序号的 hwnd 只认同名第 N 个
+        return (w["x"], w["y"], w["w"], w["h"])
+    return None
+
+
 def _quad_zone(idx, row_full, col_full):
     """按「哪一排/列有窗口」选间距方位。
 
@@ -1697,9 +1724,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     只是「参与排列的四个窗口」（顺序不限），split_x/split_y 作为兜底值。
 
     四个 hwnd 均可显式指定；未指定时自动取最前面的四个窗口（左上优先用界面
-    固定的目标窗口）。monitor 可指定目标显示器（int 索引或 device_name 字符串）；
-    为 None 时以左上窗口当前所在屏幕为准，该屏放不下四格最小尺寸时自动换一块
-    放得下的横屏。
+    固定的目标窗口）。显式选中 2 个及以上时不再自动补足——界面上点掉不想要的
+    格就只排选中的两三个，放不下四个时从「意外」变成「选择」。monitor 可指定
+    目标显示器（int 索引或 device_name 字符串）；为 None 时以左上窗口当前所在
+    屏幕为准，该屏放不下时自动换一块放得下的横屏。
 
     排布前先实测每个窗口的最小尺寸：App 的最小尺寸（真机 ChatGPT 高 600、
     Qoder CN 540）会把窗口撑出我们给的格子，撑过屏幕底边后 macOS 会把整个
@@ -1725,8 +1753,15 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
              if w["pid"] not in _OWN_PIDS and w["owner"]]
     cands_by_hwnd = {w["hwnd"]: w for w in cands}
 
-    picked, seen = [], set()
-    for want in (tl_hwnd, tr_hwnd, bl_hwnd, br_hwnd):
+    # 选几个就排几个：在网格里点掉不想要的格（或下拉里选「自动」）即可只排
+    # 两三个。这块屏放不下四个是常态（真机 Built-in 1512x896，四个窗口的
+    # App 最小尺寸总和动辄 1800x1300），能让用户主动选 2 个 / 3 个来排，比
+    # 每次放不下再解释一遍有用。显式选满 2 个及以上时不再自动补足；只选 1 个
+    # 或一个都没选时按老行为补足四个（用户还在选，或想用固定的目标窗口）。
+    wants = (tl_hwnd, tr_hwnd, bl_hwnd, br_hwnd)
+    keep_only_selected = len([x for x in wants if x]) >= 2
+    picked, picked_corners, seen = [], [], set()
+    for corner, want in enumerate(wants):
         w = None
         if want:
             w = cands_by_hwnd.get(want) or _find_window(want)
@@ -1736,23 +1771,30 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
                 # 用户看到的就是「智能/非智能都不准」）
                 logger.warning("四宫格：指定的窗口 %s 已不可用", want)
                 _missing_windows.append(want)
-        elif use_pinned and _pinned_target and _pinned_target not in seen:
+        elif (not keep_only_selected and use_pinned and _pinned_target
+              and _pinned_target not in seen):
             w = _find_window(_pinned_target)
         if w is None:
+            if keep_only_selected:
+                continue          # 用户点掉了这个角：留空，不补
             for c in cands:
                 h = c.get("hwnd") or make_hwnd(c["owner"], c["name"] or "")
                 if h not in seen:
                     w = c
                     break
         if w is None:
-            logger.warning("可用窗口不足四个，无法四宫格排列")
-            return False
+            # 桌面上一共没那么多窗口：排已有的，少于两个才失败
+            continue
         h = w.get("hwnd") or make_hwnd(w["owner"], w["name"] or "")
         # 登记 CG 侧几何：set_window_rect 靠它在 AX 窗口列表里认出这个窗口
         # （CG 枚举序与 AX 序不一致时，纯按序号会选到别的窗口）
         _last_rect[h] = (w["x"], w["y"], w["w"], w["h"])
         picked.append((h, w))
+        picked_corners.append(corner)
         seen.add(h)
+    if len(picked) < 2:
+        logger.warning("可排列的窗口不足两个（选中 %d 个）", len(picked))
+        return False
 
     tl_hwnd, tl_w = picked[0]
     idx = _resolve_monitor_index(ms, monitor)
@@ -1813,7 +1855,11 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
             mins[h] = (cur[2], cur[3])
             logger.warning("四宫格：%s 被系统钉死，按当前尺寸 %dx%d 参与",
                         h, cur[2], cur[3])
-    corners = [(mins[h][0], mins[h][1]) for h, _w in picked]
+    # 四格需求按「用户选中的角」算：点掉了几格，空格子按 0 计入。不能把选中
+    # 的窗口挤到别的角上去算——quad_requirements 假定顺序是 左上/右上/左下/右下
+    corners = [(0, 0)] * 4
+    for (h, _w), c in zip(picked, picked_corners):
+        corners[c] = (mins[h][0], mins[h][1])
     need_w, need_h = quad_plan.quad_requirements(corners)
     logger.info("四格最小尺寸需求 %dx%d（屏幕 %s %dx%d）：%s",
                 need_w, need_h, mon.device_name, ww, wh,
@@ -1880,9 +1926,14 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     gap, edge_gap = _gap_settings()
     # 被系统钉死的窗口（任何 AX 写入都被忽略）不参与占角：它动不了，占一个
     # 角只会把活窗口的空间挤掉
-    pool = [p for p in picked if p[0] not in pinned_windows]
+    pool_idx = [i for i, (h, _w) in enumerate(picked)
+                if h not in pinned_windows]
+    pool = [picked[i] for i in pool_idx]
+    # 每个窗口原本认哪个角：用户点掉几格后 picked 不满四个，角必须对得上，
+    # 否则「左上」的窗口会被排到右上
+    pool_corners = [picked_corners[i] for i in pool_idx]
     placed_slots, unplaced = quad_plan.choose_quad_slots(
-        pool, mins, ww, wh, gap, edge_gap)
+        pool, mins, ww, wh, gap, edge_gap, corners=pool_corners)
     # 没点名屏幕时，换一块能多排几个的横屏：放不下四个是常态，能多排一个是
     # 一个。竖屏不主动送——用户明确说过不适合竖屏的窗口不要发到竖屏屏幕
     if len(placed_slots) < len(pool) and monitor is None:
@@ -1891,7 +1942,7 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
                 continue
             _ml, _mt, mw2, mh2 = m.work_rect
             slots2, unplaced2 = quad_plan.choose_quad_slots(
-                pool, mins, mw2, mh2, gap, edge_gap)
+                pool, mins, mw2, mh2, gap, edge_gap, corners=pool_corners)
             if len(slots2) > len(placed_slots):
                 logger.info("屏幕 %s 只能排 %d 个，%s 能排 %d 个，改排到 %s",
                             mon.device_name, len(placed_slots),
@@ -1908,6 +1959,8 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
         ww, wh, sx, sy)
 
     notes = []
+    # 写入无效的窗口（App 不开放自动化 / 被系统钉住）：写入前后几何一步没变
+    unwritable = []
 
     wr, wb = wl + ww, wt + wh          # 工作区右 / 下边界
 
@@ -1935,19 +1988,28 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
         ri = 0 if corner in (0, 1) else 1      # 0 上排 / 1 下排
         need_col[ci] = max(need_col[ci], mins[h][0])
         need_row[ri] = max(need_row[ri], mins[h][1])
+    # 哪一排/列有窗口由「选中了哪些角」定，不由最小尺寸定：最小尺寸探测失败
+    # （全 0）时也不能退化成「只排上面半屏、下面半屏空白」。
+    has_row = [False, False]
+    has_col = [False, False]
+    for corner, _h, _w in placed_slots:
+        has_row[0 if corner in (0, 1) else 1] = True
+        has_col[0 if corner in (0, 2) else 1] = True
     lo_r1 = need_row[0] + pad if need_row[0] else 0
     lo_r2 = need_row[1] + pad if need_row[1] else 0
-    # 只有一排有窗口时，这一排撑满整个工作区高：两个窗口并排就该铺满屏幕，
-    # 留半屏空白看起来就是「没排好」。只有一个窗口时不撑满（那是 maximize，
-    # 不是四宫格）；空着的那排高度为 0，界面上的横向分割线随之贴到底边。
-    row_full = len(placed_slots) >= 2 and bool(lo_r1) != bool(lo_r2)
+    # 只有一排有窗口时，这一排撑满整个工作区高：选两个窗口就该铺满屏幕，留
+    # 半屏空白看起来就是「没排好」。只有一个窗口时不撑满（那是 maximize，不是
+    # 四宫格）；空着的那排高度为 0，界面上的横向分割线随之贴到底边。
+    row_full = len(placed_slots) >= 2 and has_row[0] != has_row[1]
     if row_full:
-        r1 = wh if lo_r1 else 0
+        # 哪一排有窗口看 has_row，不看 lo_r1：最小尺寸探测不到（全 0）时
+        # lo_r1 也是 0，拿它判会把有窗口的那排判成 0 高——窗口被压成 1px
+        r1 = wh if has_row[0] else 0
         r2 = wh - r1
         row_y = (wt, wt + r1)
         logger.info("四宫格：只有%s有窗口，%s撑满工作区高 %d",
-                    "上排" if lo_r1 else "下排",
-                    "上排" if lo_r1 else "下排", wh)
+                    "上排" if has_row[0] else "下排",
+                    "上排" if has_row[0] else "下排", wh)
     elif lo_r1 + lo_r2 <= wh and (r1 < lo_r1 or r2 < lo_r2):
         if lo_r1 and lo_r2:
             slack = wh - lo_r1 - lo_r2
@@ -1964,14 +2026,15 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     lo_c1 = need_col[0] + pad if need_col[0] else 0
     lo_c2 = need_col[1] + pad if need_col[1] else 0
     # 与行同理：只有一列有窗口时，这一列撑满整个工作区宽
-    col_full = len(placed_slots) >= 2 and bool(lo_c1) != bool(lo_c2)
+    col_full = len(placed_slots) >= 2 and has_col[0] != has_col[1]
     if col_full:
-        c1 = ww if lo_c1 else 0
+        # 同行：哪一列有窗口看 has_col，不看 lo_c1（理由同行）
+        c1 = ww if has_col[0] else 0
         c2 = ww - c1
         col_x = (wl, wl + c1)
         logger.info("四宫格：只有%s有窗口，%s撑满工作区宽 %d",
-                    "左列" if lo_c1 else "右列",
-                    "左列" if lo_c1 else "右列", ww)
+                    "左列" if has_col[0] else "右列",
+                    "左列" if has_col[0] else "右列", ww)
     elif lo_c1 + lo_c2 <= ww and (c1 < lo_c1 or c2 < lo_c2):
         if lo_c1 and lo_c2:
             slack = ww - lo_c1 - lo_c2
@@ -2012,8 +2075,27 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
         # 尺寸顶大时，由后面的贴边 / 居中逻辑收尾。
         finals.append((idx, h, bx, by, max(1, bw), max(1, bh)))
     for idx, h, fx, fy, fw, fh in finals:
+        # 写入前先取 CG 几何：判「写入有没有生效」用它，不用 _last_rect（探测
+        # 失败时它可能停留在很久以前的枚举值），也不用 AX 读回（App 不开放
+        # 自动化时读回直接失败，真机微信、CrossPaste 恒报 -1719）
+        pre = _cg_rect(h)
         set_window_rect(h, fx, fy, fw, fh, activate=False)
         got = _settled_readback(h, (fx, fy, fw, fh))
+        post = _cg_rect(h)
+        # 要求了一个有意义的变化、CG 几何却一步没变 = 这个窗口动不了：App 根本
+        # 不开放自动化（真机微信、CrossPaste），或被系统钉住（真机 Sidecar 上的
+        # UU远程）。必须与「被最小尺寸钳制」分开——钳制会变，写不动是一步不动。
+        # 判据放在「读回失败」之前：微信那种 AX 读写全失败的窗口也得报出来。
+        if (pre and post and h not in unwritable
+                and any(abs(a - b) > 2
+                        for a, b in zip(pre, (fx, fy, fw, fh)))
+                and all(abs(a - b) <= 2 for a, b in zip(pre, post))):
+            unwritable.append(h)
+            notes.append("%s 写入后位置尺寸都没变，无法移动"
+                         "（不开放自动化或被系统钉住）"
+                         % h.split("::")[0])
+            logger.warning("四宫格：%s 写入无效：要求 %s，CG 几何仍是 %s",
+                           h, (fx, fy, fw, fh), post)
         if not got or got == (0, 0, 0, 0):
             continue
         gx, gy, gw, gh = got
@@ -2067,7 +2149,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
         got = _readback_rect(h, want)
         if not got or got == (0, 0, 0, 0):
             report.append((h, want, None))
-            notes.append("%s 读不到几何" % h.split("::")[0])
+            # 已经报过「写入无效」就不再报「读不到几何」：同一个窗口占两条说明，
+            # 会把更有用的那条挤出状态栏（状态栏只显示前两条）
+            if h not in unwritable:
+                notes.append("%s 读不到几何" % h.split("::")[0])
             continue
         # 写入后几何完全没变、且窗口中心不在目标屏：这个窗口被系统钉住了
         # （真机实测 Sidecar 上的 UU远程 窗口，任何 AX 写入都被忽略）。
@@ -2077,24 +2162,14 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
         elif (abs(got[0] - want[0]) <= 2 and abs(got[1] - want[1]) <= 2
                 and abs(got[2] - want[2]) <= 2 and abs(got[3] - want[3]) <= 2):
             pass
-        else:
-            cx, cy = got[0] + got[2] / 2.0, got[1] + got[3] / 2.0
-            on_target = (mon.left <= cx < mon.left + mon.width
-                         and mon.top <= cy < mon.top + mon.height)
-            if not on_target:
-                pre = _last_rect.get(h)
-                if pre and pre == got:
-                    notes.append(
-                        "%s 被系统钉在当前位置，无法移动到目标格"
-                        % h.split("::")[0])
-                    logger.warning("四宫格：%s 钉死不动 -> %s", h, got)
         dev = max(abs(g - t) for g, t in zip(got, want))
         report.append((h, want, got))
         # 窗口被系统判给了别的屏：中心点不在目标屏范围内。这是「四窗不在
         # 一个屏幕上」的直接证据，必须报出来，不能记成「被最小尺寸钳制」。
         cx, cy = got[0] + got[2] / 2.0, got[1] + got[3] / 2.0
-        if not (mon.left <= cx < mon.left + mon.width
-                and mon.top <= cy < mon.top + mon.height):
+        if (h not in unwritable
+                and not (mon.left <= cx < mon.left + mon.width
+                         and mon.top <= cy < mon.top + mon.height)):
             notes.append("%s 被系统移到了别的屏（实测 %s）"
                          % (h.split("::")[0], got))
             logger.warning("四宫格：%s 被移到别的屏 -> %s", h, got)
@@ -2103,6 +2178,8 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
                         "可能被应用的最小窗口尺寸钳制）", h, want, got, dev)
     global _last_quad_report
     _last_quad_report = report
+    global _last_quad_unwritable
+    _last_quad_unwritable[:] = unwritable
     global _last_quad_order
     _last_quad_order = [h for _idx, h, _w in placed_slots]
     if _missing_windows:

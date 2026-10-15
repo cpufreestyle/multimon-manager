@@ -51,6 +51,9 @@ def _run(wins, mons, **kw):
     会先实测每个窗口的最小尺寸（真机是写个小尺寸再读回，走 AppleScript），
     单测必须把这一步也换掉——否则会真的去动用户的窗口。
     """
+    # 每例都拿一份窗口副本：fake 写入会把新几何写回窗口 dict（CG 枚举要跟着
+    # 变，否则「写入无效」的判据全落空），共用 WINS 会把上一例的几何带给下一例
+    wins = [dict(w) for w in wins]
     placed = []
     prev = {}
     for attr in ("list_target_windows", "monitors", "_find_window",
@@ -107,6 +110,14 @@ def _run(wins, mons, **kw):
         # 见 _exact 说明：未指定 readback 的窗口读回宽度比请求少 1px，
         # 令「读回 + 1」正好回到理想分割点
         state[hwnd] = _exact(hwnd, x, y, w, h)
+        # CG 枚举同步：snap_four_quad 用 CG 几何判断「写入有没有生效」（App 不
+        # 开放自动化时 AX 读回会失败，只有 CG 还看得见窗口）。fake 写入不更新
+        # 枚举的话，所有窗口都会被误判成写入无效。指定了 readback 的窗口按
+        # readback 走——那是在模拟「App 把尺寸钳制在别处」。
+        got = readback.get(hwnd) or (x, y, w, h)
+        for win in wins:
+            if win["hwnd"] == hwnd:
+                win["x"], win["y"], win["w"], win["h"] = got
         return True
 
     wm.set_window_rect = _place
@@ -166,10 +177,67 @@ class TestSnapFourQuad(unittest.TestCase):
         self.assertEqual([p[0] for p in placed],
                          ["D::1", "C::1", "B::1", "A::1"])
 
-    def test_insufficient_windows(self):
+    def test_three_windows_are_arranged_not_rejected(self):
+        """桌面上只有三个窗口也排：放不下四个不该等于什么都不做。
+
+        真机常态是四个放不下，用户也会在网格里点掉几格只排两三个——「不足四个
+        就失败」把这个功能在 1512x896 这类小屏上基本废掉了。
+        """
         ok, placed = _run(list(self.WINS)[:3], [_Mon()])
+        self.assertTrue(ok)
+        self.assertEqual([p[0] for p in placed], ["A::1", "B::1", "C::1"])
+        # 三格仍是 2x2 的左上/右上/左下，右下空着
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[0], (0, 0, 960, 540))
+        self.assertEqual(cells[2], (0, 540, 960, 540))
+        self.assertNotIn("D::1", {p[0] for p in placed})
+
+    def test_only_one_window_fails(self):
+        """一个窗口排不出四宫格：明确失败，且不摆任何窗口。"""
+        ok, placed = _run(list(self.WINS)[:1], [_Mon()])
         self.assertFalse(ok)
-        self.assertEqual(placed, [], "窗口不足四个时不应摆放任何窗口")
+        self.assertEqual(placed, [])
+
+    def test_two_explicit_windows_fill_the_screen(self):
+        """只选两个角（网格里点掉另外两个）就只排两个，并且铺满整屏。"""
+        ok, placed = _run(list(self.WINS), [_Mon()],
+                          tl_hwnd="A::1", tr_hwnd="B::1")
+        self.assertTrue(ok)
+        self.assertEqual([p[0] for p in placed], ["A::1", "B::1"])
+        a, b = placed
+        # placed 元组是 (hwnd, x, y, w, h)
+        self.assertEqual((a[1], a[2]), (0, 0))
+        self.assertEqual(a[2] + a[4], 1080)        # 高铺满
+        self.assertEqual(b[1] + b[3], 1920)        # 右缘贴工作区右边
+        self.assertEqual(b[2] + b[4], 1080)
+        self.assertEqual(b[1] - (a[1] + a[3]), 12)  # 中间只隔一个窗口间距
+        # 只有上排有窗口：横向分割线贴到底边（100%）
+        self.assertAlmostEqual(wm._last_quad_splits[1], 1.0)
+
+    def test_explicit_column_keeps_left_column(self):
+        """显式选左上 + 左下：按选中的角排（左列），不压缩成上排。"""
+        ok, placed = _run(list(self.WINS), [_Mon()],
+                          tl_hwnd="A::1", bl_hwnd="C::1")
+        self.assertTrue(ok)
+        self.assertEqual([p[0] for p in placed], ["A::1", "C::1"])
+        a, b = placed
+        self.assertEqual(a[1] + a[3], 1920)        # 上块铺满宽
+        self.assertEqual(b[1] + b[3], 1920)        # 下块铺满宽
+        self.assertEqual(b[2] - (a[2] + a[4]), 12)
+        # 只有左列有窗口：竖向分割线贴在右边（100%）
+        self.assertAlmostEqual(wm._last_quad_splits[0], 1.0)
+
+    def test_explicit_three_leave_fourth_corner_empty(self):
+        """显式选三个：第四个角留空，不拿别的窗口补上。"""
+        ok, placed = _run(list(self.WINS), [_Mon()],
+                          tl_hwnd="A::1", tr_hwnd="B::1", bl_hwnd="C::1")
+        self.assertTrue(ok)
+        self.assertEqual([p[0] for p in placed], ["A::1", "B::1", "C::1"])
+        self.assertNotIn("D::1", {p[0] for p in placed})
+        # 两排两列都有人：仍是标准 2x2，右下角空着
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[0], (0, 0, 960, 540))
+        self.assertEqual(cells[3], (960, 540, 960, 540))
 
     def test_monitor_offset(self):
         """指定非主屏时，四宫格应落在该屏工作区内。"""
@@ -403,6 +471,47 @@ class TestSnapFourQuad(unittest.TestCase):
         # 界面上的分割线：横向贴到底边（100%），纵向按两列实际宽度
         self.assertAlmostEqual(wm._last_quad_splits[1], 1.0)
         self.assertAlmostEqual(wm._last_quad_splits[0], 706 / float(ww), places=3)
+
+    def test_two_windows_stacked_fill_the_whole_width(self):
+        """并排宽度不够、只能上下堆时，这两个要铺满整屏的宽。
+
+        与 test_two_windows_fill_the_whole_screen 是同一条规则的另一个方向：
+        只有一列有窗口时，这一列撑满整个工作区宽，两块上下铺满。
+        """
+        ww, wh = 1512, 900
+        mins = {"A::1": (900, 400), "B::1": (900, 400),
+                "C::1": (2000, 400), "D::1": (2000, 400)}
+        ok, placed = _run(list(self.WINS),
+                          [_Mon(width=ww, height=wh)], min_sizes=mins)
+        self.assertTrue(ok)
+        # 900+900 加间距超过 1512，只能上下堆：左上 + 左下
+        self.assertEqual([p[0] for p in placed], ["A::1", "B::1"])
+        a, b = placed
+        # placed 元组是 (hwnd, x, y, w, h)
+        self.assertEqual(a[1] + a[3], ww)            # 上块铺满宽
+        self.assertEqual(b[1] + b[3], ww)            # 下块铺满宽
+        self.assertEqual(a[1], 0)                    # 左缘贴工作区左边
+        self.assertEqual(b[2] - (a[2] + a[4]), 12)   # 中间只隔一个窗口间距
+        # 只有一列有窗口：右列宽度为 0，界面上的竖向分割线贴在右边
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[1], (ww, 0, 0, wh // 2))
+        self.assertAlmostEqual(wm._last_quad_splits[0], 1.0)
+
+    def test_unwritable_window_is_reported_as_such(self):
+        """写入后一步没动的窗口要如实说「写入无效」，不能算成被最小尺寸钳制。
+
+        真机 CrossPaste：AppleScript 恒报 -1719（窗口根本不开放自动化），
+        任何 AX 写入都被忽略，窗口留在原地。旧实现只报一个很大的偏差，状态栏
+        写成「被应用最小尺寸钳制」——那是现象不是原因；而且这条判断早先藏在
+        「中心不在目标屏」里，中心恰好在目标屏上的写不动窗口就被整条漏掉了。
+        """
+        ok, placed = _run(list(self.WINS), [_Mon()],
+                          readback={"A::1": (10, 20, 100, 100)})
+        self.assertTrue(ok)
+        self.assertIn("A::1", wm._last_quad_unwritable)
+        self.assertIn("写入后位置尺寸都没变", "；".join(wm._last_quad_notes))
+        # 写不动不是把它踢出四宫格的理由：角还是它的，只是没排进去
+        self.assertEqual(len(placed), 4)
 
     def test_nothing_fits_leaves_everything_untouched(self):
         """四个窗口都比整块屏还大时一个都不排，也不硬塞。"""
