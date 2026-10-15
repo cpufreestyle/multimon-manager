@@ -1398,6 +1398,12 @@ _last_quad_boxes = [None, None, None, None]
 _last_quad_slots = []
 
 
+# 上次排布探到的 App 最小窗口尺寸 {hwnd: (w, h)}。容量预检 quad_capacity()
+# 消费它：探测最小尺寸要把窗口缩小再读回，只能挂在正式排布上做，预检里探头
+# 会把用户窗口无故缩小再还原（闪烁、白占一步撤销栈），所以这里只缓存只读。
+_QUAD_MIN_CACHE = {}
+
+
 # 最近一次四宫格需要如实告知用户的情况（屏幕装不下四个最小尺寸、某窗口
 # 被系统判给了别的屏……）。界面读它在状态栏里提示，而不是只说「排列完成」。
 _last_quad_notes = []
@@ -2328,8 +2334,92 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # 就地清空再填充（而不是重新绑定）：本函数顶部已用 global 声明过它，
     # 这里再声明一次会报「name used prior to global declaration」。就地改内容
     # 让界面持有的引用（若有）也同步更新。
+    # 最小尺寸缓存给容量预检（quad_capacity）用：下次改选择 / 换屏时立刻能
+    # 说出「这块屏最多排几个」，不必等真的排一遍。只缓存探测到的正值——
+    # (0,0) 是探测失败，按 0 计会把容量说得过于乐观。
+    for _h, _m in mins.items():
+        if _m and _m[0] > 0 and _m[1] > 0:
+            _QUAD_MIN_CACHE[_h] = (int(_m[0]), int(_m[1]))
     _last_quad_notes[:] = notes
     return True
+
+
+def quad_capacity(hwnds, monitor=None):
+    """预检：当前选择在一块屏上最多排得下几个窗口（不动任何窗口）。
+
+    为什么需要它：四宫格的容量是硬上限——App 的最小窗口尺寸改不了，放不下
+    四个时「照排四个」的结局只能是重叠或越界（真机 RV200 Pro 上四个窗口最小
+    尺寸合计需 1539x1266，工作区只有 1600x870，硬排必有 396px 上下重叠，
+    用户看到的就是「不准」）。把容量在点「2×2 排列」之前摆出来，用户才知道
+    该关谁、换谁，而不是排完看到重叠以为程序算错。
+
+    最小尺寸消费上次排布的缓存（_QUAD_MIN_CACHE），原因见该缓存处的注释。
+    没探过的窗口按 0 计——0 是乐观值，fit 因此是上限；返回值的 uncached 列
+    出没探过的窗口名，界面据此说明「容量偏乐观」。
+
+    hwnds: 按 左上/右上/左下/右下 顺序的 hwnd 列表（可少于四个，顺序即角序）。
+    monitor: int 索引 / device_name 字符串 / None（自动）。None 时在横屏里挑
+        排得最多的（竖屏不算——用户明确说过不适合竖屏的窗口不要发到竖屏），
+        与正式排布的换屏策略一致；并列时取第一个窗口所在屏。
+
+    返回 None 表示一个窗口的最小尺寸都没缓存（从没排过），界面据此不显示；
+    否则返回 dict：screen / work (w, h) / fit（最多排几个）/ total（选了几个）
+    / need（全排所需最小工作区，有未缓存窗口时为 None）/ uncached（窗口名）。
+    """
+    hwnds = [h for h in (hwnds or []) if h]
+    if not hwnds:
+        return None
+    cached = {h: _QUAD_MIN_CACHE[h] for h in hwnds if h in _QUAD_MIN_CACHE}
+    if not cached:
+        return None
+    gap, edge_gap = _gap_settings()
+    ms = monitors.enum_monitors()
+    if not ms:
+        return None
+    wins = [(h, None) for h in hwnds]
+    mins_all = {h: _QUAD_MIN_CACHE.get(h, (0, 0)) for h in hwnds}
+
+    def _fit(m):
+        _wl, _wt, mw, mh = m.work_rect
+        slots, _unplaced = quad_plan.choose_quad_slots(
+            wins, mins_all, mw, mh, gap, edge_gap)
+        return len(slots)
+
+    # 点名屏就尊重它（放不下也照样报这块屏的容量）；否则横屏里挑最优
+    idx = _resolve_monitor_index(ms, monitor) if monitor is not None else None
+    if idx is not None and 0 <= idx < len(ms):
+        best = ms[idx]
+    else:
+        # 第一个窗口所在屏：并列时的优先项（与「自动 = 左上窗口所在屏」一致）
+        first_idx = None
+        try:
+            r = _cg_rect(hwnds[0]) or _last_rect.get(hwnds[0])
+            if r:
+                first_idx = _monitor_index_by_rect(ms, r[0], r[1], r[2], r[3])
+        except Exception:  # noqa: BLE001  预检只是建议，读不到几何就按序取
+            first_idx = None
+        best, best_key = None, None
+        for i, m in enumerate(ms):
+            if m.height > m.width:
+                continue          # 竖屏不送
+            key = (_fit(m), 1 if i == first_idx else 0)
+            if best is None or key > best_key:
+                best, best_key = m, key
+        if best is None:          # 一台横屏都没有：退回第一块，容量照算
+            best = ms[0]
+    # 全排需求按用户角标算（与 snap_four_quad 里记日志的口径一致）：点掉几格
+    # 的空格按 0 计入。有窗口没探过最小尺寸时需求会偏小，宁可不报。
+    need = None
+    if len(cached) == len(hwnds):
+        corners = [(0, 0)] * 4
+        for corner, h in enumerate(hwnds[:4]):
+            corners[corner] = mins_all[h]
+        need = quad_plan.quad_requirements(corners)
+    return {"screen": best.device_name,
+            "work": (best.work_rect[2], best.work_rect[3]),
+            "fit": _fit(best), "total": len(hwnds),
+            "need": need,
+            "uncached": [h.split("::")[0] for h in hwnds if h not in cached]}
 
 
 def monitors_list_snapshot():

@@ -837,6 +837,8 @@ class App:
             cb.pack(side="left", padx=(4, 0))
             self._tooltip(cb, f"四宫格{pos}角的窗口。自动 = 取最前面的未占用窗口。")
             setattr(self, "quad_%s_cb" % key, cb)
+            cb.bind("<<ComboboxSelected>>",
+                    lambda e: self._update_quad_capacity())
         quad_btn = ttk.Button(quad_row, text="2×2 排列",
                               command=self._snap_four_quad)
         quad_btn.pack(side="left", padx=(6, 0))
@@ -866,6 +868,8 @@ class App:
                                         textvariable=self.quad_mon_var,
                                         state="readonly", width=13)
         self.quad_mon_cb.pack(side="left", padx=(4, 2))
+        self.quad_mon_cb.bind("<<ComboboxSelected>>",
+                              lambda e: self._update_quad_capacity())
         self._tooltip(self.quad_mon_cb,
                       "四宫格排到哪块屏。「自动」按左上窗口当前所在屏。")
 
@@ -879,6 +883,18 @@ class App:
         # 必须 pack：画布只 create_* 而不 pack 就永远不显示，网格、点格、
         # 分割线全都看不见（这正是「新功能没有渲染出来」的原因）。
         self.quad_grid_canvas.pack(side="left", padx=(4, 4))
+        # 容量预检：点「2×2 排列」之前就说清这块屏排得下几个。四宫格容量是
+        # 硬上限（App 最小窗口尺寸改不了），排完才发现「只动了两个」会被当成
+        # 「不准」——事前说清，用户才知道该关谁、换谁。数据用上次排布缓存的
+        # 最小尺寸：探测最小尺寸要把窗口缩小再读回，不能挂在预检里做。
+        self.quad_cap_var = tk.StringVar(value="")
+        cap_lb = ttk.Label(quad_row2, textvariable=self.quad_cap_var,
+                           font=("Helvetica", 8), foreground="#777")
+        cap_lb.pack(side="left", padx=(2, 0))
+        self._tooltip(cap_lb,
+                      "这块屏上，当前选择最多能排几个窗口。放不下四个是 App 最小"
+                      "窗口尺寸的硬上限，不是排布算错；没探测过最小尺寸的窗口按"
+                      " 0 计，容量偏乐观。")
         self._quad_split_x = tk.DoubleVar(value=0.5)
         self._quad_split_y = tk.DoubleVar(value=0.5)
         self._quad_drag = None
@@ -1028,6 +1044,8 @@ class App:
         if self.target_var.get() not in self._target_map:
             self.target_var.set(AUTO_TARGET)
             b.set_target(None)
+        # 窗口列表变了：容量预检的输入（选择 + 缓存的最小尺寸）也可能变
+        self._update_quad_capacity()
         self._refresh_trigger_pattern_candidates(wins)
 
     def _refresh_trigger_pattern_candidates(self, wins=None):
@@ -1290,9 +1308,59 @@ class App:
             if clamped:
                 parts.append("｜ 被应用最小尺寸钳制：" + "、".join(clamped[:4]))
             self.status_var.set(" ".join(parts))
+            # 这次排布刚探过最小尺寸（缓存已更新），容量预检跟着刷新：用户
+            # 接着改选择 / 换屏时，看到的就是最新事实
+            self._update_quad_capacity()
         else:
             self.status_var.set("四宫格失败：至少需要两个可操作窗口"
                                 "（网格里点掉几格可以只排两三个）")
+
+    def _update_quad_capacity(self):
+        """刷新四宫格容量预检行：只读后端缓存，不动任何窗口。"""
+        var = getattr(self, "quad_cap_var", None)
+        if var is None:
+            return
+        try:
+            b = self._quad_backend_mod()
+            fn = getattr(b, "quad_capacity", None)
+            if fn is None:
+                return
+            short_map = getattr(self, "_quad_short_map", {})
+            hwnds = []
+            for v in (self.quad_tl_var, self.quad_tr_var,
+                      self.quad_bl_var, self.quad_br_var):
+                h = short_map.get(v.get())
+                if h and h not in hwnds:
+                    hwnds.append(h)
+            if not hwnds:
+                var.set("")
+                return
+            mon_idx = self._monitor_map.get(self.quad_mon_var.get())
+            cap = fn(hwnds, mon_idx)
+            var.set(self._quad_capacity_text(cap))
+        except Exception:  # noqa: BLE001  预检只是建议，失败就不显示
+            var.set("")
+
+    @staticmethod
+    def _quad_capacity_text(cap):
+        """quad_capacity 的返回值 → 一行字；None（没缓存/没选窗）时返回空串。"""
+        if not cap:
+            return ""
+        fit, total = cap.get("fit") or 0, cap.get("total") or 0
+        scr = cap.get("screen") or ""
+        ww, wh = cap.get("work") or (0, 0)
+        need = cap.get("need")
+        # 有窗口没探过最小尺寸时 fit 偏乐观（未探测按 0 计），不能结论成
+        # 「放得下」——只能说上限，并把未探测个数报出来
+        if fit >= total and not cap.get("uncached"):
+            return "%d/%d 放得下（%s %d×%d）" % (fit, total, scr, ww, wh)
+        head = "最多排 %d/%d" % (fit, total)
+        if need:
+            head += "：全排需 %d×%d" % (need[0], need[1])
+        head += "（%s %d×%d）" % (scr, ww, wh)
+        if cap.get("uncached"):
+            head += "，%d 个未探测" % len(cap["uncached"])
+        return head
 
     # ---------- 四宫格可视化 ----------
     _QUAD_KEYS = ("TL", "TR", "BL", "BR")
