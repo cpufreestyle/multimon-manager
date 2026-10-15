@@ -56,7 +56,7 @@ def _run(wins, mons, **kw):
     for attr in ("list_target_windows", "monitors", "_find_window",
                  "get_window_rect", "set_window_rect", "push_undo",
                  "_osa", "_probe_min_size", "list_windows_front_to_back",
-                 "_readback_rect"):
+                 "_readback_rect", "_gap_settings"):
         prev[attr] = getattr(wm, attr)
 
     class _Mons:
@@ -85,6 +85,9 @@ def _run(wins, mons, **kw):
     wm.push_undo = lambda *a, **k: None
     # 最小尺寸探测本身会真的写 AppleScript 动用户的窗口，单测里必须假掉
     wm._osa = lambda script: ""
+    # 窗口间距固定成 12/False：下面各例的期望几何是按这个值算出来的，不能跟着
+    # 开发机 settings.json 漂（用户改一次间距，全套数值就全错）
+    wm._gap_settings = lambda: (12, False)
     wm._probe_min_size = lambda hwnd, at_x, at_y: tuple(
         min_sizes.get(hwnd, (0, 0)))
     # _readback_rect 会走真实 CG 枚举（list_windows_front_to_back）去找
@@ -274,7 +277,7 @@ class TestSnapFourQuad(unittest.TestCase):
                          ["D::1", "C::1", "B::1", "A::1"])
 
     def test_right_column_follows_measured_left(self):
-        """格子按 split_x 固定；窗口用 fit_frame 贴各自方位角。"""
+        """格子按 split_x 固定；窗口直接填满自己那一格（只让出间距）。"""
         wl, wt, ww, wh = 0, 0, 1920, 1080
         col_w = int(round(ww * 0.3))          # 请求左列 576
         # 真机实测：ChatGPT 请求 454 读回 480（最小窗口宽度钳制）
@@ -287,15 +290,15 @@ class TestSnapFourQuad(unittest.TestCase):
         self.assertEqual(cells[0][2], col_w)
         self.assertEqual(cells[1][0], wl + col_w)
         self.assertEqual(cells[1][2], ww - col_w)
-        # 新语义：窗口在格子里等比 fit + 贴方位角（corner 参数）。
-        # B 100x100 在 1344x540 格子里不放大，贴右上角。
+        # 新语义：窗口直接填满自己那一格，与单窗 quad-* 吸附同一套语义。
+        # B 落在右上格（1344x540）：上缘贴工作区顶边（屏幕边不让缝）、右缘贴
+        # 屏幕右缘，左缘与下缘各让出 6px 间距凑成 12px 的缝。
         last_b = [p for p in placed if p[0] == "B::1"][-1]
-        # 贴右上角：右缘 = 格子右缘 1920，宽 100 -> 左缘 1820
-        self.assertEqual(last_b[1], 1820)
-        # placed 元组是 (hwnd, x, y, w, h)：y=0、w=100、h=100
-        self.assertEqual(last_b[2], 0)
-        self.assertEqual(last_b[3], 100)
-        self.assertEqual(last_b[4], 100)
+        # placed 元组是 (hwnd, x, y, w, h)
+        self.assertEqual(last_b[1], 582)      # 左缘 = 格子左缘 576 + 6px
+        self.assertEqual(last_b[2], 0)        # 上缘 = 工作区顶边
+        self.assertEqual(last_b[3], 1338)     # 宽 = 格子宽 1344 - 6px
+        self.assertEqual(last_b[4], 534)      # 高 = 格子高 540 - 6px
         # 四个窗口都落在各自格子里（不越格）
         for (hwnd, x, y, w, h), (bx, by, bw, bh) in zip(placed, cells):
             self.assertGreaterEqual(x, bx)
@@ -304,15 +307,16 @@ class TestSnapFourQuad(unittest.TestCase):
             self.assertLessEqual(y + h, by + bh)
 
     def test_all_four_stay_on_one_screen_when_rows_too_tall(self):
-        """真机故障回归：屏装不下四格最小高度时，四个窗口必须仍留在同一屏。
+        """真机故障回归：屏装不下四格最小尺寸时，只排放得下的且都在同一屏。
 
-        真机现场是 RV200 Pro（工作区 1600x900）：上排 ChatGPT 最小高 600、
-        下排 Qoder CN 最小高 540，四等分后下排只有 450 高。旧实现让下排为了
-        满足 540 的下限往下撑、越过屏幕底边，macOS 随即把整个窗口判给别的屏
-        ——用户看到的就是「排列四个窗口不在一个屏幕上」。
+        真机现场是 Built-in（工作区 1512x896）：四个窗口的 App 最小尺寸总和
+        1824x1318 超过屏幕。旧实现照排四个，结局是上下重叠 503px、左右重叠
+        757px，还有一个窗被 macOS 判到别的屏——用户看到的就是「排列四个窗口
+        不在一个屏幕上」「四格不准」。
 
-        修复后下排高度必须保住自己的下限（宁可两排重叠），四格的顶边 + 高度
-        一律不得越过工作区底边。
+        修复后：只排「并排放得下」的那几个，放不下的原封不动，并如实说明。
+        两排最小高度 600+540 再加间距就超过 900，四格必然重叠，所以这里只能
+        排两个——宁可少排，也不能排成重叠成一团。
         """
         wl, wt, ww, wh = 0, 0, 1600, 900
         mins = {"A::1": (500, 600), "B::1": (400, 570),
@@ -320,30 +324,111 @@ class TestSnapFourQuad(unittest.TestCase):
         ok, placed = _run(list(self.WINS),
                           [_Mon(width=ww, height=wh)], min_sizes=mins)
         self.assertTrue(ok)
-        # 新语义：格子严格四等分铺满；窗口 fit 进格子，被最小尺寸顶大时
-        # 方位贴边，底边绝不越出工作区（那是 macOS 搬屏的触发条件）
-        cells = wm._last_quad_boxes
-        self.assertEqual(cells[0], (wl, wt, ww // 2, wh // 2))
-        self.assertEqual(cells[2], (wl, wt + wh // 2, ww // 2, wh - wh // 2))
+        # 只有上排两个窗口放得下（600 + 540 + 间距 > 900，四格必重叠）
+        self.assertEqual([p[0] for p in placed], ["A::1", "B::1"])
+        # 排放的窗口一个都不许多出工作区（越界就是被 macOS 搬屏的前兆）
         for hwnd, x, y, w, h in placed:
             self.assertGreaterEqual(x, wl, "%s 越过工作区左边" % hwnd)
             self.assertGreaterEqual(y, wt, "%s 越过工作区顶边" % hwnd)
             self.assertLessEqual(x + w, wl + ww, "%s 越过工作区右边" % hwnd)
             self.assertLessEqual(y + h, wt + wh, "%s 越过工作区底边" % hwnd)
+        # 放不下的两个窗口必须原封不动：一次写入都不该有
+        written = {p[0] for p in placed}
+        self.assertNotIn("C::1", written)
+        self.assertNotIn("D::1", written)
+        # 只有上排两个窗口放得下：这一排撑满整个工作区高（两个窗口并排铺满
+        # 屏幕，不留半屏空白），下排高度为 0
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[0], (wl, wt, ww // 2, wh))
+        self.assertEqual(cells[1], (wl + ww // 2, wt, ww - ww // 2, wh))
+        self.assertEqual(cells[2], (wl, wt + wh, ww // 2, 0))
+        self.assertEqual(cells[3], (wl + ww // 2, wt + wh, ww - ww // 2, 0))
+        # 说明里必须点名谁没排、为什么——用户据此知道该关谁、换谁
+        notes = "；".join(wm._last_quad_notes)
+        self.assertIn("只排出 2/4", notes)
+        self.assertIn("C(最小720x540)", notes)
+        self.assertIn("D(最小600x420)", notes)
+
+    def test_all_four_placed_when_min_sizes_fit(self):
+        """最小尺寸放得下时仍排四个：子集选择不能把排得下的窗口漏掉。"""
+        mins = {"A::1": (500, 400), "B::1": (400, 380),
+                "C::1": (700, 300), "D::1": (600, 260)}
+        ok, placed = _run(list(self.WINS), [_Mon()], min_sizes=mins)
+        self.assertTrue(ok)
+        self.assertEqual([p[0] for p in placed],
+                         ["A::1", "B::1", "C::1", "D::1"])
+        # 四个都排下了，就不该留下任何「放不下」的说明
+        self.assertEqual(wm._last_quad_notes, [])
+
+    def test_smart_mode_also_drops_unfittable_windows(self):
+        """智能模式同样只排放得下的：比例优化变不出物理空间。"""
+        mins = {"A::1": (500, 600), "B::1": (400, 570),
+                "C::1": (720, 540), "D::1": (600, 420)}
+        ok, placed = _run(list(self.WINS),
+                          [_Mon(width=1600, height=900)], min_sizes=mins,
+                          smart=True)
+        self.assertTrue(ok)
+        self.assertEqual(len(placed), 2)
+        # 子集选择的意义就在于：排下的两个互不压盖
+
+        def _overlap(p, q):
+            dx = min(p[1] + p[3], q[1] + q[3]) - max(p[1], q[1])
+            dy = min(p[2] + p[4], q[2] + q[4]) - max(p[2], q[2])
+            return max(0, dx) * max(0, dy)
+
+        self.assertEqual(_overlap(placed[0], placed[1]), 0)
+        self.assertIn("只排出 2/4", "；".join(wm._last_quad_notes))
+
+    def test_two_windows_fill_the_whole_screen(self):
+        """只排放得下两个时，这两个要铺满整屏，不留半屏空白。
+
+        真机数据（Built-in 1512x900）：四个窗口最小宽 700/800/900/896，只有
+        700+800 加一个间距刚好放进 1512。旧实现把这两个摆在四宫格的上排、
+        下面留 558px 空白，看起来就是「没排好」；现在这一排撑满整高。
+        """
+        ww, wh = 1512, 900
+        mins = {"A::1": (700, 600), "B::1": (800, 600),
+                "C::1": (900, 600), "D::1": (896, 600)}
+        ok, placed = _run(list(self.WINS),
+                          [_Mon(width=ww, height=wh)], min_sizes=mins)
+        self.assertTrue(ok)
+        self.assertEqual([p[0] for p in placed], ["A::1", "B::1"])
+        a, b = placed
+        # placed 元组是 (hwnd, x, y, w, h)：两个窗口左右并排铺满工作区
+        self.assertEqual((a[1], a[2]), (0, 0))       # 左上角贴工作区
+        self.assertEqual(a[2] + a[4], wh)            # 高铺满
+        self.assertEqual(b[1] + b[3], ww)            # 右缘贴工作区右边
+        self.assertEqual(b[2] + b[4], wh)
+        self.assertEqual(b[1] - (a[1] + a[3]), 12)   # 中间只隔一个窗口间距
+        # 界面上的分割线：横向贴到底边（100%），纵向按两列实际宽度
+        self.assertAlmostEqual(wm._last_quad_splits[1], 1.0)
+        self.assertAlmostEqual(wm._last_quad_splits[0], 706 / float(ww), places=3)
+
+    def test_nothing_fits_leaves_everything_untouched(self):
+        """四个窗口都比整块屏还大时一个都不排，也不硬塞。"""
+        mins = {h: (3000, 2000)
+                for h in ("A::1", "B::1", "C::1", "D::1")}
+        ok, placed = _run(list(self.WINS), [_Mon()], min_sizes=mins)
+        self.assertTrue(ok)
+        self.assertEqual(placed, [])
+        self.assertIn("只排出 0/4", "；".join(wm._last_quad_notes))
 
     def test_row_shrinks_other_row_instead_of_overflowing(self):
         """一排被最小尺寸抬高时，另一排让出空间，不允许两侧叠加越界。"""
-        ww, wh = 1600, 1000
+        # 屏高 1020：上排要 800、下排要 200，再加 12px 间距 = 1012，
+        # 1020 才装得下（1000 装不下，见 test_all_four_stay_on_one_screen）
+        ww, wh = 1600, 1020
         mins = {"A::1": (0, 800), "B::1": (0, 800),
                 "C::1": (0, 200), "D::1": (0, 200)}
         ok, placed = _run(list(self.WINS),
                           [_Mon(width=ww, height=wh)], min_sizes=mins)
         self.assertTrue(ok)
         # 新语义：格子仍铺满工作区，但切分按实测最小尺寸校正——上排要 800
-        # 高就给它 800，下排只需要 200 就拿剩下的 200，两排都不溢出。
+        # 高就给它 800（外加 6px 间距），下排只需要 200 就拿剩下的，两排都
+        # 不溢出、不重叠。
         cells = wm._last_quad_boxes
-        self.assertEqual(cells[0], (0, 0, ww // 2, 800))
-        self.assertEqual(cells[2], (0, 800, ww // 2, 200))
+        self.assertEqual(cells[0], (0, 0, ww // 2, 810))
+        self.assertEqual(cells[2], (0, 810, ww // 2, 210))
         # 两排高度之和仍等于工作区高（铺满、不留缝）
         self.assertEqual(cells[0][3] + cells[2][3], wh)
         for hwnd, x, y, w, h in placed:

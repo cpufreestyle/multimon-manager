@@ -1342,8 +1342,12 @@ class App:
         cv = getattr(self, "quad_grid_canvas", None)
         if cv is None:
             return
-        sx = min(max(self._quad_split_x.get(), 0.15), 0.85)
-        sy = min(max(self._quad_split_y.get(), 0.15), 0.85)
+        # 0.05~0.95：App 的最小尺寸会把某一排顶到 85% 以上（真机 ChatGPT
+        # 最小高 600），按 0.85 钳会让画出来的分割线与实际排出来的位置不符
+        # 上限放到 1.0：放不下四个窗口时剩下的一排会撑满整高，比例报 100%，
+        # 横向分割线贴在底边（看起来就是两列铺满）。按 0.95 钳会多画一条线。
+        sx = min(max(self._quad_split_x.get(), 0.05), 1.0)
+        sy = min(max(self._quad_split_y.get(), 0.05), 1.0)
         cw, ch = cv.winfo_width(), cv.winfo_height()
         if cw < 4 or ch < 4:                # 还没布局完，取请求尺寸兜底
             cw, ch = self._quad_grid_w, self._quad_grid_h
@@ -1401,8 +1405,8 @@ class App:
 
     def _quad_hit_which(self, event):
         """判断鼠标落在哪条分割线的命中区里；不在命中区返回 None。"""
-        sx = min(max(self._quad_split_x.get(), 0.15), 0.85)
-        sy = min(max(self._quad_split_y.get(), 0.15), 0.85)
+        sx = min(max(self._quad_split_x.get(), 0.05), 1.0)
+        sy = min(max(self._quad_split_y.get(), 0.05), 1.0)
         cw, ch = self._quad_canvas_size()
         top = 10
         col_x = int(round(cw * sx))
@@ -1433,9 +1437,9 @@ class App:
             return
         cw, ch = self._quad_canvas_size()
         top = 10
-        x = min(max(event.x, int(cw * 0.15)), int(cw * 0.85))
-        y = min(max(event.y, top + int((ch - top) * 0.15)),
-                top + int((ch - top) * 0.85))
+        x = min(max(event.x, int(cw * 0.05)), int(cw * 0.95))
+        y = min(max(event.y, top + int((ch - top) * 0.05)),
+                top + int((ch - top) * 0.95))
         if self._quad_drag == "v":
             self._quad_split_x.set(x / cw)
         else:

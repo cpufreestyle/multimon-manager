@@ -255,6 +255,75 @@ def _grid(center, lo, hi, step=0.05):
     return sorted(set(round(x, 6) for x in vals))
 
 
+def choose_quad_slots(wins, mins, work_w, work_h, gap=0, edge_gap=False):
+    """挑「放得下的窗口子集」以及它们各自去哪个角。
+
+    真机现场（Built-in 工作区 1512x896）：CC Switch 900x600 + CrossPaste
+    700x600 + Perplexity 800x652 + Tuanjie 896x600 = 1824x1318，宽高两个
+    方向都超屏。旧实现照排四个，结局是上下重叠 503px、左右重叠 757px，还有
+    一个窗被 macOS 判到别的屏——用户看到的就是「不准」。这里改成：只排放得
+    下的，放不下的原封不动并如实报告，格子几何不变。
+
+    wins: [(hwnd, win_dict), ...]，顺序即请求的角落顺序 [左上, 右上, 左下, 右下]
+    mins: {hwnd: (min_w, min_h)}，App 的最小窗口尺寸（探测不到按 0）
+    返回 (slots, unplaced)：
+      slots    = [(corner, hwnd, win_dict), ...]，corner 0..3，按 corner 升序
+      unplaced = [(hwnd, win_dict), ...]，放不下、保持原状的窗口
+
+    优劣口径（依次比较）：排得多 > 靠前的角 > 不挪用户指定的角 > 格子利用得
+    满 > 下标小。「靠前的角」让放不下四个时剩下的窗口仍读起来是完整的一块
+    （左上→右上→左下→右下依次填）；「不挪用户指定的角」在这之后尽量保留手动
+    模式点名的归属；「格子利用得满」避免为了凑数把两个小窗塞进去、大窗全丢下。
+    """
+    half = gap / 2.0
+    # 每个被占的列/排要让出的间距：格子之间的缝由两侧各让一半凑成，勾选
+    # 「屏幕边也留缝」时外侧再让一半。窗口被 App 的最小尺寸顶大时先吃掉这条
+    # 缝，所以需求按 need + pad 算——缝吃完才刚刚好不压盖邻居、不越出工作区。
+    pad = half + (half if edge_gap else 0)
+    n = len(wins)
+    best = None
+    for mask in range(1, 1 << n):
+        idxs = [i for i in range(n) if mask & (1 << i)]
+        # 这一组窗口的全部占角方式（不同窗口去不同角，injective）
+        for perm in itertools.permutations(range(4), len(idxs)):
+            need = [0, 0, 0, 0]      # 左列 / 右列 / 上排 / 下排 的需求
+            occ = [False, False, False, False]
+            for i, c in zip(idxs, perm):
+                mw, mh = (int(v or 0) for v in mins.get(wins[i][0], (0, 0)))
+                # need/occ 下标：0 左列、1 右列、2 上排、3 下排
+                col = 0 if c in (0, 2) else 1
+                row = 2 if c in (0, 1) else 3
+                need[col] = max(need[col], mw)
+                need[row] = max(need[row], mh)
+                occ[col] = occ[row] = True
+            req = [need[k] + pad if occ[k] else 0 for k in range(4)]
+            if req[0] + req[1] > work_w or req[2] + req[3] > work_h:
+                continue              # 这一组摆法在这块屏上必然重叠或越界
+            displaced = sum(1 for i, c in zip(idxs, perm) if c != i)
+            cols, rows = (req[0], req[1]), (req[2], req[3])
+            unused = 0
+            for i, c in zip(idxs, perm):
+                mw, mh = (int(v or 0) for v in mins.get(wins[i][0], (0, 0)))
+                cw = cols[0] if c in (0, 2) else cols[1]
+                ch = rows[0] if c in (0, 1) else rows[1]
+                unused += max(0, cw * ch - mw * mh)
+            # 排得多 > 靠前的角（左上→右上→左下→右下，读起来是完整的一块）>
+            # 不挪用户指定的角 > 格子利用得满 > 下标小。放不下四个时，「看
+            # 起来是排好的一块」比「严格守在用户点的角上」更要紧——斜对角放
+            # 两个窗口像出了 bug。
+            key = (-len(idxs), sum(perm), displaced, unused, tuple(idxs))
+            if best is None or key < best[0]:
+                best = (key, idxs, perm)
+    if best is None:
+        # 一个都放不下（窗口比整块屏还大）：全部保持原状，由调用方如实报告
+        return [], list(wins)
+    _key, idxs, perm = best
+    slots = sorted(((c, wins[i][0], wins[i][1]) for i, c in zip(idxs, perm)),
+                   key=lambda s: s[0])
+    chosen = set(idxs)
+    return slots, [w for i, w in enumerate(wins) if i not in chosen]
+
+
 if __name__ == "__main__":
     demo = [{"hwnd": "chat", "w": 1500, "h": 900},
             {"hwnd": "term", "w": 400, "h": 900},

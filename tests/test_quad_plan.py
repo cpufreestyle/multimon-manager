@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from quad_plan import plan_quad_smart  # noqa: E402
+from quad_plan import plan_quad_smart, choose_quad_slots  # noqa: E402
 
 
 def W(hwnd, w, h):
@@ -115,6 +115,77 @@ class TestQuadPlanSmart(unittest.TestCase):
     def test_rejects_bad_screen(self):
         with self.assertRaises(ValueError):
             plan_quad_smart(self.WINS, 0, 0)
+
+
+class TestChooseQuadSlots(unittest.TestCase):
+    """放不下就不硬排：挑「这块屏放得下的窗口子集」，其余原封不动。
+
+    真机现场（Built-in 工作区 1512x896）：CrossPaste 700x600 + CC Switch
+    900x600 + Perplexity 800x652 + Tuanjie 896x600，宽高两个方向都超屏。
+    旧实现照排四个，结局是上下重叠 503px、左右重叠 757px，还有一个窗被
+    macOS 判到别的屏。修复后只排「并排放得下」的那几个。
+    """
+
+    @staticmethod
+    def _mins(wins):
+        return {h: (w["w"], w["h"]) for h, w in wins}
+
+    def test_all_four_when_they_fit(self):
+        wins = [W("a", 500, 400), W("b", 400, 380),
+                W("c", 700, 300), W("d", 600, 260)]
+        wins = [(w["hwnd"], w) for w in wins]
+        slots, un = choose_quad_slots(wins, self._mins(wins), 1920, 1080)
+        self.assertEqual([c for c, _h, _w in slots], [0, 1, 2, 3])
+        self.assertEqual(un, [])
+
+    def test_drops_the_one_that_cannot_fit(self):
+        """三个放得下、一个超宽：只排三个，超宽的原封不动。"""
+        wins = [W("a", 500, 400), W("b", 400, 380),
+                W("c", 700, 300), W("d", 1900, 260)]
+        wins = [(w["hwnd"], w) for w in wins]
+        slots, un = choose_quad_slots(wins, self._mins(wins), 1920, 1080)
+        self.assertEqual([h for _c, h, _w in slots], ["a", "b", "c"])
+        self.assertEqual([h for h, _w in un], ["d"])
+
+    def test_real_device_only_two_fit(self):
+        """真机数据：Built-in 上这四个窗口只能并排放下两个。"""
+        wins = [W("cp", 700, 600), W("cc", 900, 600),
+                W("px", 800, 652), W("tc", 896, 600)]
+        wins = [(w["hwnd"], w) for w in wins]
+        slots, un = choose_quad_slots(wins, self._mins(wins), 1512, 896,
+                                      gap=12)
+        # 只有 CrossPaste + Perplexity 的宽度和 1500 + 12px 间距刚好放进 1512
+        self.assertEqual([(c, h) for c, h, _w in slots],
+                         [(0, "cp"), (1, "px")])
+        self.assertEqual([h for h, _w in un], ["cc", "tc"])
+
+    def test_gap_eats_into_capacity(self):
+        """间距要占容量：刚好铺满宽的一对，开了间距就排不下了。"""
+        wins = [(w["hwnd"], w) for w in (W("a", 750, 500), W("b", 750, 500))]
+        mins = self._mins(wins)
+        slots, _un = choose_quad_slots(wins, mins, 1500, 900, gap=0)
+        self.assertEqual(len(slots), 2)
+        slots, _un = choose_quad_slots(wins, mins, 1500, 900, gap=12)
+        self.assertEqual(len(slots), 1)
+
+    def test_keeps_requested_corner_when_possible(self):
+        """手动模式：用户点名的角尽量保留，不为了凑数把窗口挪到别的角。"""
+        wins = [W("tl", 400, 300), W("tr", 400, 300),
+                W("bl", 400, 300), W("br", 3000, 300)]
+        wins = [(w["hwnd"], w) for w in wins]
+        slots, un = choose_quad_slots(wins, self._mins(wins), 1920, 1080)
+        self.assertEqual([(c, h) for c, h, _w in slots],
+                         [(0, "tl"), (1, "tr"), (2, "bl")])
+        self.assertEqual([h for h, _w in un], ["br"])
+
+    def test_nothing_fits_returns_empty(self):
+        wins = [(w["hwnd"], w) for w in (W("a", 3000, 2000),)]
+        slots, un = choose_quad_slots(wins, self._mins(wins), 1920, 1080)
+        self.assertEqual(slots, [])
+        self.assertEqual([h for h, _w in un], ["a"])
+
+    def test_empty_input(self):
+        self.assertEqual(choose_quad_slots([], {}, 1920, 1080), ([], []))
 
 
 if __name__ == "__main__":
