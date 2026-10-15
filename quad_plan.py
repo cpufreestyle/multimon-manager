@@ -33,6 +33,85 @@ import itertools
 MIN_CELL_FRAC = 0.35
 
 
+# Moom 4 的 snapshotMatchingSelector 兜底判据：窗口中心点到布局格中心点的
+# 距离。主判据（格子与窗口的宽高比、面积、占比均衡）先比，距离作为一项小幅
+# 成本参与——它不推翻「谁合适去哪个角」，只在一组摆法都说得通时选出「窗口
+# 不用横穿屏幕」的那个。少了它，本来靠在左上的窗口会被甩到右列，用户看到的
+# 就是「不准」「乱跑」。权重 0.25：典型摆法之间的契合成本差在 0.5 以上，
+# 这项只够打破平局，不够颠倒结论。
+PROX_WEIGHT = 0.25
+
+
+def _center(win):
+    """窗口当前中心点（全局坐标）；没有几何信息时返回 None。
+
+    容量预检传进来的 win_dict 是 None，单测桩只给宽高不给 x/y——这两种情况
+    下 proximity 恒为 0，任何既有结果都不受影响。
+    """
+    if not isinstance(win, dict):
+        return None
+    try:
+        x, y = float(win["x"]), float(win["y"])
+        w, h = float(win.get("w") or 0), float(win.get("h") or 0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return (x + w / 2.0, y + h / 2.0)
+
+
+def _cell_centers(sizes, ox=0.0, oy=0.0):
+    """四个格子的中心点（全局坐标）。sizes 见 grid_geometry 的返回顺序。"""
+    c1, r1 = sizes[0]
+    c2 = sizes[1][0]
+    r2 = sizes[2][1]
+    return {0: (ox + c1 / 2.0, oy + r1 / 2.0),
+            1: (ox + c1 + c2 / 2.0, oy + r1 / 2.0),
+            2: (ox + c1 / 2.0, oy + r1 + r2 / 2.0),
+            3: (ox + c1 + c2 / 2.0, oy + r1 + r2 / 2.0)}
+
+
+def _prox_cost(pairs, cell_centers, diag):
+    """窗口中心到所去格子中心的平均距离，按工作区对角线归一化。
+
+    取平均而不是求和：四个窗口里只有一个没几何信息时，求和会把该项整体缩小
+    一半，等于「有一个窗口在哪不重要」——那不是想要的语义。
+    """
+    if not pairs or diag <= 0:
+        return 0.0
+    total, n = 0.0, 0
+    for w, c in pairs:
+        ctr = _center(w)
+        if ctr is None:
+            continue
+        gx, gy = cell_centers.get(c, ctr)
+        total += ((gx - ctr[0]) ** 2 + (gy - ctr[1]) ** 2) ** 0.5
+        n += 1
+    return total / diag / max(1, n)
+
+
+def _quad_prox(idxs, perm, wins, work_w, work_h, origin):
+    """choose_quad_slots 版的 proximity：窗口中心到**象限**中心的平均距离。
+
+    这里不算格子几何（该函数只判「放不放得下」），所以用工作区四等分的象限
+    中心近似格子中心——够在「都放得下」的几种摆法之间挑不乱跑的那个。
+    """
+    ox, oy = origin
+    diag = (work_w ** 2 + work_h ** 2) ** 0.5 or 1.0
+    centers = {c: (ox + (0.25 if c in (0, 2) else 0.75) * work_w,
+                   oy + (0.25 if c in (0, 1) else 0.75) * work_h)
+               for c in range(4)}
+    total, n = 0.0, 0
+    for i, c in zip(idxs, perm):
+        ctr = _center(wins[i][1])
+        if ctr is None:
+            continue
+        gx, gy = centers[c]
+        total += ((gx - ctr[0]) ** 2 + (gy - ctr[1]) ** 2) ** 0.5
+        n += 1
+    return total / diag / max(1, n)
+
+
 def _ratio(win):
     """窗口的宽高比；尺寸异常时按 1.0 处理（不收窄任何一侧）。"""
     w = float(win.get("w") or 0)
@@ -43,11 +122,15 @@ def _ratio(win):
 
 
 def plan_quad_layout(wins, work_w, work_h, corners=None,
-                     min_ratio=0.15, max_ratio=0.85):
+                     min_ratio=0.15, max_ratio=0.85, origin=(0, 0)):
     """算出 1~4 个窗口的四宫格布局：谁去哪个角、用什么分割比例。
 
     corners: 与 wins 等长的角标列表（0~3，元素不重复）——用户在界面上给每个
         窗口点选的格；None 表示四角全占（此时 wins 必须恰好 4 个）。
+    origin: 工作区左上角的全局坐标（默认 (0, 0)）。proximity 成本要算
+        「窗口中心到格子中心的距离」，两边不在一个坐标系里这个距离就是
+        错的——第二块屏 RV200 Pro 的工作区在 (0,-900)，不传 origin 时
+        它的窗口会被算成「离所有格子一样远」，距离排序整个反过来。
     返回 (slots, split_x, split_y)：slots = [(corner, win_dict), ...] 按 corner
     升序，win_dict 就是传入的 dict（键不变，调用方取 hwnd 用）。
 
@@ -111,6 +194,7 @@ def plan_quad_layout(wins, work_w, work_h, corners=None,
     else:
         sy_grid = [1.0] if has_row[0] else [0.0]
 
+    ox, oy = origin
     best = None
     for sx in sx_grid:
         for sy in sy_grid:
@@ -139,6 +223,13 @@ def plan_quad_layout(wins, work_w, work_h, corners=None,
                     share_win = a_w / tot_win
                     share_cell = (sizes[c][0] * sizes[c][1]) / tot_cell
                     cost += abs(share_win - share_cell)
+                # Moom 4 的 snapshotMatchingSelector 兜底判据：窗口中心点到
+                # 所去格子中心的平均距离。契合成本打平的几种摆法之间，选
+                # 「窗口不用横穿屏幕」的那个——权重见 PROX_WEIGHT，只打破
+                # 平局，不颠倒「谁合适去哪个角」的结论。
+                cost += PROX_WEIGHT * _prox_cost(
+                    pairs, _cell_centers(sizes, ox, oy),
+                    (work_w ** 2 + work_h ** 2) ** 0.5)
                 if best is None or cost < best[0]:
                     best = (cost, pairs, sx, sy)
     if best is None:
@@ -325,7 +416,7 @@ def _grid(center, lo, hi, step=0.05):
 
 
 def choose_quad_slots(wins, mins, work_w, work_h, gap=0, edge_gap=False,
-                      corners=None):
+                      corners=None, origin=(0, 0)):
     """挑「放得下的窗口子集」以及它们各自去哪个角。
 
     真机现场（Built-in 工作区 1512x896）：CC Switch 900x600 + CrossPaste
@@ -338,6 +429,8 @@ def choose_quad_slots(wins, mins, work_w, work_h, gap=0, edge_gap=False,
     mins: {hwnd: (min_w, min_h)}，App 的最小窗口尺寸（探测不到按 0）
     corners: wins[i] 原本该去的角（0~3）。用户在界面上点掉了几格时 wins 不满
         四个，得靠它才知道每个窗口原本认哪个角；缺省按顺序 0,1,2,...
+    origin: 工作区左上角的全局坐标（默认 (0, 0)），用途同 plan_quad_layout
+        ——窗口中心与象限中心必须在同一坐标系里比，非主屏尤其如此。
     返回 (slots, unplaced)：
       slots    = [(corner, hwnd, win_dict), ...]，corner 0..3，按 corner 升序
       unplaced = [(hwnd, win_dict), ...]，放不下、保持原状的窗口
@@ -389,10 +482,20 @@ def choose_quad_slots(wins, mins, work_w, work_h, gap=0, edge_gap=False,
                 unused += max(0, cw * ch - mw * mh)
             # 四个里挑：排得多 > 靠前的角 > 不挪用户指定的角 > 利用得满。
             # 明确只选几个：排得多 > 不挪用户选中的角 > 靠前的角 > 利用得满。
+            # Moom 4 的 snapshotMatchingSelector 兜底判据：窗口中心到所去
+            # 象限中心的平均距离（按工作区对角线归一化）。「都放得下」的几种
+            # 摆法之间挑不乱跑的那个；权重见 PROX_WEIGHT。
+            prox = PROX_WEIGHT * _quad_prox(idxs, perm, wins, work_w,
+                                            work_h, origin)
+            # 四个里挑：排得多 > 靠前的角 > 不挪用户指定的角 > 不乱跑 >
+            # 利用得满。明确只选几个：排得多 > 不挪用户选中的角 > 靠前的角
+            # > 不乱跑 > 利用得满。
             if honor_requested:
-                key = (-len(idxs), displaced, sum(perm), unused, tuple(idxs))
+                key = (-len(idxs), displaced, sum(perm), prox, unused,
+                       tuple(idxs))
             else:
-                key = (-len(idxs), sum(perm), displaced, unused, tuple(idxs))
+                key = (-len(idxs), sum(perm), displaced, prox, unused,
+                       tuple(idxs))
             if best is None or key < best[0]:
                 best = (key, idxs, perm)
     if best is None:

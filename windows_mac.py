@@ -1868,6 +1868,28 @@ def _quad_cells(placed_slots, mins, wl, wt, ww, wh, gap, edge_gap,
     return cells, finals, row_full, col_full
 
 
+def _quad_anchor(corner, fx, fy, fw, fh, gw, gh, wl, wt, ww, wh):
+    """窗口被 App 最小尺寸顶大/顶小后，按方位把该贴的边贴住的目标位置。
+
+    锚定基准是 finals 里让出间距后的目标矩形（fx, fy, fw, fh），不是原始
+    格子：屏幕边留缝（edge_gap）时格子右边就是屏幕边，照它贴会把缝吃成
+    0——用户看到的「没吸附到边上」正是这么来的。语义同 BTT 的
+    windowAnchor：锚定角永远贴住，溢出只发生在远离锚定角的那一侧；同时
+    不越出工作区，越界会被 macOS 判到别的屏（真机实测 ChatGPT 被搬到
+    RV200 Pro）。
+    """
+    ax, ay = fx, fy
+    if corner in (1, 3):          # 右列：贴目标矩形右边
+        ax = min(max(fx + fw - gw, wl), max(fx, wl + ww - gw))
+    else:                          # 左列：贴目标矩形左边
+        ax = max(min(fx, wl + ww - gw), wl)
+    if corner in (2, 3):          # 下排：贴目标矩形底边，底缘优先
+        ay = min(max(fy + fh - gh, wt), max(fy, wt + wh - gh))
+    else:                          # 上排：贴目标矩形上边
+        ay = max(min(fy, wt + wh - gh), wt)
+    return ax, ay
+
+
 def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
                 detect_unwritable=True):
     """把 finals 写进窗口，读回实测几何，再按方位贴边收尾。
@@ -1916,20 +1938,35 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
         # 少 1~2px 是常态（AX 读回噪声），不该触发重排。
         if abs(gw - fw) <= 8 and abs(gh - fh) <= 8:
             continue
+        # 刚判过「写入无效」的窗口不再补刀：它动不了，再写一次只是白等一个
+        # AppleScript 往返（真机每个 AX 写入上百毫秒），报告里已经有了
+        if h in unwritable:
+            continue
         # 窗口被 App 顶大后，按方位把该贴的边贴住：左上格贴左上、右上格贴
         # 右上、左下格贴左下、右下格贴右下。溢出只发生在远离贴边的那一侧。
-        ax, ay = gx, gy
-        if corner in (1, 3):
-            ax = max(cells[corner][0], cells[corner][0] + cells[corner][2] - gw)
-        if corner in (2, 3):
-            # 底缘优先：窗口比格子高时，贴格子底边会越出工作区底边，
-            # macOS 随即将整个窗口搬到别的屏（真机实测 ChatGPT 被搬到
-            # RV200 Pro）。所以先保证不越工作区底边，再尽量贴近格子底边。
-            ay = min(max(cells[corner][1] + cells[corner][3] - gh, wt),
-                     max(cells[corner][1], wt + wh - gh))
+        # 贴角基准是 finals 的目标矩形而不是 cells：窗口被 App 顶大/顶小
+        # 后，锚定的一侧永远贴住目标边，溢出只发生在远离锚定角的那一侧
+        # （语义与边界保护见 _quad_anchor）。
+        ax, ay = _quad_anchor(corner, fx, fy, fw, fh, gw, gh,
+                              wl, wt, ww, wh)
         if (ax, ay) != (gx, gy):
             set_window_rect(h, ax, ay, gw, gh, activate=False)
     return measured
+
+
+def _fresh_win(entry, pre_probe):
+    """把探测前读回的当前几何并进窗口 dict，返回 (hwnd, win_dict)。
+
+    list_target_windows 的 x/y 是枚举时刻的值，用户刚拖过窗口就过期了。
+    proximity（Moom 4 快照匹配）拿旧坐标算，会把「刚才就在左上」的窗口判成
+    「离左上最远」——那就是用户说的「乱跑」「不准」。探测前的读回
+    （pre_probe）是当下最新的几何。
+    """
+    h, w = entry
+    cur = pre_probe.get(h)
+    if cur and cur != (0, 0, 0, 0):
+        w = dict(w, x=cur[0], y=cur[1], w=cur[2], h=cur[3])
+    return h, w
 
 
 def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
@@ -2124,15 +2161,17 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
                 plan_mins[h] = (0, 0)
             order_idx = sorted(range(len(picked)),
                                key=lambda i: (picked[i][0] in pinned_windows, i))
-            plan_wins = [dict(picked[i][1], hwnd=picked[i][0],
-                              min_w=plan_mins[picked[i][0]][0],
-                              min_h=plan_mins[picked[i][0]][1])
-                         for i in order_idx]
+            plan_wins = []
+            for i in order_idx:
+                h_i, w_i = _fresh_win(picked[i], pre_probe)
+                w_i.update(hwnd=h_i,
+                           min_w=plan_mins[h_i][0], min_h=plan_mins[h_i][1])
+                plan_wins.append(w_i)
             # 用户在界面上给每个窗口点选的格：传给 plan_quad_layout，它就只在
             # 这些角里分配，不会把「左上」的窗口排到右上。
             plan_corners = sorted(set(picked_corners[i] for i in order_idx))
             planned, sx2, sy2 = quad_plan.plan_quad_layout(
-                plan_wins, ww, wh, corners=plan_corners)
+                plan_wins, ww, wh, corners=plan_corners, origin=(wl, wt))
         except ValueError as e:  # noqa: BLE001
             logger.warning("智能分配失败，退回手动比例: %s", e)
         else:
@@ -2169,12 +2208,14 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # 角只会把活窗口的空间挤掉
     pool_idx = [i for i, (h, _w) in enumerate(picked)
                 if h not in pinned_windows]
-    pool = [picked[i] for i in pool_idx]
+    # proximity 要拿「窗口现在在哪」算：探测前读回的几何盖掉枚举时刻的值
+    pool = [_fresh_win(picked[i], pre_probe) for i in pool_idx]
     # 每个窗口原本认哪个角：用户点掉几格后 picked 不满四个，角必须对得上，
     # 否则「左上」的窗口会被排到右上
     pool_corners = [picked_corners[i] for i in pool_idx]
     placed_slots, unplaced = quad_plan.choose_quad_slots(
-        pool, mins, ww, wh, gap, edge_gap, corners=pool_corners)
+        pool, mins, ww, wh, gap, edge_gap, corners=pool_corners,
+        origin=(wl, wt))
     # 没点名屏幕时，换一块能多排几个的横屏：放不下四个是常态，能多排一个是
     # 一个。竖屏不主动送——用户明确说过不适合竖屏的窗口不要发到竖屏屏幕
     if len(placed_slots) < len(pool) and monitor is None:
@@ -2183,7 +2224,8 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
                 continue
             _ml, _mt, mw2, mh2 = m.work_rect
             slots2, unplaced2 = quad_plan.choose_quad_slots(
-                pool, mins, mw2, mh2, gap, edge_gap, corners=pool_corners)
+                pool, mins, mw2, mh2, gap, edge_gap, corners=pool_corners,
+                origin=(m.work_rect[0], m.work_rect[1]))
             if len(slots2) > len(placed_slots):
                 logger.info("屏幕 %s 只能排 %d 个，%s 能排 %d 个，改排到 %s",
                             mon.device_name, len(placed_slots),
@@ -2382,7 +2424,7 @@ def quad_capacity(hwnds, monitor=None):
     def _fit(m):
         _wl, _wt, mw, mh = m.work_rect
         slots, _unplaced = quad_plan.choose_quad_slots(
-            wins, mins_all, mw, mh, gap, edge_gap)
+            wins, mins_all, mw, mh, gap, edge_gap, origin=(_wl, _wt))
         return len(slots)
 
     # 点名屏就尊重它（放不下也照样报这块屏的容量）；否则横屏里挑最优
