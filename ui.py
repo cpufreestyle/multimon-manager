@@ -1236,14 +1236,15 @@ class App:
             # 四个角的归属，若界面仍显示用户排的顺序，看到的就是「不准」；
             # 写回实测归属后，下次再点「2×2 排列」也是确定性的同一结果，
             # 不会再由程序随机补一个「最靠前的未占用窗口」。
-            order = getattr(bm, "_last_quad_order", None) or []
+            slots = getattr(bm, "_last_quad_slots", None) or []
             rev = getattr(self, "_quad_hwnd_short", {})
             names = []
-            if len(order) == 4 and all(order):
-                for h in order:
-                    nm = rev.get(h)
-                    names.append(nm if nm in short_map else AUTO_TARGET)
-                for v, nm in zip(quad_vars, names):
+            if slots:
+                by_corner = dict(slots)
+                for corner, v in enumerate(quad_vars):
+                    nm = rev.get(by_corner.get(corner))
+                    nm = nm if nm in short_map else AUTO_TARGET
+                    names.append(nm)
                     v.set(nm)
             self._refresh_quad_grid()
             assigned = "、".join(f"{k}={v}" for k, v in

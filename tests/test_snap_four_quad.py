@@ -257,7 +257,6 @@ class TestSnapFourQuad(unittest.TestCase):
     def test_bottom_row_starts_below_measured_top(self):
         """上排有最小高度缩不下去时，下排必须贴着实测底边走，不能重叠。"""
         wl, wt, ww, wh = 0, 0, 1920, 1080
-        half_h = wh // 2
         ok, placed = _run(
             list(self.WINS), [_Mon()],
             # 左上/右上被系统钳制在 600 / 570 高（真机实测值）
@@ -266,20 +265,110 @@ class TestSnapFourQuad(unittest.TestCase):
             readback={"A::1": (wl, wt, ww // 2 - 1, 600),
                       "B::1": (wl + ww // 2, wt, ww - ww // 2, 570)})
         self.assertTrue(ok)
-        # 新语义：格子严格四等分铺满，窗口在格子里等比缩放。被最小尺寸钳制
-        # 的窗口只会比 fit 尺寸大，但方位上仍贴住自己那一格该贴的边。
+        # 二趟重排：第一遍按探测到的最小尺寸（这里探测不到，全是 0）切四等分，
+        # 写入后读回的是窗口**实际**占的 600 高——比格子（540）还大，说明这一排
+        # 装不下。把实测尺寸并回最小尺寸再切一遍：上排长到 600 + 间距 6 = 606，
+        # 下排从 606 起，两排不再重叠（旧实现只写一遍，上下重叠 60px）。
         cells = wm._last_quad_boxes
-        self.assertEqual(cells[0], (wl, wt, ww // 2, half_h))
-        self.assertEqual(cells[1], (wl + ww // 2, wt, ww - ww // 2, half_h))
-        self.assertEqual(cells[2], (wl, wt + half_h, ww // 2, wh - half_h))
+        top_h = 606
+        self.assertEqual(cells[0], (wl, wt, ww // 2, top_h))
+        self.assertEqual(cells[1], (wl + ww // 2, wt, ww - ww // 2, top_h))
+        self.assertEqual(cells[2], (wl, wt + top_h, ww // 2, wh - top_h))
         self.assertEqual(cells[3],
-                         (wl + ww // 2, wt + half_h, ww - ww // 2, wh - half_h))
-        # 上排两个窗口都必须在各自格子里
-        for (hwnd, x, y, w, h), (bx, by, bw, bh) in zip(placed[:2], cells[:2]):
-            self.assertGreaterEqual(x, bx)
-            self.assertGreaterEqual(y, by)
-            self.assertLessEqual(x + w, bx + bw)
-            self.assertLessEqual(y + h, by + bh)
+                         (wl + ww // 2, wt + top_h, ww - ww // 2, wh - top_h))
+        # 上排两个窗口的最后一次写入都必须落在各自格子里
+        last = {}
+        for hwnd, x, y, w, h in placed:
+            last[hwnd] = (x, y, w, h)
+        for hwnd, cell in (("A::1", cells[0]), ("B::1", cells[1])):
+            x, y, w, h = last[hwnd]
+            self.assertGreaterEqual(x, cell[0])
+            self.assertGreaterEqual(y, cell[1])
+            self.assertLessEqual(x + w, cell[0] + cell[2])
+            self.assertLessEqual(y + h, cell[1] + cell[3])
+        # 上排底边不许越过下排顶边：这是「上下重叠」的直接度量
+        got = {h: g for h, _w, g in wm._last_quad_report if g}
+        self.assertLessEqual(got["A::1"][1] + got["A::1"][3], cells[2][1])
+        self.assertLessEqual(got["B::1"][1] + got["B::1"][3], cells[2][1])
+
+    def test_second_pass_lifts_row_when_probe_undersized(self):
+        """探测偏小时，二趟重排必须把上排抬到实测高度，两排不能重叠。"""
+        wl, wt, ww, wh = 0, 0, 1920, 1080
+        ok, placed = _run(
+            list(self.WINS), [_Mon()],
+            # 最小尺寸探测一个都没探到（全 0），只有左上被钳在 600 高
+            readback={"A::1": (wl, wt, ww // 2 - 1, 600)})
+        self.assertTrue(ok)
+        cells = wm._last_quad_boxes
+        # 上排长到 600 + 间距 6，下排从那里起：旧实现只写一遍，上排仍是 540，
+        # 左上窗口向下溢出 60px 压住左下——「有些窗口没有吸附到边上」的根因
+        self.assertEqual(cells[0][3], 606)
+        self.assertEqual(cells[2][1], 606)
+        self.assertEqual(cells[2][3], wh - 606)
+        # 左上窗口的最后一次写入落在自己格子里
+        last = {}
+        for hwnd, x, y, w, h in placed:
+            last[hwnd] = (x, y, w, h)
+        x, y, w, h = last["A::1"]
+        self.assertGreaterEqual(x, cells[0][0])
+        self.assertGreaterEqual(y, cells[0][1])
+        self.assertLessEqual(x + w, cells[0][0] + cells[0][2])
+        self.assertLessEqual(y + h, cells[0][1] + cells[0][3])
+        # 左上窗口的实测底边不许越过左下窗口的顶边
+        got = {h: g for h, _w, g in wm._last_quad_report if g}
+        self.assertLessEqual(got["A::1"][1] + got["A::1"][3],
+                             got["C::1"][1])
+
+    def test_smart_two_windows_same_row_fill_height(self):
+        """两个窗口占同一排：这一排撑满工作区高，不是上下各半屏。"""
+        wins = [_win("A::1", x=10, y=20, w=1600, h=400),   # 宽扁 4.0
+                _win("B::1", x=2000, y=30, w=600, h=1200)]  # 瘦高 0.5
+        ok, placed = _run(wins, [_Mon()],
+                          tl_hwnd="A::1", tr_hwnd="B::1", smart=True)
+        self.assertTrue(ok)
+        self.assertEqual(len(placed), 2)
+        # 瘦高的去左上、宽扁的去右上：智能分配按宽高比换角
+        slots = dict(wm._last_quad_slots)
+        self.assertEqual(slots[0], "B::1")
+        self.assertEqual(slots[1], "A::1")
+        # 只有上排有窗口：上排撑满整个工作区高，下排高度为 0
+        cells = wm._last_quad_boxes
+        self.assertEqual(cells[0][3], 1080)
+        self.assertEqual(cells[2][3], 0)
+        # 左窄右宽：瘦高窗占窄格、宽扁窗占宽格
+        self.assertLess(cells[0][2], cells[1][2])
+        # 界面上的竖向分割线必须报「撑满」（1.0），不能报成 0.85
+        self.assertAlmostEqual(wm._last_quad_splits[1], 1.0)
+
+    def test_smart_three_windows_reorder_by_aspect(self):
+        """三个窗口也走智能分配：谁去哪个角由宽高比定，不是传入顺序。"""
+        wins = [_win("A::1", x=10, y=20, w=1600, h=400),    # 宽扁 4.0
+                _win("B::1", x=2000, y=30, w=600, h=1200),  # 瘦高 0.5
+                _win("C::1", x=10, y=2000, w=900, h=900)]   # 方圆 1.0
+        ok, placed = _run(wins, [_Mon()],
+                          tl_hwnd="A::1", tr_hwnd="B::1", bl_hwnd="C::1",
+                          smart=True)
+        self.assertTrue(ok)
+        # 旧实现 plan_quad_smart 严格要求四个窗口，三个直接抛 ValueError 退化成
+        # 手动顺序——「智能模式不准」的直接来源。现在三个也按宽高比分配。
+        self.assertEqual(len(placed), 3)
+        slots = dict(wm._last_quad_slots)
+        self.assertEqual(set(slots), {0, 1, 2})
+        # 按宽高比各就各位：最宽扁的 A(4.0) 去右上宽格、方正的 C(1.0) 去左上
+        # 近方格、瘦高的 B(0.5) 去左下窄高格。三个格子实测宽高比 1.02 / 4.06 /
+        # 0.55，与三个窗口的宽高比几乎一一对应。
+        self.assertEqual(slots[1], "A::1")
+        self.assertEqual(slots[0], "C::1")
+        self.assertEqual(slots[2], "B::1")
+        # 与传入顺序不同：这才是「智能」该有的样子（旧实现三个窗口直接抛
+        # ValueError 退化成手动顺序，等于没有智能模式）
+        self.assertNotEqual([h for _c, h in wm._last_quad_slots],
+                            ["A::1", "B::1", "C::1"])
+        # 右下角空着：右列起点仍由实际分配的窗口定，两列不重叠
+        cells = wm._last_quad_boxes
+        self.assertLess(cells[0][2], cells[1][2])
+        self.assertEqual(cells[0][0] + cells[0][2], cells[1][0])
+        self.assertEqual(cells[2][1], cells[0][1] + cells[0][3])
 
     def test_clamped_when_readback_insane(self):
         """读回值异常（如读到别的窗口/0）时，下排仍必须留在屏内。"""

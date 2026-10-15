@@ -19,6 +19,10 @@ split_x 与摆放是耦合的：比例决定四个格子的宽高比，摆放好
 四格比例跨度远超窗口跨度，再怎么配对都错位。
 
 比例仍在 min_ratio~max_ratio 内钳制，避免某一边只剩几个像素。
+
+入口有两个：plan_quad_smart 是「恰好四个、四角全占」的严格包装；
+plan_quad_layout 接受 1~4 个窗口与「用户在界面上点选的角」——2~3 个窗口
+也能按宽高比分配（只占被选中的格，空格子不参与成本与比例搜索）。
 """
 import itertools
 
@@ -38,66 +42,131 @@ def _ratio(win):
     return w / h
 
 
+def plan_quad_layout(wins, work_w, work_h, corners=None,
+                     min_ratio=0.15, max_ratio=0.85):
+    """算出 1~4 个窗口的四宫格布局：谁去哪个角、用什么分割比例。
+
+    corners: 与 wins 等长的角标列表（0~3，元素不重复）——用户在界面上给每个
+        窗口点选的格；None 表示四角全占（此时 wins 必须恰好 4 个）。
+    返回 (slots, split_x, split_y)：slots = [(corner, win_dict), ...] 按 corner
+    升序，win_dict 就是传入的 dict（键不变，调用方取 hwnd 用）。
+
+    与 plan_quad_smart 的关系：后者是「恰好四个、四角全占」的严格包装，
+    n=4 时两者搜索结果完全一致。「选几个就排几个」落地后 2~3 个窗口走智能
+    分配是常态，所以比例候选按「哪些排/列有窗口」分流：某一整排空着时纵向
+    比例没有选择余地（有窗的那排撑满，sy 取 1.0 或 0.0），整列空时同理；
+    成本只在被占用的角上累计——空格子不罚，面积均衡项也只在被占格子之间
+    归一化。
+    """
+    n = len(wins)
+    if n == 0 or n > 4:
+        raise ValueError("窗口数量必须是 1~4 个，当前 %d 个" % n)
+    if work_w <= 0 or work_h <= 0:
+        raise ValueError("屏幕工作区尺寸无效: %sx%s" % (work_w, work_h))
+    if corners is None:
+        if n != 4:
+            raise ValueError("未指定角标时需要恰好 4 个窗口，当前 %d 个" % n)
+        corner_list = [0, 1, 2, 3]
+    else:
+        corner_list = list(corners)
+        if len(corner_list) != n:
+            raise ValueError("角标数量 %d 与窗口数 %d 不一致"
+                             % (len(corner_list), n))
+        if len(set(corner_list)) != n:
+            raise ValueError("角标有重复: %s" % (corner_list,))
+        if any(c < 0 or c > 3 for c in corner_list):
+            raise ValueError("角标越界（应为 0~3）: %s" % (corner_list,))
+        corner_list = sorted(corner_list)
+
+    lo = min(max(min_ratio, 0.15), 0.85)
+    hi = min(0.5, max_ratio)
+    if hi < lo:
+        hi = lo
+
+    # 哪些排/列有窗口：整排空 -> sy 只能取 1.0（上排占）或 0.0（下排占）；
+    # 整列空 -> sx 同理。两排两列都有时才在全区间扫描（同旧计划）。
+    has_row = [any(c in (0, 1) for c in corner_list),
+               any(c in (2, 3) for c in corner_list)]
+    has_col = [any(c in (0, 2) for c in corner_list),
+               any(c in (1, 3) for c in corner_list)]
+
+    # hint 适配 n<4：按宽高比升序后前 half_n 个当「竖排候选」、其余当「横排
+    # 候选」。n=4 时 half_n=2，与旧计划逐字一致。
+    order = sorted(wins, key=_ratio)
+    half_n = max(1, n // 2)
+    r_tall = sum(_ratio(w) for w in order[:half_n]) / float(half_n)
+    r_wide = (sum(_ratio(w) for w in order[half_n:])
+              / float(max(1, n - half_n)))
+    sx_hint = 0.4 if (r_tall + r_wide) <= 0 else r_tall / (r_tall + r_wide)
+    h_all = sum(float(w.get("h") or 0) for w in wins)
+    h_wide = sum(float(w.get("h") or 0) for w in order[half_n:])
+    sy_hint = 0.4 if h_all <= 0 else max(0.2, 1.0 - h_wide / h_all)
+
+    if has_col[0] and has_col[1]:
+        sx_grid = _grid(sx_hint, lo, hi)
+    else:
+        sx_grid = [1.0] if has_col[0] else [0.0]
+    if has_row[0] and has_row[1]:
+        sy_grid = _grid(sy_hint, lo, hi)
+    else:
+        sy_grid = [1.0] if has_row[0] else [0.0]
+
+    best = None
+    for sx in sx_grid:
+        for sy in sy_grid:
+            for perm in itertools.permutations(corner_list):
+                # 格子严格按比例铺满（与 windows 侧一致）：最小尺寸不抬格，
+                # 只通过 _fit_cost 的惩罚影响「谁去哪个角 / 用什么比例」。
+                pairs = list(zip(wins, perm))
+                c1, c2, r1, r2, ov_x, ov_y = grid_geometry(
+                    work_w, work_h, sx, sy)
+                sizes = ((c1, r1), (c2, r1), (c1, r2), (c2, r2))
+                # 只用被占的角算成本：空格子不罚
+                cost = sum(_fit_cost(w, *sizes[c]) for w, c in pairs)
+                # 四格装不下各自的最小尺寸时只能贴边 + 重叠摆放：重叠越多越差，
+                # 让搜索宁可换一个比例 / 换一种摆法
+                cost += (ov_x + ov_y) / float(max(1, work_h)) * 10.0
+                # 面积均衡项：被占格子的「窗口面积占比」应与其「格子面积占比」
+                # 接近。少了这一项，算法会把小窗口挤进极小格、剩下的全给大
+                # 窗口——纯凑比例的话这样总成本更低，但四格大小失衡，
+                # 不是用户要的「合适」。
+                tot_win = sum(float(w.get("w") or 0) * float(w.get("h") or 0)
+                              for w, _c in pairs) or 1.0
+                tot_cell = sum(sizes[c][0] * sizes[c][1]
+                               for _w, c in pairs) or 1.0
+                for w, c in pairs:
+                    a_w = float(w.get("w") or 0) * float(w.get("h") or 0)
+                    share_win = a_w / tot_win
+                    share_cell = (sizes[c][0] * sizes[c][1]) / tot_cell
+                    cost += abs(share_win - share_cell)
+                if best is None or cost < best[0]:
+                    best = (cost, pairs, sx, sy)
+    if best is None:
+        # 理论上不会发生（候选网格非空、窗口数已校验）
+        raise ValueError("没有可用的布局候选")
+    _cost, pairs, split_x, split_y = best
+    slots = [(c, w) for w, c in sorted(pairs, key=lambda p: p[1])]
+    return slots, split_x, split_y
+
+
 def plan_quad_smart(wins, work_w, work_h, min_ratio=0.15, max_ratio=0.85):
-    """算出智能四宫格布局。
+    """算出智能四宫格布局（严格四窗口、四角全占）。
 
     返回 ([TL, TR, BL, BR], split_x, split_y)；四个元素是传入 wins 里的
-    原始 dict（键不变，调用方取 hwnd 用）。
+    原始 dict（键不变，调用方取 hwnd 用）。内部转调 plan_quad_layout，
+    n=4 时的搜索结果与旧实现逐项一致。1~3 个窗口的智能分配直接用
+    plan_quad_layout（corners 传用户在界面上点选的格）——「选几个就排几个」
+    之后 2~3 窗是常态，旧实现在这里抛 ValueError 退化成手动顺序，正是
+    「智能模式不准」的来源之一。
     """
     if len(wins) != 4:
         raise ValueError("智能分配需要恰好 4 个窗口，当前 %d 个" % len(wins))
     if work_w <= 0 or work_h <= 0:
         raise ValueError("屏幕工作区尺寸无效: %sx%s" % (work_w, work_h))
 
-    lo = min(max(min_ratio, 0.15), 0.85)
-    hi = min(0.5, max_ratio)
-    if hi < lo:
-        hi = lo
-    # 在整个合法区间上扫比例，不只在一个粗值附近探：粗值由「左列装竖窗」
-    # 推出，天然把 C1 压得过窄（实测 0.25），四格比例跨度远超窗口跨度，
-    # 再怎么配对都错位。铺开到 lo~hi 才能找到真正贴合窗口的那一组。
-
-    order = sorted(wins, key=_ratio)
-    r_tall = sum(_ratio(w) for w in order[:2]) / 2.0
-    r_wide = sum(_ratio(w) for w in order[2:]) / 2.0
-    sx_hint = 0.4 if (r_tall + r_wide) <= 0 else r_tall / (r_tall + r_wide)
-    h_all = sum(float(w.get("h") or 0) for w in wins)
-    h_wide = sum(float(w.get("h") or 0) for w in order[2:])
-    sy_hint = 0.4 if h_all <= 0 else max(0.2, 1.0 - h_wide / h_all)
-
-    best = None
-    for sx in _grid(sx_hint, lo, hi):
-        for sy in _grid(sy_hint, lo, hi):
-            for perm in itertools.permutations(wins):
-                # 格子严格按比例铺满（与 windows 侧一致）：最小尺寸不抬格，
-                # 只通过 _fit_cost 的惩罚影响「谁去哪个角 / 用什么比例」。
-                c1, c2, r1, r2, ov_x, ov_y = grid_geometry(
-                    work_w, work_h, sx, sy)
-                sizes = ((c1, r1), (c2, r1), (c1, r2), (c2, r2))
-                cost = sum(_fit_cost(w, cw, ch)
-                           for w, (cw, ch) in zip(perm, sizes))
-                # 四格装不下各自的最小尺寸时只能贴边 + 重叠摆放：重叠越多越差，
-                # 让搜索宁可换一个比例 / 换一种摆法
-                cost += (ov_x + ov_y) / float(max(1, work_h)) * 10.0
-                # 面积均衡项：四格的「窗口面积占比」应与其「格子面积占比」
-                # 接近。少了这一项，算法会把小窗口挤进极小格、剩下的全给大
-                # 窗口——纯凑比例的话这样总成本更低，但四格大小失衡，
-                # 不是用户要的「合适」。
-                tot_win = sum(float(w.get("w") or 0) * float(w.get("h") or 0)
-                              for w in perm) or 1.0
-                tot_cell = sum(cw * ch for cw, ch in sizes) or 1.0
-                for w, (cw, ch) in zip(perm, sizes):
-                    a_w = float(w.get("w") or 0) * float(w.get("h") or 0)
-                    share_win = a_w / tot_win
-                    share_cell = (cw * ch) / tot_cell
-                    cost += abs(share_win - share_cell)
-                if best is None or cost < best[0]:
-                    best = (cost, list(perm), sx, sy)
-    if best is None:
-        # 理论上不会发生（候选网格非空、窗口数已校验为 4）
-        raise ValueError("没有可用的布局候选")
-    _cost, layout, split_x, split_y = best
-    return layout, split_x, split_y
+    slots, sx, sy = plan_quad_layout(wins, work_w, work_h, corners=None,
+                                     min_ratio=min_ratio, max_ratio=max_ratio)
+    return [w for _c, w in slots], sx, sy
 
 
 def _fit_cost(win, cw, ch):

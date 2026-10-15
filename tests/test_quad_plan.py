@@ -11,7 +11,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from quad_plan import plan_quad_smart, choose_quad_slots  # noqa: E402
+from quad_plan import (plan_quad_layout, plan_quad_smart,  # noqa: E402
+                        choose_quad_slots)
 
 
 def W(hwnd, w, h):
@@ -186,6 +187,79 @@ class TestChooseQuadSlots(unittest.TestCase):
 
     def test_empty_input(self):
         self.assertEqual(choose_quad_slots([], {}, 1920, 1080), ([], []))
+
+
+class TestPlanQuadLayout(unittest.TestCase):
+    """plan_quad_layout：1~4 个窗口、用户点选的那些角。
+
+    与 plan_quad_smart 的分工：后者是「恰好四个、四角全占」的严格包装；前者
+    是「选几个就排几个」的真正入口。界面点掉不想要的格之后，2~3 个窗口走智能
+    分配是常态，旧实现此时抛 ValueError 退化成手动顺序——「智能模式不准」。
+    """
+
+    def _w(self, hwnd, w, h):
+        return dict(W(hwnd, w, h), min_w=0, min_h=0)
+
+    def test_returns_passed_dicts_in_corner_order(self):
+        """返回的就是传入的 dict，且按角标升序——调用方靠 hwnd 认窗口。"""
+        a, b, c = self._w("a", 1600, 400), self._w("b", 600, 1200), \
+            self._w("c", 900, 900)
+        slots, _sx, _sy = plan_quad_layout([a, b, c], 1920, 1080,
+                                           corners=[2, 0, 1])
+        self.assertEqual([c for c, _w in slots], [0, 1, 2])
+        # 返回的就是传入的那几个 dict（不是副本），调用方取 hwnd / min_* 用
+        self.assertEqual(sorted(id(w) for _c, w in slots),
+                         sorted([id(a), id(b), id(c)]))
+        # corners 只说明「这三个角参与」，谁去哪个角由宽高比定（见下面的用例）
+        self.assertEqual([w["hwnd"] for _c, w in slots],
+                         ["c", "a", "b"])
+
+    def test_empty_row_gives_full_height_split(self):
+        """整排空着：有窗的那排撑满，纵向比例没有选择余地（sy=1.0 / 0.0）。"""
+        wins = [self._w("a", 1600, 400), self._w("b", 600, 1200)]
+        _s, sx, sy = plan_quad_layout(wins, 1920, 1080, corners=[0, 1])
+        self.assertEqual(sy, 1.0)
+        self.assertGreater(sx, 0.0)
+        _s, sx, sy = plan_quad_layout(wins, 1920, 1080, corners=[2, 3])
+        self.assertEqual(sy, 0.0)
+
+    def test_empty_column_gives_full_width_split(self):
+        """整列空着：有窗的那列撑满，横向比例没有选择余地（sx=1.0 / 0.0）。"""
+        wins = [self._w("a", 1600, 400), self._w("b", 600, 1200)]
+        _s, sx, _sy = plan_quad_layout(wins, 1920, 1080, corners=[0, 2])
+        self.assertEqual(sx, 1.0)
+        _s, sx, _sy = plan_quad_layout(wins, 1920, 1080, corners=[1, 3])
+        self.assertEqual(sx, 0.0)
+
+    def test_single_window_fills_work_area(self):
+        """只选一个窗口：它那个角就是整块工作区，不切出空格子。"""
+        _s, sx, sy = plan_quad_layout([self._w("a", 900, 900)],
+                                      1920, 1080, corners=[2])
+        self.assertEqual((sx, sy), (1.0, 0.0))
+
+    def test_bad_corners_raise(self):
+        """角标非法必须报错，不能静默按别的顺序排。"""
+        wins = [self._w("a", 900, 900), self._w("b", 900, 900)]
+        for bad in ([0, 0], [0, 4], [0, 1, 2], [-1, 2]):
+            with self.assertRaises(ValueError):
+                plan_quad_layout(wins, 1920, 1080, corners=bad)
+        # corners=None 但不满四个：宁可报错也不猜
+        with self.assertRaises(ValueError):
+            plan_quad_layout(wins, 1920, 1080, corners=None)
+        with self.assertRaises(ValueError):
+            plan_quad_layout([], 1920, 1080, corners=[])
+
+    def test_four_windows_matches_plan_quad_smart(self):
+        """四个窗口、四角全占时与 plan_quad_smart 逐字一致（严格包装）。"""
+        wins = [self._w(w["hwnd"], w["w"], w["h"])
+                for w in TestQuadPlanSmart.WINS]
+        slots, sx, sy = plan_quad_layout(wins, 1920, 1080, corners=None)
+        lay, sx2, sy2 = plan_quad_smart(
+            [self._w(w["hwnd"], w["w"], w["h"])
+             for w in TestQuadPlanSmart.WINS], 1920, 1080)
+        self.assertEqual([w["hwnd"] for _c, w in slots],
+                         [w["hwnd"] for w in lay])
+        self.assertEqual((sx, sy), (sx2, sy2))
 
 
 if __name__ == "__main__":
