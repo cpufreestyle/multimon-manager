@@ -341,9 +341,11 @@ class TestSnapFourQuad(unittest.TestCase):
         cells = wm._last_quad_boxes
         self.assertEqual(cells[0][3], 1080)
         self.assertEqual(cells[2][3], 0)
-        # 左宽右窄：宽扁窗占宽格、瘦高窗占窄格
-        self.assertEqual(cells[0], (0, 0, 1248, 1080))
-        self.assertEqual(cells[1], (1248, 0, 672, 1080))
+        # 左宽右窄：宽扁窗占宽格、瘦高窗占窄格。1344/576 而不是 1248/672：
+        # B 等比缩放后只需 540px 宽，672px 的格子浪费 20%——契合成本与利用率
+        # 都在 sx=0.70 更优（旧均衡权重 1.0 把它压回了 0.65）。
+        self.assertEqual(cells[0], (0, 0, 1344, 1080))
+        self.assertEqual(cells[1], (1344, 0, 576, 1080))
         self.assertGreater(cells[0][2], cells[1][2])
         # 界面上的竖向分割线必须报「撑满」（1.0），不能报成 0.85
         self.assertAlmostEqual(wm._last_quad_splits[1], 1.0)

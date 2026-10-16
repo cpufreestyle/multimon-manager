@@ -48,6 +48,17 @@ PROX_WEIGHT = 0.25
 MIN_PEN_WEIGHT = 3.0
 
 
+# 面积均衡项权重：被占格子的「窗口面积占比」与「格子面积占比」越接近越好。
+# 0.65 是实测调出来的：两窗同排时（宽扁 A 1600x400 + 瘦高 B 600x1200，
+# 1920x1080 屏），权重 1.0 会让每 5% 的比例差被均衡项的 0.10 抵消，算法
+# 永远停在 sx=0.65——但纯契合成本与 fit 利用率都在 0.70 更优（B 等比
+# 缩放后只需 540px 宽，672px 的格子浪费 20%）。降到 0.65 后 0.70 胜出，
+# 3 窗 T 形与 4 窗场景的既有结论不动（0.60 以下才会扰动 3 窗选择）。
+# 均衡项的原始职责——防小窗挤进极小格——由 _fit_cost 里的
+# MIN_CELL_FRAC 硬约束与 area_pen 项继续兜底。
+BALANCE_WEIGHT = 0.65
+
+
 def _center(win):
     """窗口当前中心点（全局坐标）；没有几何信息时返回 None。
 
@@ -310,7 +321,7 @@ def plan_quad_layout(wins, work_w, work_h, corners=None,
                     a_w = float(w.get("w") or 0) * float(w.get("h") or 0)
                     share_win = a_w / tot_win
                     share_cell = (sizes[c][0] * sizes[c][1]) / tot_cell
-                    cost += abs(share_win - share_cell)
+                    cost += BALANCE_WEIGHT * abs(share_win - share_cell)
                 # Moom 4 的 snapshotMatchingSelector 兜底判据：窗口中心点到
                 # 所去格子中心的平均距离。契合成本打平的几种摆法之间，选
                 # 「窗口不用横穿屏幕」的那个——权重见 PROX_WEIGHT，只打破
