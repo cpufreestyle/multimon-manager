@@ -115,6 +115,8 @@ if IS_MAC:
     is_accessibility_trusted = accessibility.is_trusted
     request_accessibility = accessibility.request_trusted
     open_accessibility_settings = accessibility.open_settings
+    accessibility_responsible_binary = accessibility.responsible_binary
+    accessibility_reveal_binary = accessibility.reveal_binary
 else:
     def is_accessibility_trusted():
         return True
@@ -124,3 +126,10 @@ else:
 
     def open_accessibility_settings():
         pass
+
+    def accessibility_responsible_binary():
+        # Windows 没有 TCC 那套「按进程记账」，谈不上要加哪个二进制
+        return None
+
+    def accessibility_reveal_binary():
+        return False

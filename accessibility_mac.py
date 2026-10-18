@@ -7,6 +7,7 @@
 首次未授权时，本模块可主动弹出系统授权对话框，并引导用户到设置开启。
 零第三方依赖，仅用 ctypes 调用系统框架。
 """
+import os
 import subprocess
 import sys
 
@@ -63,6 +64,66 @@ def request_trusted():
         fn.restype = c_bool
         fn.argtypes = [c_void_p]
         return bool(fn(opts))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def responsible_binary():
+    """返回 TCC 实际认账的那个可执行文件路径（未授权时要加进列表的就是它）。
+
+    不能直接用 sys.executable：Homebrew 的 framework Python 是个小程序，跑起来
+    会把自己重新 exec 进 Python.app，ps 里看到的是
+    .../Versions/3.14/Resources/Python.app/Contents/MacOS/Python，而
+    sys.executable 只是 .../opt/python@3.14/bin/python3.14 这个软链。macOS 的
+    辅助功能授权按「真正负责的进程」记账，照 sys.executable 去加列表，用户会
+    发现加了没反应——这正是「怎么授权都不生效」的常见原因。
+
+    用 _NSGetExecutablePath 取本进程真实可执行路径；取不到时退回 sys.executable
+    的 realpath。非 macOS 或都失败时返回 None。
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        # 注意：本模块顶层没有 import ctypes（原实现只 from ctypes import 具体
+        # 名字），这里必须把 CDLL 一起导进来，否则 NameError 会被下面的 except
+        # 吞掉、静默退回 sys.executable 的软链路径——那正是要避免的错路径。
+        from ctypes import CDLL, byref, c_uint32, create_string_buffer
+
+        libc = CDLL(None)
+        size = c_uint32(0)
+        # 第一遍只问需要多大缓冲区
+        libc._NSGetExecutablePath(None, byref(size))
+        buf = create_string_buffer(size.value)
+        if libc._NSGetExecutablePath(buf, byref(size)) == 0:
+            p = buf.value.decode("utf-8", "replace")
+            if p:
+                return p
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        p = os.path.realpath(sys.executable)
+        return p if p and os.path.exists(p) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def reveal_binary():
+    """在 Finder 里显示出 responsible_binary() 指向的那个文件（选中状态）。
+
+    辅助功能列表支持直接把文件拖进去——这是最省事的授权路径：点一下，Finder
+    弹出并选中该二进制，用户拖进 系统设置 → 隐私与安全性 → 辅助功能 即可。
+    比让用户在文件选择器里手敲一长串 Cellar 路径可靠得多。
+
+    返回是否成功打开了 Finder。
+    """
+    if sys.platform != "darwin":
+        return False
+    p = responsible_binary()
+    if not p or not os.path.exists(p):
+        return False
+    try:
+        subprocess.run(["open", "-R", p], check=False, timeout=5)
+        return True
     except Exception:  # noqa: BLE001
         return False
 

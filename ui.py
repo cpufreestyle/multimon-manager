@@ -165,13 +165,17 @@ class App:
 
         # 辅助功能授权提示（默认隐藏，未授权时由 main 调用 show 显示）
         self._perm_frame = ttk.Frame(self.content)
-        ttk.Label(
-            self._perm_frame,
-            text="未授权「辅助功能」：窗口控制与全局快捷键不可用。\n"
-                 "请到 系统设置 → 隐私与安全性 → 辅助功能，开启本程序"
-                 "（打包版为『多屏管理器』，源码运行版为『python3』）。",
-            foreground="#a15c00", wraplength=700, justify="left",
-        ).pack(side="left", padx=6, fill="x", expand=True)
+        # 文案运行时才填：macOS 的辅助功能授权按「真正负责的进程」记账，要加进
+        # 列表的是本进程的可执行文件（Homebrew 的 framework Python 跑起来会变成
+        # .../Python.app/Contents/MacOS/Python，不是 sys.executable 那个软链）。
+        # 旧文案写「源码运行版为 python3」是错的，照它去加往往加了没反应。
+        self._perm_text = tk.StringVar(value="")
+        ttk.Label(self._perm_frame, textvariable=self._perm_text,
+                  foreground="#a15c00", wraplength=700, justify="left",
+                  ).pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Button(self._perm_frame, text="在 Finder 中显示",
+                   command=self._reveal_accessibility_binary,
+                   ).pack(side="left", padx=4)
         ttk.Button(self._perm_frame, text="打开系统设置",
                    command=self._open_accessibility_settings).pack(side="left", padx=4)
         ttk.Button(self._perm_frame, text="已授权/知道了",
@@ -1808,8 +1812,25 @@ class App:
 
     # ---------- 辅助功能授权提示 ----------
     def show_accessibility_hint(self):
-        """未获得辅助功能授权时，在界面顶部显示引导提示。"""
+        """未获得辅助功能授权时，在界面顶部显示引导提示。
+
+        路径每次显示时重算：用户换了 Python 版本或运行方式，要授权的二进制就变了
+        （Homebrew 升级 python 是常事），写死只会指错路。
+        """
         try:
+            path = b.accessibility_responsible_binary()
+            if path:
+                self._perm_text.set(
+                    "未授权「辅助功能」：窗口控制与全局快捷键不可用。\n"
+                    "需授权的文件（macOS 按实际运行的进程记账）：\n%s\n"
+                    "点「在 Finder 中显示」把它拖进 "
+                    "系统设置 → 隐私与安全性 → 辅助功能，再打开右侧开关。"
+                    % path)
+            else:
+                self._perm_text.set(
+                    "未授权「辅助功能」：窗口控制与全局快捷键不可用。\n"
+                    "请到 系统设置 → 隐私与安全性 → 辅助功能，"
+                    "开启本程序后点「已授权/知道了」。")
             self._perm_frame.pack(fill="x", padx=4, pady=(0, 4),
                                   before=self._scroll_area)
         except Exception:  # noqa: BLE001
@@ -1826,6 +1847,18 @@ class App:
         """跳转到系统设置的辅助功能页面。"""
         try:
             b.open_accessibility_settings()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _reveal_accessibility_binary(self):
+        """在 Finder 中显示出需要授权的那个二进制（选中状态）。
+
+        辅助功能列表支持直接拖入文件，这是最省事的授权路径：比让用户在文件
+        选择器里手敲 /opt/homebrew/Cellar/... 一长串路径可靠得多。
+        """
+        try:
+            if not b.accessibility_reveal_binary():
+                self.status_var.set("没能打开 Finder，请手动到辅助功能页面添加")
         except Exception:  # noqa: BLE001
             pass
 
