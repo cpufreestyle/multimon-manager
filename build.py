@@ -94,20 +94,53 @@ _INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 _LAUNCHER = """#!/bin/bash
-# 由 build.py 生成：启动本应用（使用系统 python3，零第三方依赖）。
+# 由 build.py 生成：启动本应用（零第三方依赖）。
+# 选解释器的唯一判据是「真的能 import tkinter」——只判可执行不够：Homebrew
+# 升级后 /opt/homebrew/bin/python3 可能指向没装 python-tk 的版本（实测
+# python@3.15 就是），那时 App 起来第一行 import tkinter 就崩。
 DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
 cd "$DIR" || exit 1
-if [ -f "$HOME/.multimon_python" ]; then
-  PY="$(cat "$HOME/.multimon_python")"
-else
-  for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
-    if [ -x "$c" ]; then PY="$c"; break; fi
-  done
+
+# MMM_PY_CANDIDATES 供测试注入假解释器；默认按 Homebrew 各版本优先
+# （Homebrew 自带 Tk 9.0；/usr/bin/python3 的 Tcl/Tk 在 macOS 上会黑屏，
+# 只作最后兜底）。
+CANDIDATES="$MMM_PY_CANDIDATES"
+if [ -z "$CANDIDATES" ]; then
+  CANDIDATES="/opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.10 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3"
 fi
-[ -z "$PY" ] && PY="python3"
+
+# --print-python：只打印选中的解释器后退出，供单测与排障使用，不启动 App
+PRINT_ONLY=0
+if [ "$1" = "--print-python" ]; then
+  PRINT_ONLY=1
+  shift
+fi
+
+pick_python() {
+  # 用户显式指定的解释器优先；但它也得真有 tkinter，否则照旧崩
+  if [ -f "$HOME/.multimon_python" ]; then
+    p="$(cat "$HOME/.multimon_python")"
+    if [ -n "$p" ] && [ -x "$p" ] && "$p" -c "import tkinter" >/dev/null 2>&1; then
+      echo "$p"
+      return
+    fi
+  fi
+  for c in $CANDIDATES; do
+    if [ -x "$c" ] && "$c" -c "import tkinter" >/dev/null 2>&1; then
+      echo "$c"
+      return
+    fi
+  done
+  echo python3
+}
+
+PY="$(pick_python)"
+if [ "$PRINT_ONLY" = "1" ]; then
+  echo "$PY"
+  exit 0
+fi
 exec "$PY" main.py "$@"
 """
-
 
 def _version():
     """返回应用版本号。

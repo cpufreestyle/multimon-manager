@@ -16,15 +16,30 @@
 | macOS | `CoreGraphics` + `system_profiler` | `desktoppicture.db` + `osascript` | System Events AppleScript | `Quartz` CGEventTap | Dock 菜单 + 常驻面板 |
 
 ## 运行
-无需联网安装任何依赖，仅需 Python 3.8+（macOS 用系统自带 `/usr/bin/python3` 或任意 venv 均可）。
+无需联网安装任何依赖，仅需 Python 3.8+（macOS 用系统自带 /usr/bin/python3 或任意 venv 均可）。
 
 ```bash
 # Windows
 python main.py
 
 # macOS
-python3 main.py
+./run.sh
 ```
+
+run.sh 会自己挑一个带 tkinter 的解释器：只判「可执行」不够，Homebrew 升级后
+/opt/homebrew/bin/python3 可能指向没装 python-tk 的版本（实测 python@3.15
+就是），那时 import tkinter 直接崩，表现为「双击 App 没反应」。
+
+## 跑测试
+
+```bash
+./run_tests.sh
+```
+
+同样必须挑带 tkinter 的解释器：tests/test_quad_capacity.py 的
+QuadCapacityTextTest 要 import ui，用没 tkinter 的解释器跑会整类静默跳过，
+退出码仍是 0，覆盖率少一截而看不出来。所以别直接敲
+python3 -m unittest discover -s tests，用上面的脚本。
 
 ## 快速上手（实用建议）
 
