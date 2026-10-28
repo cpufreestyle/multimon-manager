@@ -32,6 +32,10 @@ import itertools
 # 比例对上，还得有可用大小。
 MIN_CELL_FRAC = 0.35
 
+# 探测抖动容差（px）：最小尺寸探测有 1~2px 波动，零容差会让差几像素
+# 就能放下四格的窗口被丢掉。与 _quad_overload 的容差保持一致。
+_SLACK_TOL = 6
+
 
 # Moom 4 的 snapshotMatchingSelector 兜底判据：窗口中心点到布局格中心点的
 # 距离。主判据（格子与窗口的宽高比、面积、占比均衡）先比，距离作为一项小幅
@@ -581,8 +585,12 @@ def choose_quad_slots(wins, mins, work_w, work_h, gap=0, edge_gap=False,
                 need[row] = max(need[row], mh)
                 occ[col] = occ[row] = True
             req = [need[k] + pad if occ[k] else 0 for k in range(4)]
-            if req[0] + req[1] > work_w or req[2] + req[3] > work_h:
-                continue              # 这一组摆法在这块屏上必然重叠或越界
+            # 探测有 1~2px 抖动，总和只超屏几个像素时允许微重叠——
+            # 零容差会把差几像素就能放下四格的窗口全丢掉，用户看到的就是
+            # 「四格只排了两个」。容差与 _quad_overload 一致。
+            if (req[0] + req[1] > work_w + _SLACK_TOL
+                    or req[2] + req[3] > work_h + _SLACK_TOL):
+                continue              # 超出容差才判「装不下」
             displaced = sum(1 for i, c in zip(idxs, perm)
                             if c != want_corner[i])
             cols, rows = (req[0], req[1]), (req[2], req[3])

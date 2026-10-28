@@ -42,3 +42,7 @@ _*.py
 .codebuddy/
 .workbuddy/
 stash.json
+
+# 运行时数据缓存（最小尺寸学习、归位记录）：与 settings.json 同类，不应入库
+quad_cache.json
+rehome.json

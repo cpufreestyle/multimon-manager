@@ -150,12 +150,44 @@ def _parse_resolution_to_wh(res_str):
 
 # ── 主接口 ────────────────────────────────────────────────────────────
 
+def display_edid(display_id):
+    """取一块显示器的 EDID 硬件身份 (vendor, model, serial)（macOS）。
+
+    与 LayoutKeeper 的 MonitorIdentity 同源：它用 CGDisplayVendorNumber /
+    CGDisplayModelNumber / CGDisplaySerialNumber 拼出 monitor-vendor-model-serial
+    当屏的 key，重启、重插、换接口都不变。本项目 rehome 模块在拿不到
+    CGDisplayCreateUUIDFromDisplayID 时用它兜底。任一项取不到返回对应 0。
+    """
+    out = (0, 0, 0)
+    if _cg is None:
+        return out
+    try:
+        _cg.CGDisplayVendorNumber.restype = ctypes.c_uint32
+        _cg.CGDisplayVendorNumber.argtypes = [ctypes.c_uint32]
+        _cg.CGDisplayModelNumber.restype = ctypes.c_uint32
+        _cg.CGDisplayModelNumber.argtypes = [ctypes.c_uint32]
+        _cg.CGDisplaySerialNumber.restype = ctypes.c_uint32
+        _cg.CGDisplaySerialNumber.argtypes = [ctypes.c_uint32]
+        v = int(_cg.CGDisplayVendorNumber(display_id) or 0)
+        m = int(_cg.CGDisplayModelNumber(display_id) or 0)
+        sr = int(_cg.CGDisplaySerialNumber(display_id) or 0)
+        return (v, m, sr)
+    except Exception:  # noqa: BLE001
+        return out
+
+
 @dataclass
 class MonitorInfo:
     index: int = 0
     device_name: str = ""
     device_path: str = ""
     is_primary: bool = False
+    # 显示器硬件身份（EDID）：LayoutKeeper 的 MonitorIdentity(vendor, model,
+    # serial) 同款思路。同为 1920x1080 的两块屏靠它区分；拿不到时留空，
+    # 调用方退回 UUID 或分辨率指纹。
+    vendor_id: int = 0
+    model_id: int = 0
+    serial: int = 0
     left: int = 0
     top: int = 0
     width: int = 0
@@ -461,11 +493,18 @@ def enum_monitors(force=False, work=True):
                 name = f"Display {i + 1}"
             is_main = cg["is_main"]
 
+        try:
+            _v, _m, _sr = display_edid(cg["id"])
+        except Exception:  # noqa: BLE001
+            _v = _m = _sr = 0
         monitors.append(MonitorInfo(
             index=i,
             device_name=name,
             device_path=str(cg["id"]),
             is_primary=is_main,
+            vendor_id=_v,
+            model_id=_m,
+            serial=_sr,
             left=cg["x"],
             top=cg["y"],
             width=cg["width"],

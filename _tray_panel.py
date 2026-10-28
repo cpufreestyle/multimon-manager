@@ -1,8 +1,9 @@
 """托盘快速访问面板（独立 Tk 进程运行，避免影响主窗口渲染）。
 
-提供：打开主界面 / 应用窗口布局 / 切换情景 / 开始·停止幻灯片 / 刷新显示器 / 退出。
-除"打开主界面"外都通过命令文件通知主进程执行（见 cmd_channel）；退出直接终止
-主进程。主进程 PID 通过环境变量 MAIN_PID 传入；若未传入则仅退出本面板。
+提供：打开主界面 / 应用窗口布局 / 2×2 排最近四窗 / 切换情景 / 开始·停止
+幻灯片 / 刷新显示器 / 退出。除"打开主界面"外都通过命令文件通知主进程执行
+（见 cmd_channel）；退出直接终止主进程。主进程 PID 通过环境变量 MAIN_PID
+传入；若未传入则仅退出本面板。
 """
 import os
 import signal
@@ -16,6 +17,34 @@ from tkinter import ttk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cmd_channel  # noqa: E402
+
+
+def _main_alive(pid):
+    """主进程是否还活着（PID 复用也算死：用 starttime 校验）。"""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _relaunch_main():
+    """主进程已死时重新拉起它（macOS：open .app；其它平台：直接跑 main.py）。
+
+    托盘是独立进程，主进程崩溃后它会变成孤儿：命令照发，但没有任何进程
+    消费，用户看到的就是「按钮点了没效果」。这里在发命令前补一次自愈。
+    """
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-a", "多屏管理器"], check=False, timeout=5)
+        else:
+            here = os.path.dirname(os.path.abspath(__file__))
+            subprocess.Popen([sys.executable, os.path.join(here, "main.py")],
+                             close_fds=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _load_scenarios():
@@ -37,7 +66,7 @@ def main(tip=None):
 
     root = tk.Tk()
     root.title(tip)
-    root.geometry("220x270+1400+20")
+    root.geometry("220x302+1400+20")
     root.resizable(False, False)
 
     tk.Label(root, text=tip, font=("Arial", 12, "bold")).pack(pady=6)
@@ -55,8 +84,25 @@ def main(tip=None):
             pass
 
     def send_and_activate(cmd):
+        # 主进程死了就先拉起来：否则命令发出去没人消费，按钮像坏了
+        if not _main_alive(main_pid):
+            _relaunch_main()
+            import time as _t
+            _t.sleep(2.5)      # 等新实例建完界面、进入命令轮询
         cmd_channel.send(cmd)
         activate_main()
+
+    def _send_quiet(cmd):
+        """同 send_and_activate，但不激活主窗口。
+
+        2×2 一键要的是「不动界面、只动窗口」：send_and_activate 会把主窗拉到
+        最前，盖住刚排好的四个窗口。主进程已死时仍需先自愈，否则没人消费。
+        """
+        if not _main_alive(main_pid):
+            _relaunch_main()
+            import time as _t
+            _t.sleep(2.5)
+        cmd_channel.send(cmd)
 
     def do_exit():
         if main_pid:
@@ -69,6 +115,10 @@ def main(tip=None):
     tk.Button(root, text="打开主界面", command=activate_main).pack(fill="x", padx=14, pady=2)
     tk.Button(root, text="应用窗口布局",
               command=lambda: send_and_activate("apply_layout")).pack(fill="x", padx=14, pady=2)
+    # 2×2 一键：只发命令、不激活主窗。send_and_activate 会把主窗拉到最前，
+    # 盖住刚排好的四个窗口——这条命令要的就是「不动界面、只动窗口」。
+    tk.Button(root, text="2×2 排最近四窗",
+              command=lambda: _send_quiet("snap_quad")).pack(fill="x", padx=14, pady=2)
 
     # 切换情景（F4）：列出已绑定情景，一键套用（壁纸方案 + 窗口布局）
     scen_rows = _load_scenarios()
@@ -94,6 +144,18 @@ def main(tip=None):
     tk.Button(root, text="刷新显示器",
               command=lambda: send_and_activate("refresh")).pack(fill="x", padx=14, pady=2)
     tk.Button(root, text="退出", command=do_exit).pack(fill="x", padx=14, pady=2)
+
+    # 主进程守护：主进程死了就自行退出。否则托盘变成孤儿——界面照旧显示、
+    # 按钮照旧可点，但命令没有任何进程消费，用户看到的就是「点了没效果」。
+    # 顺带避免每次 open .app 都新起一个托盘、旧的永远留着（托盘增殖）。
+    def _watch_main():
+        if main_pid and not _main_alive(main_pid):
+            root.destroy()
+            return
+        root.after(2000, _watch_main)
+
+    if main_pid:
+        root.after(2000, _watch_main)
 
     root.mainloop()
 

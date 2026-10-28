@@ -7,6 +7,30 @@ import sys
 import tempfile
 import tkinter as tk
 
+
+# ── 已修复：主进程随机 abort（真根因是拖拽吸附的事件 tap）─────────────
+#
+# 现象：进程启动 10-16 秒后静默死亡，系统崩溃报告 SIGABRT / SIGSEGV，
+#   Fatal Python error: PyEval_RestoreThread: the GIL is released
+#   (the current Python thread state is NULL)
+# 用户可见后果：托盘按钮除「打开主界面」外全部失效（命令无人消费）。
+#
+# 真根因（二分定位，勿再怀疑别处）：DragSnapWatcher 把 CGEventTap 的
+# runloop source 注册到 **Tk 主线程** CFRunLoop（CFRunLoopGetMain），
+# 由 Tk mainloop 驱动。mouse dragged 事件极频繁，每次都在 Tcl 释放 GIL 的
+# 窗口期回调进 Python -> PyEval_RestoreThread 拿到 NULL tstate -> abort。
+# 判据：只禁掉拖拽吸附，同一份代码从 rc=134（必崩）变 rc=124（存活）。
+#
+# 修法：tap 改建在**专用线程**自己的 CFRunLoop 上（与 hotkeys_mac 同一
+# 套路），回调只读坐标/入队、不碰 tkinter；stop() 用 CFRunLoopStop 唤醒。
+# 字段访问加锁——stop() 在调用方线程置 None 而 _handler 在 tap 线程读，
+# 不加锁踩出过 SIGSEGV。
+#
+# 排除过的错误方向（都做过实验，勿重复）：Python/Tcl 版本（3.9/3.13/3.14
+# 与 Tcl 8.5/9.1 都崩过也都活过）、启动方式（shell / nohup / open .app /
+# pty.fork 无差别）、ttk.Notebook、全局热键 tap、辅助功能提示。
+# 教训：这个崩溃是概率性的，小样本（2-3 次）结论全部不可信，必须多次重复。
+#
 # 日志必须在 import backend 之前配置：backend 导入期（如 Quartz 框架加载结果）
 # 会打印 INFO/WARNING，若此时 root logger 尚未设置，这些日志会丢失。
 LOG_PATH = os.path.join(tempfile.gettempdir(), "multimon-manager.log")
@@ -31,6 +55,7 @@ _setup_logging()
 
 import backend
 import cmd_channel
+import settings
 import resources
 import ui
 
@@ -113,7 +138,6 @@ def _activate_frontmost(root, delay_ms=400):
         try:
             root.deiconify()
             root.lift()
-            root.focus_force()
         except Exception:  # noqa: BLE001
             pass
 
@@ -158,8 +182,23 @@ def main():
             pass
         return
     logging.getLogger(__name__).info("单实例锁已获取，准备创建窗口…")
+    # 四宫格尺寸缓存（上次实测的最小尺寸 / 尺寸上限）读入内存：排列预演
+    # （点「2×2 排列」前的空白预告）消费它。只 macOS 侧有对应模块，读不到
+    # 就按无缓存走——预演静默放行，不影响排布。
+    try:
+        if sys.platform == "darwin":
+            import windows_mac as _wm_cache
+            _wm_cache._quad_cache_load()
+    except Exception:  # noqa: BLE001
+        pass
 
     root = tk.Tk()
+    # 诊断开关：关掉 Tk 的输入法支持（见下方说明）
+    if os.environ.get("MMM_TK_NOIMK") == "1":
+        try:
+            root.tk.eval("option add *Tk.useInputMethods 0 interactive")
+        except Exception:  # noqa: BLE001
+            pass
     logging.getLogger(__name__).info("Tk 窗口已创建")
 
     # 独立打包(.app)时，Dock 图标由 bundle 的 app.icns / Info.plist 提供：
@@ -188,7 +227,19 @@ def main():
                 logging.getLogger(__name__).warning("设置 Dock 图标失败: %s", e)
     logging.getLogger(__name__).info("图标处理完成，开始构建界面…")
 
-    app = ui.App(root)
+    # 界面构造期的异常必须落到日志：日志配置在 import backend 之前，
+    # 而 ui.App 内部任何一处抛错都只会让进程静默退出——用户看到的是
+    # 「点了没反应」，日志里连一行都没有，无从排查。
+    try:
+        app = ui.App(root)
+    except Exception:
+        import traceback
+        logging.getLogger(__name__).exception("界面构造失败")
+        try:
+            root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     logging.getLogger(__name__).info("界面构建完成")
 
     if start_minimized:
@@ -216,6 +267,18 @@ def main():
                 pass
         root.after(800, _maybe_prompt_accessibility)
 
+    # 防休眠：恢复上次选的模式（挂任务的人希望开机就生效，不想每次手动开）。
+    # 合盖档需要管理员授权，启动时静默尝试一次（sudo -n），失败就只持断言
+    # 并在状态栏说明「系统级没开成」——不弹框打断启动。
+    try:
+        _ka_mode = settings.load().get("keep_awake_mode", backend.keep_awake_default)
+        if _ka_mode and _ka_mode != backend.keep_awake_default:
+            _ok, _text, _d = backend.keep_awake_apply(_ka_mode, allow_prompt=False)
+            logging.getLogger(__name__).info("防休眠恢复: mode=%s ok=%s %s",
+                                             _ka_mode, _ok, _text)
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger(__name__).warning("防休眠恢复失败: %s", e)
+
     root.protocol("WM_DELETE_WINDOW", app.on_close)
 
     # 托盘运行在独立 Tk 子进程，避免与主窗口共用事件循环导致 macOS 黑屏
@@ -241,6 +304,13 @@ def main():
         root.mainloop()
     finally:
         t.destroy()
+        # 防休眠必须在这里归还：断言随进程死亡自动释放，但系统级
+        # `pmset -a disablesleep 1` 不会——不还原就会把用户的 Mac
+        # 永久改成不休眠（重启后仍在）。绝不静默留着。
+        try:
+            backend.keep_awake_release()
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger(__name__).warning("防休眠释放失败: %s", e)
 
 
 if __name__ == "__main__":

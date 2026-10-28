@@ -8,6 +8,7 @@ from ctypes import wintypes
 import monitors
 
 import quad_plan
+import grid_plan
 import screen_math
 
 logger = logging.getLogger(__name__)
@@ -1053,6 +1054,160 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     return True
 
 
+# ── 虚拟桌面网格（跨屏 m×n 批排，Windows）────────────────────────────
+
+# 最近一次虚拟网格需要如实告知用户的情况。界面读它在状态栏里提示，
+# 而不是只说「排列完成」——用户反复抱怨「不准」，而多数不准其实是
+# 装不下、写入无效、被应用钳制这三类物理限制。
+_last_grid_notes = []
+
+# 最近一次虚拟网格的实测报告 [(hwnd, 目标矩形, 实测矩形或None), ...]
+_last_grid_report = []
+
+
+def fill_grid(hwnds=None, cols=None, rows=None, layout=None, smart=False,
+              monitor_indices=None, use_pinned=True):
+    """把若干窗口排进跨屏虚拟桌面的 m×n（或加权比例）网格（整数 HWND）。
+
+    与 fill_all_monitors（一个窗口一块屏）互补：把勾选的多块屏当成一块大桌面，
+    按比例切格子，一个格子一个窗口。等分（2×2 / 3×2 / 3×3）与加权
+    （2/3+1/3）走同一条路，由 grid_plan 的比例元组描述。
+
+    三条约束与 macOS 版一致，都是真机踩过的坑：
+
+    1. **格子绝不跨屏**。Windows 上横跨两屏的窗口同样会被系统重新归属，
+       grid_plan.assign_cells 把每格归到交集最大的屏并裁进它的工作区。
+    2. **装不下的窗口不硬排**。Windows 侧没有 AppleScript 最小尺寸探测，
+       这里按窗口当前尺寸作乐观判据（min=0），fit_report 仍会拦住
+       「格子本身退化到 0」的情况；装不下的保持原位并如实报告。
+    3. **间距按贴边算**（grid_plan.cell_gap_rect）。
+
+    layout 优先于 cols/rows；两者都没给时按 2×2。
+    monitor_indices: 只排这些下标的屏（按给定顺序）。
+    """
+    ms = monitors.enum_monitors()
+    if not ms:
+        return 0
+
+    if monitor_indices is not None:
+        keep = []
+        for i in monitor_indices:
+            if isinstance(i, int) and 0 <= i < len(ms) and i not in keep:
+                keep.append(i)
+        ms = [ms[i] for i in keep]
+        if not ms:
+            logger.warning("虚拟网格：没有可用的目标屏")
+            return 0
+
+    global _last_grid_notes, _last_grid_report
+    _last_grid_notes.clear()
+    _last_grid_report = []
+
+    if layout:
+        got = grid_plan.layout_by_label(layout)
+        if got is None:
+            logger.warning("虚拟网格：未知布局 %r，按自定义行列处理", layout)
+            got = (grid_plan.equal_fracs(cols or 2),
+                   grid_plan.equal_fracs(rows or 2))
+    else:
+        got = (grid_plan.equal_fracs(cols or 2),
+               grid_plan.equal_fracs(rows or 2))
+    col_fracs, row_fracs = got
+    n_cols, n_rows = len(col_fracs), len(row_fracs)
+    if n_cols > grid_plan.MAX_COLS or n_rows > grid_plan.MAX_ROWS:
+        logger.warning("虚拟网格：%d×%d 超出上限（最多 %d列×%d行）",
+                       n_cols, n_rows, grid_plan.MAX_COLS, grid_plan.MAX_ROWS)
+        return 0
+
+    vr = grid_plan.virtual_rect(ms)
+    if vr is None:
+        return 0
+    cells = grid_plan.grid_cells(vr[0], vr[1], vr[2], vr[3],
+                                 col_fracs, row_fracs)
+    asg = grid_plan.assign_cells(cells, ms)
+    if not asg:
+        _last_grid_notes.append("勾选的屏摆不出可用的网格（屏之间有重叠？）")
+        logger.warning("虚拟网格：格子与任何屏都没有交集")
+        return 0
+
+    # 选窗：显式 hwnd 优先，否则按 z 序取前 len(asg) 个（滤自身进程）
+    wins = []
+    if hwnds:
+        cands = list_windows_front_to_back()
+        by_hwnd = {w["hwnd"]: w for w in cands}
+        for h in hwnds:
+            if not h or h in [w["hwnd"] for w in wins]:
+                continue
+            w = by_hwnd.get(h) or _find_window(h)
+            if w is None:
+                _last_grid_notes.append(
+                    "指定的窗口 %s 已关闭，未参与排列" % h)
+                logger.warning("虚拟网格：指定的窗口 %s 已不可用", h)
+                continue
+            wins.append(w)
+    if not wins:
+        cands = [w for w in list_windows_front_to_back()
+                 if w["pid"] not in _OWN_PIDS]
+        wins = grid_plan.pick_windows(cands, len(asg), own_pids=_OWN_PIDS)
+        if use_pinned and _pinned_target and not wins:
+            pinned = _find_window(_pinned_target)
+            if pinned is not None:
+                wins = [pinned]
+    if not wins:
+        _last_grid_notes.append("没有可操作的窗口")
+        logger.warning("虚拟网格：没有可操作的窗口")
+        return 0
+
+    # 间距：Windows 侧读同一份设置（settings.json 与 macOS 共用）
+    try:
+        import settings
+        _s = settings.load()
+        gap = int(_s.get("window_gap", 0) or 0)
+        edge_gap = bool(_s.get("gap_screen_edges", False))
+    except Exception:  # noqa: BLE001
+        gap, edge_gap = 0, False
+    gap = max(0, gap)
+
+    # Windows 侧没有最小尺寸探测：按 0（乐观）计，fit_report 只拦格子退化
+    mins = {w["hwnd"]: (0, 0) for w in wins}
+    slots, too_small = grid_plan.fit_report(asg, wins, mins, gap, edge_gap, ms)
+    if not slots:
+        _last_grid_notes.append("这些窗口放不进网格格子，未做排列")
+        logger.warning("虚拟网格：%d 个窗口全部放不进各自格子", len(wins))
+        return 0
+
+    # 智能分配必须拿 **slots 里的窗口**算（macOS 侧同一教训：fit_report 剔掉
+    # 装不下的窗口后 wins 与 slots 的下标会错开），且算出的 order 必须真的
+    # 用于写入循环——只算不用的 order 让「智能」开关形同虚设。
+    n = len(slots)
+    slot_wins = [s[2] for s in slots]
+    order = list(range(n))
+    if smart and n > 1:
+        sizes = [(a[5], a[6]) for a, _h, _w in slots]
+        perm = grid_plan.assign_windows(slot_wins, sizes, smart=True)
+        order = [0] * n
+        for wi, ci in enumerate(perm):
+            if 0 <= ci < n:
+                order[ci] = wi
+
+    done = 0
+    for k in range(n):
+        row, col, mi, gx, gy, gw, gh = slots[k][0]
+        hwnd = slot_wins[order[k]].get("hwnd") or slots[k][1]
+        try:
+            if _place_window(hwnd, gx, gy, gw, gh):
+                done += 1
+                _last_grid_report.append((hwnd, (gx, gy, gw, gh),
+                                          get_window_rect(hwnd)))
+        except Exception:  # noqa: BLE001
+            logger.warning("虚拟网格：写入 %s 失败", hwnd, exc_info=True)
+            _last_grid_notes.append("%s 摆放失败" % hwnd)
+    for h, _w, r in too_small:
+        _last_grid_notes.append(
+            "%s 放不下它那一格（%dx%d），已保持原位" % (h, r[2], r[3]))
+    logger.info("虚拟网格完成(Windows): %d/%d 个窗口 -> %d 格（%d列×%d行）",
+                done, len(wins), len(asg), n_cols, n_rows)
+    return done
 def _is_portrait(mon):
     """屏幕是否为竖屏（高大于宽）。"""
     return mon.height > mon.width

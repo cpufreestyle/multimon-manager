@@ -22,6 +22,8 @@ if IS_MAC:
     import tray_mac as tray
     import display_notify_mac as display_notify
     import accessibility_mac as accessibility
+    import rehome
+    import keep_awake
     import dragsnap_mac as dragsnap
 else:
     import monitors
@@ -30,6 +32,7 @@ else:
     import hotkeys
     import tray
     import display_notify
+    import rehome
     import dragsnap
 
 
@@ -43,8 +46,9 @@ try:
     VK_B = getattr(hotkeys, "VK_B", 0)
     VK_S = getattr(hotkeys, "VK_S", 0)
     VK_D = getattr(hotkeys, "VK_D", 0)
+    VK_Q = getattr(hotkeys, "VK_Q", 0)
 except Exception:  # noqa: BLE001
-    VK_LEFT = VK_RIGHT = VK_UP = VK_DOWN = VK_Z = VK_B = VK_S = VK_D = 0
+    VK_LEFT = VK_RIGHT = VK_UP = VK_DOWN = VK_Z = VK_B = VK_S = VK_D = VK_Q = 0
 
 MOD_ALT = getattr(hotkeys, "MOD_ALT", 1)
 MOD_CONTROL = getattr(hotkeys, "MOD_CONTROL", 2)
@@ -69,13 +73,60 @@ move_to_monitor = getattr(windows, "move_to_monitor", lambda *a, **k: False)
 snap_two_side_by_side = getattr(windows, "snap_two_side_by_side", lambda *a, **k: False)
 snap_three_stack = getattr(windows, "snap_three_stack", lambda *a, **k: False)
 snap_four_quad = getattr(windows, "snap_four_quad", lambda *a, **k: False)
+# 四宫格排列预演（点排列前的空白/放不下预告；只读，不动任何窗口）
+quad_predict = getattr(windows, "quad_predict", lambda *a, **k: ([], {}))
 fill_all_monitors = getattr(windows, "fill_all_monitors", lambda *a, **k: 0)
+# 虚拟桌面网格：把勾选的多块屏当成一块大桌面，按 m×n 或加权比例网格批排
+fill_grid = getattr(windows, "fill_grid", lambda *a, **k: 0)
 # 窗口置顶切换（Windows 实现；macOS 暂无对应实现时为 None，UI 自动隐藏入口）
 toggle_topmost = getattr(windows, "toggle_topmost", None)
 HotkeyManager = hotkeys.HotkeyManager
 # 拖拽吸附监听（F3；macOS 为真实实现，Windows 为占位）
 DragSnapWatcher = dragsnap.DragSnapWatcher
 register_display_callback = display_notify.register
+# 插拔屏幕归位（LayoutKeeper 的 reconnect restore）：拔/插副屏后把窗口送回原屏
+rehome_capture = rehome.capture
+rehome_freeze = rehome.freeze
+rehome_clear_frozen = rehome.clear_frozen
+rehome_plan = rehome.plan
+rehome_apply = rehome.apply_plan
+rehome_summary = rehome.summary
+rehome_policy_action = rehome.policy_action
+rehome_set_mode = rehome.set_mode
+rehome_per_monitor_modes = rehome.per_monitor_modes
+rehome_pause = rehome.pause
+rehome_resume = rehome.resume
+rehome_paused_until = rehome.paused_until_value
+rehome_fingerprint = rehome.screen_fingerprint
+rehome_fingerprint_diff = rehome.fingerprint_diff
+rehome_monitor_key = rehome.monitor_key
+rehome_known_screens = rehome.known_screens
+# 防休眠（LayoutKeeper 的 KeepAwake）：合盖/拔电/锁屏时继续干活
+keep_awake_modes = keep_awake.MODES
+keep_awake_default = keep_awake.DEFAULT_MODE
+keep_awake_labels = keep_awake.MODE_LABELS
+keep_awake_hints = keep_awake.MODE_HINTS
+# 单例：断言要与进程同生命周期，不能每次 apply 都新建（新建的实例一被 GC，
+# 析构就释放断言）。UI / main 都通过 backend 调这一个。
+_keep_awake = keep_awake.KeepAwake()
+
+
+def keep_awake_apply(mode, allow_prompt=False):
+    """套用防休眠模式；返回 (ok, 说明, 细节)。"""
+    return _keep_awake.apply(mode, allow_prompt=allow_prompt)
+
+
+def keep_awake_release():
+    """释放全部断言并归还本程序设的系统 disablesleep（退出时调用）。"""
+    return _keep_awake.release_all()
+
+
+def keep_awake_snapshot():
+    """当前持有情况（界面状态栏用）。"""
+    return _keep_awake.status()
+
+
+keep_awake_has_lid = keep_awake.has_lid
 # 撤销上一次窗口移动（F7）
 undo_last_move = windows.undo_last_move
 # 窗口暂存（复刻 Rectangle Pro 的 Stash）

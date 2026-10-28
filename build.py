@@ -101,9 +101,11 @@ _LAUNCHER = """#!/bin/bash
 DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
 cd "$DIR" || exit 1
 
-# MMM_PY_CANDIDATES 供测试注入假解释器；默认按 Homebrew 各版本优先
-# （Homebrew 自带 Tk 9.0；/usr/bin/python3 的 Tcl/Tk 在 macOS 上会黑屏，
-# 只作最后兜底）。
+# MMM_PY_CANDIDATES 供测试注入假解释器。顺序按 Homebrew 各版本优先
+# （自带 Tk 9.1；/usr/bin/python3 是 3.9 + Tcl 8.5，作兜底）。
+# 注意：曾把 /usr/bin/python3 提到最前想绕开一次 abort，事后证明与
+# Python/Tcl 版本无关——真正的根因是拖拽吸附的 CGEventTap 注册在 Tk 主线程
+# runloop 上（见 dragsnap_mac.py 的说明），修那里就够了。
 CANDIDATES="$MMM_PY_CANDIDATES"
 if [ -z "$CANDIDATES" ]; then
   CANDIDATES="/opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.10 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3"
@@ -139,7 +141,32 @@ if [ "$PRINT_ONLY" = "1" ]; then
   echo "$PY"
   exit 0
 fi
-exec "$PY" main.py "$@"
+# 主进程守护：macOS 上 tkinter + Tcl 有长期缺陷（cpython#59432），进程会在
+# 事件循环里随机 abort（Fatal PyEval_RestoreThread: GIL is released），Python
+# 层 try/except 抓不到。主进程一死托盘按钮就全部失效（用户看到「点了没效果」），
+# 所以加一层外壳守护：退出就重启，带退避防崩溃风暴。
+# 用户主动退出时 ui.quit() 会写 $DIR/.no_restart 标记文件，守护据此放行。
+GUARD_FLAG="$DIR/.no_restart"
+BACKOFF=1
+while true; do
+  if [ -f "$GUARD_FLAG" ]; then
+    rm -f "$GUARD_FLAG"
+    break
+  fi
+  "$PY" main.py "$@"
+  RC=$?
+  # 0=用户主动退出（托盘「退出」会先写标记文件，这里只是兜底）。
+  # 其它退出码一律重启：abort 类崩溃是 134、被 kill 是 137，用户看到的
+  # 现象都是「托盘按钮没反应」，都该拉起来。关机时系统先结束守护脚本
+  # 本身，不会出现反复重启。
+  if [ "$RC" -eq 0 ]; then
+    break
+  fi
+  sleep "$BACKOFF"
+  if [ "$BACKOFF" -lt 8 ]; then
+    BACKOFF=$((BACKOFF * 2))
+  fi
+done
 """
 
 def _version():

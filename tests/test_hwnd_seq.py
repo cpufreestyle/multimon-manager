@@ -94,6 +94,58 @@ class TestAxWindowByGeometry(unittest.TestCase):
         # 三个都命中（互相包含），取最具体的 abc = window 3
         self.assertEqual(wm._ax_window_by_name("App", "ab"), "window 3")
 
+    def test_negative_coords_match_exactly(self):
+        """副屏窗口的 x/y 是负数，必须原样比较，不能取绝对值。
+
+        真机 ChatGPT 主窗口在 RV200 Pro（y=-870），CG 与 AX 都是
+        (0,-870,793,870)。旧实现对 AppleScript 返回值取 abs()，目标 y=-870
+        与实测 y=870 相差 1740，偏差阈值判定失效，副屏窗口全部退化成按序号
+        选窗——几何写到别的窗口上，表现为「四格不准 / 没吸附到边上」。
+        """
+        self._set_ax("0,-870,793,870;600,-870,1000,640")
+        sel = wm._ax_window_by_geometry("ChatGPT", (0, -870, 793, 870))
+        self.assertEqual(sel, "window 1")
+
+    def test_negative_coords_pick_closest(self):
+        """同为负坐标时，按偏差最小挑选，不被符号干扰。"""
+        self._set_ax("0,-870,793,870;600,-870,1000,640")
+        sel = wm._ax_window_by_geometry("爱思助手", (600, -870, 1000, 640))
+        self.assertEqual(sel, "window 2")
+
+    def test_negative_coords_still_reject_far_match(self):
+        """副屏几何对不上时依然走窗口名兜底，不会误配成正坐标的那个。"""
+        calls = []
+
+        def _osa(script):
+            calls.append(script)
+            if "position of w" in script:
+                return "0,-870,793,870;600,-870,1000,640"
+            if "name of w" in script:
+                return "主窗口;小窗"
+            return ""
+
+        wm._osa = _osa
+        sel = wm._ax_window_by_geometry("App", (0, 33, 906, 447), name="主窗口")
+        self.assertEqual(sel, "window 1")
+
+    def test_thousands_separator_does_not_break_parse(self):
+        """坐标过千时 as text 会插入千位分隔符，不能按逗号切分。
+
+        真机日志见过 "546, ,, -870, ,, 1054, ,, 870" 这种 8 段输出：split(",")
+        解析直接抛 ValueError，几何读取报废，四宫格退化成按序号选窗。
+        """
+        self._set_ax("546, ,, -870, ,, 1054, ,, 870;0,0,448,394")
+        sel = wm._ax_window_by_geometry("App Store", (546, -870, 1054, 870))
+        self.assertEqual(sel, "window 1")
+
+    def test_parse_nums_extracts_signed_ints(self):
+        self.assertEqual(wm._parse_nums("546,1,054,-870,870"),
+                         [546, 1, 54, -870, 870])
+        self.assertEqual(wm._parse_nums("546, ,, -870, ,, 1054, ,, 870"),
+                         [546, -870, 1054, 870])
+        self.assertEqual(wm._parse_nums(""), [])
+        self.assertEqual(wm._parse_nums(None), [])
+
     def test_name_match_single_window(self):
         """整个应用只有一个窗口，名字再不像也只能是它。"""
 

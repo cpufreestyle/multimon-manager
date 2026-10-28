@@ -12,6 +12,9 @@ import backend as b
 import config_io
 import profiles
 import quad_plan
+import grid_plan
+import rehome
+import keep_awake
 import settings
 import layouts
 import screen_math
@@ -42,6 +45,7 @@ VK_LEFT = b.VK_LEFT
 VK_UP = b.VK_UP
 VK_RIGHT = b.VK_RIGHT
 VK_DOWN = b.VK_DOWN
+VK_Z = b.VK_Z
 
 # 目标窗口下拉框的"自动"选项：由程序判断最前面的非本程序窗口
 AUTO_TARGET = "自动（上次活动窗口）"
@@ -53,6 +57,9 @@ AUTO_MON = "自动（按窗口所在屏）"
 # 跨屏铺满的两种铺法（界面显示值，同时作为 spread_mode_var 的取值）。
 # 前缀「每屏」由标签「跨屏铺满:」承担：文案太长会把模式、按钮和屏勾选框
 # 挤出一行放不下（Combobox 要 width=14 才不截断「每屏左上角四分之一」）。
+# 虚拟网格「自定义行列」项：放在预设布局之后，选中时按 Spinbox 的列/行数
+# 等分。没有它，用户改 Spinbox 会被上面的预设布局覆盖，「改了没反应」。
+GRID_LAYOUT_CUSTOM = "自定义行列"
 SPREAD_MODE_MAX = "整屏最大化"
 SPREAD_MODE_QUAD = "左上四分之一"
 # 规则引擎（F5）：目标屏"不换屏"选项 + 位置预设（中文 → 内部键）
@@ -120,6 +127,8 @@ class App:
         # 显示器插拔后的稳定等待：签名停止变化后才套用情景（Moom wake 思路）
         self._display_settle_id = None
         self._pending_mon_sig = None
+        # 插拔归位的持续采集调度 id
+        self._rehome_cap_id = None
         # 拖拽吸附预览（F3）：浮层懒创建，监听器按开关启停
         self._snap_preview = None
         self._drag_watcher = None
@@ -205,23 +214,67 @@ class App:
         self._canvas.bind("<Configure>", self._on_canvas_configure)
         self._bind_mousewheel()
 
-        # 所有分区统一挂到同一个容器（不再分页）
-        self._build_getting_started(self.body)
-        self._build_window_tools(self.body)
-        self._build_taskbar(self.body)
-        self._build_triggers(self.body)
-        self._build_wallpaper(self.body)
-        self._build_profiles(self.body)
-        self._build_rotate(self.body)
-        self._build_layouts(self.body)
-        self._build_hotkeys(self.body)
-        self._build_autostart(self.body)
-        self._build_backup(self.body)
-        self._build_display_watch(self.body)
-        self._build_scenarios(self.body)
-        self._build_drag_snap(self.body)
-        self._build_rules(self.body)
-        self._build_settings_io(self.body)
+        # 按用途分三组：16 个分区平铺一页时，用户要滚过十几个框才能点到
+        # 「备份」这类一次性设置。分组后首屏就是窗口工具/四宫格，零滚动可达。
+        # 刻意不用 ttk.Notebook：实测本机 Python 3.14 + Tcl 9.1 下 Notebook
+        # 会让主进程在启动 15 秒内静默死亡（Fatal PyEval_RestoreThread），
+        # 托盘按钮随之全部失效——那正是「很多按钮点了没效果」的根因。
+        # 改用一组按钮 + pack/pack_forget 切换 Frame，只碰普通控件。
+        self._tab_btns = {}
+        tab_bar = ttk.Frame(self.body)
+        tab_bar.pack(fill="x", padx=6, pady=(4, 0))
+        self._tab_common = ttk.Frame(self.body)
+        self._tab_config = ttk.Frame(self.body)
+        self._tab_settings = ttk.Frame(self.body)
+        for _key, _label, _frame in (
+                ("common", "常用", self._tab_common),
+                ("config", "布局与壁纸", self._tab_config),
+                ("settings", "设置", self._tab_settings)):
+            _btn = ttk.Button(tab_bar, text=_label, width=12,
+                              command=lambda f=_frame, k=_key: self._show_tab(k))
+            _btn.pack(side="left", padx=(0, 4))
+            self._tab_btns[_key] = (_btn, _frame)
+        self._tab_active = None
+        self._show_tab("common")
+
+        # 常用页：打开就要用的窗口操作
+        self._build_getting_started(self._tab_common)
+        self._build_window_tools(self._tab_common)
+        self._build_taskbar(self._tab_common)
+        self._build_drag_snap(self._tab_common)
+        # 布局与壁纸页：方案类配置，改一次就不常动
+        self._build_wallpaper(self._tab_config)
+        self._build_profiles(self._tab_config)
+        self._build_rotate(self._tab_config)
+        self._build_layouts(self._tab_config)
+        self._build_scenarios(self._tab_config)
+        self._build_triggers(self._tab_config)
+        self._build_rules(self._tab_config)
+        # 设置页：快捷键说明、启动/备份/热插拔等一次性项
+        self._build_hotkeys(self._tab_settings)
+        self._build_autostart(self._tab_settings)
+        self._build_keep_awake(self._tab_settings)
+        self._build_backup(self._tab_settings)
+        self._build_display_watch(self._tab_settings)
+        self._build_settings_io(self._tab_settings)
+
+    def _show_tab(self, key):
+        """切到指定分组：显示目标 Frame、隐藏其余，并高亮当前按钮。"""
+        if key == self._tab_active:
+            return
+        for k, (_btn, frame) in self._tab_btns.items():
+            if k == key:
+                frame.pack(fill="both", expand=True)
+            else:
+                frame.pack_forget()
+        # 用 state 区分当前组：ttk 没有「按下」态，disabled 视觉上够明显
+        for k, (btn, _frame) in self._tab_btns.items():
+            try:
+                btn.state(["disabled"] if k == key else ["!disabled"])
+            except Exception:  # noqa: BLE001
+                pass
+        self._tab_active = key
+        self._on_body_configure()
 
     # ---------- 滚动支持 ----------
     def _on_body_configure(self, event=None):
@@ -952,6 +1005,19 @@ class App:
         _quad_hint.pack(side="left")
         self._tooltip(_quad_hint, "拖两条分割线可改左右/上下比例，"
                       "四等分不总是合适——比例随「2×2 排列」一起生效。")
+        # 一键四窗：无视下拉当前选择，直接取最前面四个窗口排 2×2，与
+        # ⌘⌥+Q、托盘同项同一动作（force_auto）。放第 2 行末尾而不是挤进
+        # 第 1 行：第 1 行实测 720px、窗口可视宽约 765-793px，再加按钮
+        # 会被 packer 吞掉不映射——「四格只能选三个」当年正是这么来的。
+        quad_auto_btn = ttk.Button(
+            quad_row2, text="自动四窗",
+            command=lambda: self._snap_four_quad(force_auto=True))
+        quad_auto_btn.pack(side="left", padx=(8, 0))
+        self._tooltip(
+            quad_auto_btn,
+            "一键模式：无视下拉选择，直接取前面的四个窗口排 2×2"
+            "（等价于快捷键和托盘里的同项）。下拉选了具体窗口时，"
+            "「2×2 排列」仍按你的选择排。")
 
         # 跨屏铺满：若干窗口分别铺满各自勾选的屏（一个窗口一块屏）。
         # 模式、按钮与屏勾选框同排一行：勾选框按屏数动态重建，宽度实测
@@ -968,6 +1034,12 @@ class App:
         ttk.Label(spread, text="跨屏铺满:").pack(side="left")
         self._spread_checks_parent = spread
         self._last_monitors = list(self.monitors)
+        # 记住这套勾选框上次是按哪批 device_path 建的：迁移旧勾选时用它配
+        # （device_path, value），不再拿 _last_monitors[i] 与 _spread_checks[i]
+        # 按下标配对。那两个列表分属两处维护，只要有一处先被外部改掉（热插拔
+         # 重排、枚举顺序变化），配出来的就是别的屏的值——横屏继承「竖屏不勾」、
+        # 竖屏继承「横屏勾」，窗口就被发到竖屏上压成一条。
+        self._spread_check_paths = []
         self.spread_mode_var = tk.StringVar(value=SPREAD_MODE_MAX)
         self.spread_mode_cb = ttk.Combobox(
             spread, textvariable=self.spread_mode_var, state="readonly",
@@ -984,6 +1056,78 @@ class App:
             "窗口比勾选的屏少时有几屏铺几屏，多出来的屏不动。")
         # 勾选框按当前屏数生成（屏数为 1 时跨屏铺满等价于最大化，故不显示）
         self._rebuild_spread_checks()
+
+        # 虚拟网格：把勾选的多块屏当成一块大桌面，按 m×n 或加权比例切格子，
+        # 一个格子一个窗口。与「跨屏铺满」的分工：那个是「屏多窗口少」
+        # （一个窗口一块屏），这个是「窗口多、屏要合起来用」。
+        #
+        # 布局分两行：第 1 行布局下拉 + 自定义行列 Spinbox + 智能勾选 + 按钮；
+        # 第 2 行屏勾选框（与跨屏铺满共用 _spread_checks，选同一批屏）。
+        # 第 1 行宽度实测 705px，在窗口可视宽 765px 内。
+        #
+        # Spinbox 必须 pack 并给足宽度：容器装不下时 Tk packer 不映射后面的
+        # 子控件——「很多按钮点了没效果」多半是这个（控件根本没映射）。
+        grid = ttk.Frame(f)
+        grid.pack(fill="x", padx=6, pady=(1, 1))
+        grid_row = ttk.Frame(grid)
+        grid_row.pack(fill="x")
+        ttk.Label(grid_row, text="虚拟网格:").pack(side="left")
+        self.grid_layout_var = tk.StringVar(value="2×2 四等分")
+        self.grid_layout_cb = ttk.Combobox(
+            grid_row, textvariable=self.grid_layout_var, state="readonly",
+            width=13, values=list(grid_plan.layout_labels()))
+        self.grid_layout_cb.pack(side="left", padx=(4, 2))
+        self._tooltip(
+            self.grid_layout_cb,
+            "网格形状。等分（2×2 / 3×2 / 3×3）= 每格一样大；"
+            "「2/3+1/3」让一侧吃掉三分之二——左栏放终端想窄一点、"
+            "右栏放浏览器想宽一点就用它。选「自定义」按右边的行列数等分。")
+        # 选「自定义」时才让 Spinbox 生效：否则布局下拉已经定了形状，
+        # 改 Spinbox 没反应，用户看到的就是「点了没效果」
+        self.grid_cols_var = tk.IntVar(value=2)
+        self.grid_rows_var = tk.IntVar(value=2)
+        cols_sb = tk.Spinbox(grid_row, from_=1, to=grid_plan.MAX_COLS,
+                             textvariable=self.grid_cols_var, width=2,
+                             command=self._on_grid_dims_change)
+        cols_sb.pack(side="left", padx=(2, 0))
+        self._tooltip(cols_sb, "自定义列数（1~%d，需先把布局改成「自定义」）"
+                      % grid_plan.MAX_COLS)
+        rows_sb = tk.Spinbox(grid_row, from_=1, to=grid_plan.MAX_ROWS,
+                             textvariable=self.grid_rows_var, width=2,
+                             command=self._on_grid_dims_change)
+        rows_sb.pack(side="left", padx=(1, 0))
+        self._tooltip(rows_sb, "自定义行数（1~%d，需先把布局改成「自定义」）"
+                      % grid_plan.MAX_ROWS)
+        # 布局下拉里加一项「自定义」：列在前两个预设之后插不进去顺序，
+        # 放最后，文案说清它用哪两个数
+        self.grid_layout_cb["values"] = (list(grid_plan.layout_labels())
+                                         + [GRID_LAYOUT_CUSTOM])
+        self.grid_layout_var.set("2×2 四等分")
+        self.grid_smart_var = tk.BooleanVar(value=False)
+        smart_cb = ttk.Checkbutton(
+            grid_row, text="智能", variable=self.grid_smart_var,
+            command=self._on_grid_smart_toggle)
+        smart_cb.pack(side="left", padx=(6, 0))
+        self._tooltip(
+            smart_cb,
+            "勾选后不管窗口顺序：程序按每个窗口的宽高比，"
+            "决定谁去哪一格，让每格都贴合窗口。")
+        grid_btn = ttk.Button(grid_row, text="网格批排",
+                              command=self._fill_grid)
+        grid_btn.pack(side="left", padx=(6, 0))
+        self._tooltip(
+            grid_btn,
+            "把最前面的若干窗口依次排进网格（一个格子一个窗口）。"
+            "格子绝不跨屏：每格按比例切出来后裁进它所在的那块屏，"
+            "装不下 App 最小尺寸的窗口保持原位并说明原因。"
+            "屏勾选与「跨屏铺满」共用。")
+        grid_row2 = ttk.Frame(grid)
+        grid_row2.pack(fill="x", pady=(1, 0))
+        ttk.Label(grid_row2, text="屏:").pack(side="left")
+        self._grid_checks_parent = grid_row2
+        self._grid_checks = []
+        self._grid_check_widgets = []
+        self._rebuild_grid_checks()
 
     def _on_gap_change(self):
         """窗口间距改动即存盘：吸附/排列函数每次都会重新读设置。"""
@@ -1109,14 +1253,22 @@ class App:
 
         热插拔会改变屏的数量与顺序，勾选框是构建期建的静态控件，
         这里按 device_path 迁移旧状态，再对新屏按「横屏勾、竖屏不勾」给默认值。
+
+        旧状态取自 _spread_check_paths（上次 rebuild 记下的 device_path 顺序）与
+        _spread_checks 的值：两者都由本函数成对写入，配不错。早先是拿
+        _last_monitors[i] 与 _spread_checks[i] 按下标配对，那两个列表分属两处
+        维护，只要有一处先被外部改掉（枚举顺序变化、换替身屏），配出来的就是
+        别的屏的值——横屏继承「竖屏不勾」、竖屏继承「横屏勾」，窗口就被发到
+        竖屏上压成一条。
         """
         parent = getattr(self, "_spread_checks_parent", None)
         if parent is None:
             return
         old = {}
+        paths = getattr(self, "_spread_check_paths", [])
         for i, var in getattr(self, "_spread_checks", []):
-            if i < len(self._last_monitors):
-                old[self._last_monitors[i].device_path] = bool(var.get())
+            if i < len(paths):
+                old[paths[i]] = bool(var.get())
         for child in list(getattr(self, "_spread_check_widgets", [])):
             try:
                 child.destroy()
@@ -1124,6 +1276,7 @@ class App:
                 pass
         self._spread_check_widgets = []
         self._spread_checks = []
+        self._spread_check_paths = []
         # 单屏时跨屏铺满等价于最大化，没有可选项，勾选区整个不显示
         if len(self.monitors) < 2:
             self._last_monitors = list(self.monitors)
@@ -1151,7 +1304,159 @@ class App:
                 "竖屏上的横屏应用会被压扁，默认不勾。")
             self._spread_checks.append((i, var))
             self._spread_check_widgets.append(cb)
+            self._spread_check_paths.append(m.device_path)
         self._last_monitors = list(self.monitors)
+
+    # ---------- 虚拟网格（跨屏 m×n 批排） ----------
+    def _rebuild_grid_checks(self):
+        """重建虚拟网格的屏勾选框：与跨屏铺满共用勾选，同步两边的状态。
+
+        不另建一套勾选框：两处选的是同一批「要参与的大桌面」的屏，各建一套
+        必然出现「这边勾了那边没勾」的错位。做法是销毁自己的控件，再把跨屏
+        铺满的勾选状态镜像过来（按 device_path 对，热插拔后仍对得上）。
+        """
+        parent = getattr(self, "_grid_checks_parent", None)
+        if parent is None:
+            return
+        # 跨屏铺满那套勾选框的状态按 device_path 取（下标会随屏数变）。
+        # 配对用 _spread_check_paths：它与 _spread_checks 由 _rebuild_spread_checks
+        # 成对写入，不依赖 _last_monitors 的顺序。
+        spread = {}
+        paths = getattr(self, "_spread_check_paths", [])
+        for i, var in getattr(self, "_spread_checks", []):
+            if i < len(paths):
+                spread[paths[i]] = bool(var.get())
+        for child in list(getattr(self, "_grid_check_widgets", [])):
+            try:
+                child.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        self._grid_check_widgets = []
+        self._grid_checks = []
+        # 单屏时网格就是这块屏上的 m×n，没有可选项，勾选区整个不显示
+        if len(self.monitors) < 2:
+            return
+        head = ttk.Label(parent, text="同铺满:")
+        head.pack(side="left", padx=(6, 2))
+        self._grid_check_widgets.append(head)
+        for i, m in enumerate(self.monitors):
+            portrait = m.height > m.width
+            val = spread.get(m.device_path, not portrait)
+            var = tk.BooleanVar(value=val)
+            label = (f"{i + 1}"
+                     + ("★" if m.is_primary else "")
+                     + ("竖" if portrait else "横")
+                     + f" {m.width}x{m.height}")
+            cb = ttk.Checkbutton(parent, text=label, variable=var,
+                                 command=self._on_grid_check)
+            cb.pack(side="left", padx=(1, 0))
+            self._tooltip(
+                cb,
+                f"这块屏加入虚拟桌面（{self._monitor_display_name(m)}）。"
+                "格子绝不跨屏：每格裁进它所在的那块屏。"
+                "竖屏上的横屏应用会被压扁，默认不勾。")
+            self._grid_checks.append((i, var))
+            self._grid_check_widgets.append(cb)
+
+    def _grid_indices(self):
+        """虚拟网格勾选的屏下标（按界面顺序）。"""
+        out = []
+        for i, var in getattr(self, "_grid_checks", []):
+            try:
+                if var.get():
+                    out.append(i)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def _on_grid_check(self):
+        """勾选/取消某块屏后即时提示，并同步到跨屏铺满那套勾选框。"""
+        idx = self._grid_indices()
+        # 同步：两处选的是同一批屏，改一边另一边要跟着变。按 device_path 对
+        # （下标会随屏数变）。grid 里没有对应下标的屏**不动它的勾选**——
+        # 旧写法拿 bool(None) 当「不勾」写回去，会把竖屏悄悄勾上（真机就
+        # 这么把窗口发到竖屏，横屏应用被压成一条）。
+        grid_by_idx = dict(self._grid_checks)
+        spread_by_path = {}
+        paths = getattr(self, "_spread_check_paths", [])
+        for i, var in getattr(self, "_spread_checks", []):
+            if i < len(paths):
+                spread_by_path[paths[i]] = var
+        for i, m in enumerate(self.monitors):
+            var = grid_by_idx.get(i)
+            target = spread_by_path.get(m.device_path)
+            if var is not None and target is not None:
+                target.set(bool(var.get()))
+        if not idx:
+            self.status_var.set("未选择任何屏（至少勾一块才能排网格）")
+            return
+        self.status_var.set(
+            "网格将使用 %d 块屏: %s" % (
+                len(idx),
+                "、".join(self._monitor_short_name(self.monitors[i])
+                          for i in idx)))
+
+    def _on_grid_dims_change(self):
+        """改自定义行列数时把布局切到「自定义」：否则预设会把这两个数盖掉。"""
+        if self.grid_layout_var.get() != GRID_LAYOUT_CUSTOM:
+            self.grid_layout_var.set(GRID_LAYOUT_CUSTOM)
+
+    def _on_grid_smart_toggle(self):
+        self.status_var.set(
+            "虚拟网格智能分配已" + ("开启" if self.grid_smart_var.get()
+                                   else "关闭"))
+
+    def _grid_layout_args(self):
+        """界面选择 → fill_grid 的 (cols, rows, layout) 参数。"""
+        label = self.grid_layout_var.get()
+        if label == GRID_LAYOUT_CUSTOM:
+            return (max(1, int(self.grid_cols_var.get() or 2)),
+                    max(1, int(self.grid_rows_var.get() or 2)), None)
+        if grid_plan.layout_by_label(label) is None:
+            # 显示值不认识（改了代码/配置文件）：按自定义行列处理，不静默
+            # 排成别的形状——用户看到的就是「选了这个排出来是那个」
+            import logging
+            logging.getLogger("ui.grid").warning(
+                "界面选了未知网格布局 %r，按自定义行列处理", label)
+            return (max(1, int(self.grid_cols_var.get() or 2)),
+                    max(1, int(self.grid_rows_var.get() or 2)), None)
+        return (None, None, label)
+
+    def _fill_grid(self):
+        """把窗口排进跨屏虚拟网格。
+
+        竖屏默认不勾（不适合竖屏的窗口不发过去），用户想用就自己勾。
+        排列后把后端说明如实显示：装不下的窗口、写入无效的窗口、被应用钳制
+        的窗口——「不准」的观感多半来自这三类物理限制，不说清用户只会
+        以为程序算错。
+        """
+        if self.topmost.get():
+            try:
+                self.root.attributes("-topmost", False)
+            except Exception:  # noqa: BLE001
+                pass
+        indices = self._grid_indices()
+        if not indices:
+            self.status_var.set("网格批排失败：请先勾选至少一块目标屏")
+            return
+        cols, rows, label = self._grid_layout_args()
+        try:
+            done = b.fill_grid(cols=cols, rows=rows, layout=label,
+                               smart=bool(self.grid_smart_var.get()),
+                               monitor_indices=indices)
+        except Exception as e:  # noqa: BLE001
+            self.status_var.set(f"网格批排失败：{e}")
+            return
+        if not done:
+            self.status_var.set("网格批排失败：没有可操作的窗口")
+            return
+        bm = self._quad_backend_mod()
+        notes = [n for n in (getattr(bm, "_last_grid_notes", None) or []) if n]
+        shape = label or "%d列×%d行" % (cols, rows)
+        head = f"已按 {shape} 排 {done} 个窗口（{len(indices)} 块屏）"
+        if notes:
+            head += "｜ " + "；".join(notes[:3])
+        self.status_var.set(head)
 
     def _move_to_selected_monitor(self):
         """把目标/活动窗口一次移动到下拉框选中的显示器。"""
@@ -1228,12 +1533,22 @@ class App:
         else:
             self.status_var.set("竖排失败：需要至少三个可操作窗口")
 
-    def _snap_four_quad(self):
+    def _snap_four_quad(self, force_auto=False):
         """按选择的左上/右上/左下/右下窗口做 2×2 四宫格排列。
 
        排列后四个窗口需要显示到最前面，故临时取消主窗口置顶（若开启），
        与并排 / 竖排一致，不沿用 _keep_front_after。
+
+       force_auto：一键模式（⌘⌥+Q / 托盘「2×2 排最近四窗」/「自动四窗」
+       按钮）——先把四个下拉复位成「自动」，即无视当前选择，直接取最
+       前面的四个窗口。选过的窗口可能已关闭，一键要的是「现在最靠前
+       的四个」，不是上次的选择。
         """
+        if force_auto:
+            for v in (self.quad_tl_var, self.quad_tr_var,
+                      self.quad_bl_var, self.quad_br_var):
+                v.set(AUTO_TARGET)
+            self._refresh_quad_grid()
         if self.topmost.get():
             try:
                 self.root.attributes("-topmost", False)
@@ -1251,6 +1566,28 @@ class App:
             return
         mon_idx = self._monitor_map.get(self.quad_mon_var.get())
         mon_label = self.quad_mon_var.get()
+        # 排列预演：用上次实测缓存的尺寸先只读算一遍，把「这一格会留多少
+        # 空白 / 谁按上次实测放不下」提前摆出来，用户确认再动窗口。没有
+        # 缓存（首次排列）时静默放行——预演退化成原来的行为，不添阻碍。
+        try:
+            fn = getattr(b, "quad_predict", None)
+            if fn is not None:
+                warns, _detail = fn(
+                    tl_hwnd=chosen[0], tr_hwnd=chosen[1],
+                    bl_hwnd=chosen[2], br_hwnd=chosen[3],
+                    monitor=mon_idx, smart=smart,
+                    split_x=self._quad_split_x.get(),
+                    split_y=self._quad_split_y.get())
+                if warns:
+                    body = "\n".join("· " + w for w in warns[:5])
+                    if not messagebox.askyesno(
+                            "排列预演",
+                            "按上次实测的窗口尺寸，这次排列预计：\n\n"
+                            + body + "\n\n仍要排列吗？"):
+                        self.status_var.set("已取消排列")
+                        return
+        except Exception:  # noqa: BLE001  预演只是预告，失败不该拦着排列
+            pass
         if b.snap_four_quad(tl_hwnd=chosen[0], tr_hwnd=chosen[1],
                             bl_hwnd=chosen[2], br_hwnd=chosen[3],
                             monitor=mon_idx,
@@ -2228,9 +2565,21 @@ class App:
         self._gs_frame.pack(fill="x", padx=6, pady=(4, 8), anchor="n")
 
         self._gs_text = tk.StringVar(value="")
+        # 摘要/全文两套显示：环境就绪时默认只显示一行摘要，把窗口工具、
+        # 四宫格这些核心操作留在首屏；未授权或单屏时才展开全文。
+        # _gs_brief_var / _gs_expanded 必须在这里建——_refresh_getting_started
+        # 在构造末尾就会读它们。
+        self._gs_brief_var = tk.StringVar(value="")
+        self._gs_expanded = False
         self._gs_label = ttk.Label(self._gs_frame, textvariable=self._gs_text,
                                    wraplength=720, justify="left")
-        self._gs_label.pack(fill="x", padx=8, pady=(4, 2), anchor="w")
+        self._gs_brief = ttk.Label(self._gs_frame,
+                                   textvariable=self._gs_brief_var,
+                                   wraplength=720, justify="left",
+                                   foreground="#666666", cursor="hand2")
+        self._gs_brief.bind("<Button-1>",
+                            lambda _e: self._toggle_getting_started())
+        self._gs_brief.pack(fill="x", padx=8, pady=(4, 2), anchor="w")
 
         btn_row = ttk.Frame(self._gs_frame)
         btn_row.pack(fill="x", padx=8, pady=(0, 6))
@@ -2240,6 +2589,16 @@ class App:
                    command=self._open_accessibility_settings).pack(side="left", padx=4)
         ttk.Button(btn_row, text="收起",
                    command=lambda: self._gs_frame.pack_forget()).pack(side="left", padx=4)
+
+    def _toggle_getting_started(self):
+        """在上手建议的摘要/全文之间切换（点摘要行即可展开）。"""
+        self._gs_expanded = not self._gs_expanded
+        if self._gs_expanded:
+            self._gs_brief.pack_forget()
+            self._gs_label.pack(fill="x", padx=8, pady=(4, 2), anchor="w")
+        else:
+            self._gs_label.pack_forget()
+            self._gs_brief.pack(fill="x", padx=8, pady=(4, 2), anchor="w")
 
         self._refresh_getting_started()
 
@@ -2264,6 +2623,13 @@ class App:
         else:
             lines.append("• 通用建议：F6 起别名 → F2 建情景 → F5 加规则；F3 拖拽吸附 + 撤销；F8 备份设置。")
         self._gs_text.set("\n".join(lines))
+        # 需要用户处理的状态（未授权 / 单屏）默认展开全文，其余只留摘要
+        needs_attention = (b.IS_MAC and not trusted) or n <= 1
+        brief = ("环境就绪：已授权、多屏。三步上手 F6 起别名 -> F2 建情景 "
+                 "-> F5 加规则（点此展开详情）")
+        if needs_attention:
+            brief = lines[0].split("：")[0] + "（点此展开详情）"
+        self._gs_brief_var.set(brief)
         try:
             if b.IS_MAC and not trusted:
                 color = "#a15c00"
@@ -2274,6 +2640,8 @@ class App:
             self._gs_label.configure(foreground=color)
         except Exception:  # noqa: BLE001
             pass
+        if needs_attention != self._gs_expanded:
+            self._toggle_getting_started()
 
     def _keep_front_after(self, cmd):
         """包装窗口操作：执行后重新置顶，避免被激活的目标窗口盖住。"""
@@ -2604,6 +2972,111 @@ class App:
                         variable=self.autostart_min_var,
                         command=self._toggle_autostart).pack(anchor="w", padx=4, pady=2)
 
+    def _build_keep_awake(self, parent):
+        """防休眠（复刻 LayoutKeeper 的 KeepAwake）：合盖/拔电/锁屏时继续干活。"""
+        f = ttk.LabelFrame(parent, text="防休眠")
+        f.pack(fill="x", padx=8, pady=6)
+        ttk.Label(
+            f,
+            text="让 Mac 在合盖、拔电源、锁屏时也不睡眠，挂下载 / 跑长任务 / 当看板时有用。"
+                 "前三档只持本程序的电源断言，退出即失效；最后一档会改系统级设置"
+                 "（需管理员授权，退出时自动还原）。",
+            justify="left", wraplength=620,
+        ).pack(anchor="w", padx=4, pady=(0, 4))
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(row, text="模式:").pack(side="left")
+        self.keep_awake_var = tk.StringVar(
+            value=settings.load().get("keep_awake_mode", keep_awake.DEFAULT_MODE))
+        # 候选顺序按 keep_awake.MODES（关闭 → 息屏 → 常亮 → 合盖）
+        self.keep_awake_cb = ttk.Combobox(
+            row, textvariable=self.keep_awake_var, state="readonly", width=16,
+            values=[keep_awake.MODE_LABELS[m] for m in keep_awake.MODES])
+        self.keep_awake_cb.pack(side="left", padx=4)
+        self.keep_awake_cb.bind(
+            "<<ComboboxSelected>>", lambda *_a: self._on_keep_awake_change())
+        self._keep_awake_status = tk.StringVar(value="")
+        ttk.Label(row, textvariable=self._keep_awake_status,
+                  foreground="#0a5", wraplength=420,
+                  justify="left").pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Button(row, text="立即生效", command=self._on_keep_awake_change,
+                   ).pack(side="right", padx=2)
+        ttk.Button(row, text="全部释放", command=self._keep_awake_release,
+                   ).pack(side="right", padx=2)
+        # 当前状态一行：持有哪些断言、是否合盖、系统级是否已改
+        self._keep_awake_detail = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self._keep_awake_detail, foreground="#555",
+                  wraplength=620, justify="left").pack(anchor="w", padx=4, pady=(0, 2))
+        self._refresh_keep_awake_status()
+
+    def _keep_awake_mode_from_label(self, label):
+        for m in keep_awake.MODES:
+            if keep_awake.MODE_LABELS[m] == label:
+                return m
+        return keep_awake.DEFAULT_MODE
+
+    def _on_keep_awake_change(self):
+        """切模式并立即套用（不等到重启）。"""
+        mode = self._keep_awake_mode_from_label(self.keep_awake_var.get())
+        # 合盖档会改系统级设置：先说明白再授权，别让用户被突如其来的授权框吓到
+        allow_prompt = True
+        if mode == keep_awake.MODE_CLAMSHELL:
+            self.show()
+            if not messagebox.askyesno(
+                    "合盖断电也不眠",
+                    "这一档会设置系统级「禁止睡眠」（pmset -a disablesleep 1），"
+                    "需要管理员授权。\n\n"
+                    "· 生效后：合盖、拔电源、拔显示器都不会睡\n"
+                    "· 退出本程序时会自动还原成原状\n"
+                    "· 发热与耗电会明显增加，长时间无人看管不建议开\n\n"
+                    "要继续吗？"):
+                # 用户取消：退回上一档，不静默改成 off
+                prev = settings.load().get("keep_awake_mode",
+                                           keep_awake.DEFAULT_MODE)
+                self.keep_awake_var.set(
+                    keep_awake.MODE_LABELS.get(prev, keep_awake.MODE_LABELS[keep_awake.DEFAULT_MODE]))
+                self._refresh_keep_awake_status()
+                return
+        ok, text, detail = b.keep_awake_apply(mode, allow_prompt=allow_prompt)
+        s = settings.load()
+        s["keep_awake_mode"] = mode
+        settings.save(s)
+        self._keep_awake_status.set(text)
+        self._refresh_keep_awake_status()
+        if not ok:
+            # 没生效要说清缺什么，不能只显示一个「失败」
+            self.status_var.set(text)
+
+    def _keep_awake_release(self):
+        b.keep_awake_release()
+        self.keep_awake_var.set(keep_awake.MODE_LABELS[keep_awake.MODE_OFF])
+        s = settings.load()
+        s["keep_awake_mode"] = keep_awake.MODE_OFF
+        settings.save(s)
+        self._refresh_keep_awake_status()
+        self.status_var.set("防休眠已全部释放")
+
+    def _refresh_keep_awake_status(self):
+        """刷新模式下拉与状态说明（含合盖 / 系统级是否已改）。"""
+        cur = settings.load().get("keep_awake_mode", keep_awake.DEFAULT_MODE)
+        if cur in keep_awake.MODES:
+            self.keep_awake_var.set(keep_awake.MODE_LABELS[cur])
+        snap = b.keep_awake_snapshot()
+        bits = []
+        held = snap.get("held") or []
+        bits.append("持断言 %d 个" % len(held) if held else "未持断言")
+        if keep_awake.has_lid() is False:
+            bits.append("本机无盖子")
+        else:
+            cl = snap.get("clamshell")
+            bits.append("合盖中" if cl else ("盖子合上状态:开" if cl is False else "盖子状态未知"))
+        if snap.get("sleep_disabled"):
+            bits.append("系统级禁止睡眠已开启" + ("（本程序设的）" if snap.get("owns_disablesleep") else "（非本程序设的，退出不会还原）"))
+        self._keep_awake_detail.set(" · ".join(bits))
+        if not self._keep_awake_status.get():
+            hint = keep_awake.MODE_HINTS.get(cur, "")
+            self._keep_awake_status.set(hint)
+
     def _toggle_autostart(self):
         try:
             autostart.set_enabled(self.autostart_var.get(),
@@ -2753,6 +3226,38 @@ class App:
         ttk.Checkbutton(f, text="并自动重应用上次使用的壁纸方案",
                         variable=self.auto_apply_watch,
                         command=self._save_watch_prefs).pack(anchor="w", padx=4, pady=2)
+        # 插拔归位（LayoutKeeper 的 reconnect restore）：拔/插副屏后把窗口送回
+        # 它原来所在的那块屏。原先「显示器变了」只有刷新列表 + 情景两条路，
+        # 窗口会被 macOS 顺手搬到主屏，用户得自己一个个拖回去。
+        self.rehome_var = tk.BooleanVar(
+            value=bool(settings.load().get("rehome_enabled", True)))
+        ttk.Checkbutton(f, text="显示器变化后把窗口送回原来所在的屏（插拔归位）",
+                        variable=self.rehome_var,
+                        command=self._save_rehome_prefs).pack(anchor="w", padx=4, pady=2)
+        self.rehome_mode_var = tk.StringVar(
+            value=settings.load().get("rehome_mode", rehome.DEFAULT_MODE))
+        mode_row = ttk.Frame(f)
+        mode_row.pack(fill="x", padx=4, pady=2)
+        ttk.Label(mode_row, text="归位方式:").pack(side="left")
+        ttk.OptionMenu(mode_row, self.rehome_mode_var,
+                       self.rehome_mode_var.get(),
+                       *self._rehome_mode_labels(),
+                       command=lambda *_a: self._save_rehome_prefs()).pack(
+                           side="left", padx=(4, 6))
+        # 按钮必须单独占一行：状态标签带 fill="x" + expand=True，同行的右侧按钮
+        # 会被挤到容器外——packer 不映射它们，用户看到的就是「按钮建了但点了
+        # 没反应」（本项目历史上多次出现同一类 packer 故障）。
+        self._rehome_status = tk.StringVar(value="")
+        ttk.Label(mode_row, textvariable=self._rehome_status,
+                  foreground="#0a5").pack(side="left", fill="x", expand=True)
+        btn_row = ttk.Frame(f)
+        btn_row.pack(fill="x", padx=4, pady=(0, 2))
+        ttk.Button(btn_row, text="立即归位",
+                   command=self._rehome_now).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="每屏设置…",
+                   command=self._rehome_per_monitor).pack(side="left", padx=2)
+        ttk.Button(btn_row, text="暂停 1 小时",
+                   command=self._rehome_pause).pack(side="left", padx=2)
         self._toggle_display_watch()
 
     def _save_watch_prefs(self):
@@ -2761,12 +3266,195 @@ class App:
         s["watch_auto_apply"] = self.auto_apply_watch.get()
         settings.save(s)
 
+    # ---------- 插拔归位（LayoutKeeper 的 reconnect restore）----------
+    _REHOME_MODE_TEXT = {"off": "关闭", "ask": "先询问", "auto": "自动"}
+
+    def _rehome_mode_labels(self):
+        """界面选项（含当前值，避免 OptionMenu 初始值不在列表里而不显示）。"""
+        vals = list(rehome.MODES)
+        cur = self.rehome_mode_var.get() if hasattr(self, "rehome_mode_var") else ""
+        if cur and cur not in vals:
+            vals.insert(0, cur)
+        return [self._REHOME_MODE_TEXT.get(v, v) for v in vals]
+
+    def _save_rehome_prefs(self, *_a):
+        s = settings.load()
+        s["rehome_enabled"] = bool(self.rehome_var.get())
+        s["rehome_mode"] = self.rehome_mode_var.get()
+        settings.save(s)
+
+    def _rehome_label_for(self, mode):
+        return self._REHOME_MODE_TEXT.get(mode, mode)
+
+    def _rehome_screen_names(self):
+        """当前屏的 {key: 显示名}，用于每屏设置列表。"""
+        out = {}
+        try:
+            ms = b.enum_monitors(force=True)
+        except Exception:  # noqa: BLE001
+            return out
+        for m in ms:
+            k = b.rehome_monitor_key(m)
+            if k:
+                out[k] = self._monitor_display_name(m) or m.device_name or k
+        return out
+
+    def _rehome_wanted(self):
+        """归位是否启用（开关 + 全局模式不是 off）。"""
+        return bool(getattr(self, "rehome_var", None)
+                    and self.rehome_var.get()
+                    and self.rehome_mode_var.get() != rehome.MODE_OFF)
+
+    def _rehome_capture_now(self):
+        """采集一次「每块屏上有哪些窗口」；失败静默（采集不该打断正常流程）。"""
+        try:
+            b.rehome_capture(list(self.monitors or []), b.list_target_windows())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _rehome_on_display_change(self, removed_keys, added_keys):
+        """显示器指纹变化后的归位处理（由 _handle_display_change 调用）。
+
+        LayoutKeeper 的 ReconnectWatch 用「屏 key 与上次稳定态不同」触发；这里
+        同样：拔掉的屏先把采集记录冻结（它上面的窗口此刻还在主屏上，再不记就
+        晚了），插回的屏算出归位计划，再按策略机决定自动搬、先问、还是不动。
+        """
+        if not getattr(self, "rehome_var", None) or not self.rehome_var.get():
+            return
+        try:
+            if removed_keys:
+                n = b.rehome_freeze(list(self.monitors or []), removed_keys)
+                if n:
+                    self._rehome_status.set(
+                        f"已记录 {n} 块拔出屏的窗口（插回时归位）")
+            rows = b.rehome_plan(list(self.monitors or []), added_keys or removed_keys)
+        except Exception as e:  # noqa: BLE001
+            self._rehome_status.set(f"归位准备失败：{e}")
+            return
+        if not rows:
+            return
+        text = b.rehome_summary(rows)
+        # 每屏模式优先于全局（LayoutKeeper 的 ReconnectPolicy 语义）：用户在
+        # 「每屏设置」里给某块屏选了「永不归位」，就一直生效。取计划里第一块
+        # 有窗口的屏当代表——一次插拔通常只动一块屏，多块屏时逐块判更准。
+        modes = b.rehome_per_monitor_modes()
+        per_key = None
+        for r in rows:
+            if r.get("wins"):
+                per_key = r.get("key")
+                break
+        action = b.rehome_policy_action(
+            self.rehome_mode_var.get(),
+            modes.get(per_key) if per_key else None,
+            b.rehome_paused_until())
+        if action == "off":
+            self._rehome_status.set(f"归位已关闭（{text}）")
+            return
+        if action == "paused":
+            self._rehome_status.set(f"归位已暂停（{text}）")
+            return
+        if action == "ask":
+            self.show()
+            if not messagebox.askyesno(
+                    "插拔归位",
+                    f"检测到显示器变化，可以{text}。\n\n现在归位吗？"
+                    "（选「否」仅这次不搬；可在「每屏设置」里改为永不归位）"):
+                self._rehome_status.set(f"已跳过本次归位（{text}）")
+                return
+        self._rehome_run(rows)
+
+    def _rehome_run(self, rows):
+        """执行归位计划并如实报告。"""
+        try:
+            ok, detail = b.rehome_apply(
+                rows, b.set_window_rect, activate=False)
+        except Exception as e:  # noqa: BLE001
+            self._rehome_status.set(f"归位失败：{e}")
+            return
+        remapped = [d for d in detail if d.get("where") in ("remapped", "fallback")]
+        text = b.rehome_summary(rows)
+        msg = f"归位完成：成功 {ok} 个"
+        if remapped:
+            msg += f"；其中 {len(remapped)} 个的原屏已不在，已按比例落到现存屏"
+        failed = [d for d in detail if not d.get("ok")]
+        if failed:
+            msg += f"；失败 {len(failed)} 个（{failed[0].get('err', '')[:40]}）"
+        self._rehome_status.set(f"{msg}（{text}）")
+        # 归位成功后清掉冻结记录：下次拔屏重新采集，避免拿着几小时前的旧记录
+        # 反复搬窗。
+        b.rehome_clear_frozen([r.get("key") for r in rows])
+        self.refresh_monitors()
+
+    def _rehome_now(self):
+        """手动「立即归位」：按当前记录把窗口送回各自的原屏。"""
+        rows = b.rehome_plan(list(self.monitors or []), None)
+        if not rows:
+            messagebox.showinfo("提示", "当前没有可归位的记录（先正常使用一会儿，"
+                                        "程序会记下每块屏上有哪些窗口）")
+            return
+        self._rehome_run(rows)
+
+    def _rehome_pause(self):
+        b.rehome_pause(60)
+        self._rehome_status.set("归位已暂停 1 小时")
+
+    def _rehome_per_monitor(self):
+        """每屏归位模式（LayoutKeeper 的 MonitorPreferences.restore）。"""
+        win = tk.Toplevel(self.root)
+        win.title("每屏归位设置")
+        win.transient(self.root)
+        names = self._rehome_screen_names()
+        known = b.rehome_known_screens()
+        modes = b.rehome_per_monitor_modes()
+        rows = []
+        for k in sorted(set(list(names.keys()) + list(known.keys()))):
+            info = known.get(k) or {}
+            label = names.get(k) or info.get("name") or k
+            res = info.get("res", "?")
+            rows.append((k, f"{label}（{res}）", info.get("frozen", False)))
+        ttk.Label(win, text="给某块屏单独选归位方式（优先于全局设置）：",
+                  justify="left").pack(anchor="w", padx=8, pady=(8, 4))
+        box = ttk.Frame(win)
+        box.pack(fill="both", expand=True, padx=8, pady=4)
+        vars_ = {}
+        for k, label, frozen in rows:
+            r = ttk.Frame(box)
+            r.pack(fill="x", pady=2)
+            ttk.Label(r, text=label, width=34).pack(side="left")
+            v = tk.StringVar(value=modes.get(k, "跟随全局"))
+            cb = ttk.Combobox(r, textvariable=v, width=10, state="readonly",
+                              values=["跟随全局", "关闭", "先询问", "自动"])
+            cb.pack(side="left", padx=4)
+            vars_[k] = v
+            if frozen:
+                ttk.Label(r, text="有冻结记录", foreground="#a15c00").pack(side="left")
+        ttk.Button(win, text="保存", command=lambda: self._rehome_save_modes(
+            vars_, win)).pack(pady=8)
+
+    def _rehome_save_modes(self, vars_, win):
+        n = 0
+        for k, v in vars_.items():
+            want = v.get()
+            mode = None if want == "跟随全局" else {
+                "关闭": rehome.MODE_OFF, "先询问": rehome.MODE_ASK,
+                "自动": rehome.MODE_AUTO}.get(want)
+            if b.rehome_set_mode(k, mode):
+                n += 1
+        win.destroy()
+        self._rehome_status.set(f"已保存 {n} 块屏的归位方式")
+
     def _toggle_display_watch(self):
         self._save_watch_prefs()
         if self.watch_enabled.get():
             if self._display_poll_id is None:
                 self._last_mon_sig = self._monitor_signature()
                 self._display_poll_id = self.root.after(1500, self._poll_display)
+            # 插拔归位的持续采集：与显示器轮询同一开关。LayoutKeeper 是
+            # 「外接屏插着且稳定时就一直记录」，这里同样持续记，拔屏那一刻
+            # 才有东西可冻结（只在拔屏时才采集就晚了——屏一拔，它上面的
+            # 窗口已经被 macOS 搬到主屏，再也分不出原来在哪块屏）。
+            if self._rehome_cap_id is None and self._rehome_wanted():
+                self._rehome_cap_id = self.root.after(5000, self._poll_rehome_capture)
         else:
             if self._display_poll_id is not None:
                 try:
@@ -2774,6 +3462,23 @@ class App:
                 except Exception:  # noqa: BLE001
                     pass
                 self._display_poll_id = None
+            if self._rehome_cap_id is not None:
+                try:
+                    self.root.after_cancel(self._rehome_cap_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._rehome_cap_id = None
+
+    def _poll_rehome_capture(self):
+        """每 5s 采集一次「每块屏上有哪些窗口」（归位的依据）。"""
+        self._rehome_cap_id = None
+        try:
+            if self._rehome_wanted():
+                b.rehome_capture(list(self.monitors or []), b.list_target_windows())
+        except Exception:  # noqa: BLE001
+            pass
+        if self._rehome_wanted():
+            self._rehome_cap_id = self.root.after(5000, self._poll_rehome_capture)
 
     def _monitor_signature(self):
         """生成当前显示器配置的指纹，用于检测热插拔/重排。"""
@@ -2786,7 +3491,10 @@ class App:
 
     def _poll_display(self):
         """主线程轮询：显示器配置变化则刷新（不依赖后台 CFRunLoop，避免 GIL 崩溃）。"""
-        if not self.watch_enabled.get():
+        # 两个开关任一开着都要继续轮询：「自动刷新列表」管 UI 刷新，「插拔归位」
+        # 管窗口归位。早先这里只在 watch_enabled 开着时跑，用户关掉刷新列表却想
+        # 要归位时，轮询整体停摆，归位永远不会触发（点了没效果）。
+        if not (self.watch_enabled.get() or self._rehome_wanted()):
             self._display_poll_id = None
             return
         try:
@@ -2807,13 +3515,13 @@ class App:
                     2500, self._apply_display_change_if_settled)
         except Exception:  # noqa: BLE001
             pass
-        if self.watch_enabled.get():
+        if self.watch_enabled.get() or self._rehome_wanted():
             self._display_poll_id = self.root.after(1500, self._poll_display)
 
     def _apply_display_change_if_settled(self):
         """延迟到期且签名未再变化时才处理显示器变化（等待配置稳定）。"""
         self._display_settle_id = None
-        if not self.watch_enabled.get():
+        if not (self.watch_enabled.get() or self._rehome_wanted()):
             self._pending_mon_sig = None
             return
         try:
@@ -2834,8 +3542,31 @@ class App:
 
         优先级：① 匹配到且开启自动应用的情景 → 套用；② 旧的"重应用上次壁纸方案"；
         ③ 仅刷新列表。
+
+        另外单独走插拔归位（LayoutKeeper 的 reconnect restore）：把窗口送回
+        它原来所在的屏。与情景是两件事——情景换的是壁纸 + 整套布局，归位只动
+        「原本在拔掉/插回那块屏上的窗口」，不动其它屏。
         """
+        # 指纹必须**先**算：refresh_monitors() 会把 self.monitors 换成新枚举结果，
+        # 拔掉的那块屏从列表里消失，再算就算不出「拔了哪块」。
+        # 另外不能拿 self._last_mon_sig 当 old：_poll_display 在检测到变化的那一
+        # 刻就把它改成了新签名（为了重排等待），到这里两者已经相等，diff 永远是空
+        # ——归位因此从未触发过。用 _pending_mon_sig（= 检测到的那次签名）才拿得到
+        # 真正的前一态；极少数路径它为空时退回 _last_mon_sig。
+        old_sig = self._pending_mon_sig or self._last_mon_sig
+        # 读完后就地清掉：若本次又检测到新的插拔，_poll_display 会重新写入；
+        # 不清的话下一次 _handle_display_change 会拿着同一个旧签名再 diff 一次。
+        self._pending_mon_sig = None
         self.refresh_monitors()
+        try:
+            removed, added = b.rehome_fingerprint_diff(
+                old_sig, b.rehome_fingerprint(self.monitors))
+        except Exception:  # noqa: BLE001
+            removed, added = [], []
+        # 采集要在 refresh 之后做：self.monitors 刚更新，窗口也还在原处
+        self._rehome_capture_now()
+        if removed or added:
+            self._rehome_on_display_change(removed, added)
         try:
             self._refresh_scenario_ui()
         except Exception:  # noqa: BLE001
@@ -3707,6 +4438,11 @@ class App:
             return
         if cmd == "refresh":
             self.refresh_monitors()
+        elif cmd == "snap_quad":
+            # 托盘「2×2 排最近四窗」：一键模式取最前面四个窗口。托盘发这
+            # 条命令时刻意不激活主窗——激活会把主窗盖到刚排好的四个窗口
+            # 上面，与「排完窗口要到最前面」直接矛盾。
+            self._snap_four_quad(force_auto=True)
         elif cmd == "apply_layout":
             self._apply_last_layout()
         elif cmd == "open":
@@ -3773,6 +4509,9 @@ class App:
         self._draw_layout()
         # 同步并排/竖排的显示器下拉选项
         self._refresh_monitor_choices()
+        # 虚拟网格的屏勾选框跟着重建（_refresh_monitor_choices 里已重建跨屏
+        # 铺满那套，这里镜像它的最新状态——两处选的是同一批屏）
+        self._rebuild_grid_checks()
         # 显示器数量变化后，同步「上手建议」卡片的屏数提示
         self._refresh_getting_started()
 
@@ -4158,7 +4897,8 @@ class App:
                 f"{sym}+Z : 撤销上一次移动 · {sym}+B : 回到上次摆放位\n"
                 f"{sym}+S : 暂存窗口 · {sym}+D : 取回最早暂存的窗口\n"
                 f"{sym}+7/8/9 : 三分屏（左/中/右）\n"
-                f"{sym}+Shift+1/2/3/4 : 四象限（左上/右上/左下/右下）")
+                f"{sym}+Shift+1/2/3/4 : 四象限（左上/右上/左下/右下）\n"
+                f"{sym}+Q : 一键 2×2 排列最近四个窗口")
 
     def _current_hk_mods(self):
         """把用户选择的修饰键组合映射为 backend 的 MOD_* 位掩码。"""
@@ -4188,12 +4928,57 @@ class App:
             self.hk = None
             self._toggle_hk()
 
+    def _register_hotkeys(self):
+        """把全部快捷键组合登记到 self.hk（已构造好的管理器）。"""
+        mods = self._current_hk_mods()
+        dk = b.DIGIT_KEYS
+        self.hk.register(mods, VK_RIGHT,
+                         lambda: b.move_active_to_next_monitor(1, use_pinned=False))
+        self.hk.register(mods, VK_LEFT,
+                         lambda: b.move_active_to_next_monitor(-1, use_pinned=False))
+        self.hk.register(mods, dk[1],
+                         lambda: b.snap_active("left", use_pinned=False))
+        self.hk.register(mods, dk[2],
+                         lambda: b.snap_active("right", use_pinned=False))
+        self.hk.register(mods, dk[3],
+                         lambda: b.snap_active("top", use_pinned=False))
+        self.hk.register(mods, dk[4],
+                         lambda: b.snap_active("bottom", use_pinned=False))
+        self.hk.register(mods, dk[5],
+                         lambda: b.snap_active("maximize", use_pinned=False))
+        self.hk.register(mods, dk[6],
+                         lambda: b.snap_active("center", use_pinned=False))
+        self.hk.register(mods, dk[7],
+                         lambda: b.snap_active("left-third", use_pinned=False))
+        self.hk.register(mods, dk[8],
+                         lambda: b.snap_active("middle-third", use_pinned=False))
+        self.hk.register(mods, dk[9],
+                         lambda: b.snap_active("right-third", use_pinned=False))
+        self.hk.register(mods, VK_Z, lambda: self._undo_move())
+        self.hk.register(mods, getattr(b, "VK_B", 0),
+                         lambda: self._back_to_active_arranged())
+        self.hk.register(mods, getattr(b, "VK_S", 0),
+                         lambda: self._stash_active_shortcut())
+        self.hk.register(mods, getattr(b, "VK_D", 0),
+                         lambda: self._unstash_active_shortcut())
+        for vk, zone in ((dk[1], "quad-tl"), (dk[2], "quad-tr"),
+                         (dk[3], "quad-bl"), (dk[4], "quad-br")):
+            self.hk.register(mods | b.MOD_SHIFT, vk,
+                             lambda z=zone: b.snap_active(z, use_pinned=False))
+        self.hk.register(mods, getattr(b, "VK_Q", 0),
+                         lambda: self.root.after(
+                             0, lambda: self._snap_four_quad(force_auto=True)))
     def _toggle_hk(self, quiet=False):
+        import logging as _lg
+        _log = _lg.getLogger("ui.hk")
+        _log.info("HK-enter: enabled=%s hk=%s",
+                  self.hk_enabled.get(), self.hk)
         if self.hk_enabled.get():
             if self.hk is None:
                 try:
                     self.hk = b.HotkeyManager()
                 except Exception as e:  # noqa: BLE001
+                    _log.warning("HK-construct-failed: %r", e)
                     if quiet:
                         # 启动自动恢复失败：保留勾选状态，下次启动再试
                         self.status_var.set(f"全局快捷键恢复失败：{e}")
@@ -4201,48 +4986,18 @@ class App:
                         messagebox.showerror("错误", f"快捷键初始化失败:\n{e}")
                         self.hk_enabled.set(False)
                     return
-                # 快捷键语义是"作用于当前活动窗口"，故忽略界面固定的目标
-                mods = self._current_hk_mods()
-                dk = b.DIGIT_KEYS
-                self.hk.register(mods, VK_RIGHT,
-                                 lambda: b.move_active_to_next_monitor(1, use_pinned=False))
-                self.hk.register(mods, VK_LEFT,
-                                 lambda: b.move_active_to_next_monitor(-1, use_pinned=False))
-                self.hk.register(mods, dk[1],
-                                 lambda: b.snap_active("left", use_pinned=False))
-                self.hk.register(mods, dk[2],
-                                 lambda: b.snap_active("right", use_pinned=False))
-                self.hk.register(mods, dk[3],
-                                 lambda: b.snap_active("top", use_pinned=False))
-                self.hk.register(mods, dk[4],
-                                 lambda: b.snap_active("bottom", use_pinned=False))
-                self.hk.register(mods, dk[5],
-                                 lambda: b.snap_active("maximize", use_pinned=False))
-                self.hk.register(mods, dk[6],
-                                 lambda: b.snap_active("center", use_pinned=False))
-                self.hk.register(mods, dk[7],
-                                 lambda: b.snap_active("left-third", use_pinned=False))
-                self.hk.register(mods, dk[8],
-                                 lambda: b.snap_active("middle-third", use_pinned=False))
-                self.hk.register(mods, dk[9],
-                                 lambda: b.snap_active("right-third", use_pinned=False))
-                # F7：⌘⌥+Z 撤销上一次窗口移动
-                self.hk.register(mods, VK_Z,
-                                 lambda: self._undo_move())
-                # ⌘⌥+B：活动窗口回到上次被程序摆好的位置（snap back）
-                self.hk.register(mods, getattr(b, "VK_B", 0),
-                                 lambda: self._back_to_active_arranged())
-                # ⌘⌥+S：暂存活动窗口；⌘⌥+D：取回最早暂存的窗口
-                self.hk.register(mods, getattr(b, "VK_S", 0),
-                                 lambda: self._stash_active_shortcut())
-                self.hk.register(mods, getattr(b, "VK_D", 0),
-                                 lambda: self._unstash_active_shortcut())
-                # 四象限：修饰键+Shift+数字 1-4（左上/右上/左下/右下）
-                for vk, zone in ((dk[1], "quad-tl"), (dk[2], "quad-tr"),
-                                 (dk[3], "quad-bl"), (dk[4], "quad-br")):
-                    self.hk.register(mods | b.MOD_SHIFT, vk,
-                                     lambda z=zone: b.snap_active(z, use_pinned=False))
+                try:
+                    self._register_hotkeys()
+                except Exception as _e:  # noqa: BLE001
+                    import traceback
+                    _log.warning("HK-register-failed: %r %s", _e,
+                                 traceback.format_exc())
+                    raise
+                _log.info("HK-registered: %d 个组合", len(self.hk.hotkeys))
             self.hk.start()
+            _log.info("HK-after-start: running=%s tap=%s",
+                      getattr(self.hk, "_running", None),
+                      bool(getattr(self.hk, "_tap", None)))
         else:
             if self.hk:
                 self.hk.stop()
@@ -4255,7 +5010,6 @@ class App:
     def show(self):
         self.root.deiconify()
         self.root.lift()
-        self.root.focus_force()
         # 从托盘唤醒时刷新一次窗口列表，避免操作已关闭的窗口
         self._refresh_targets()
         self._apply_topmost()
@@ -4286,4 +5040,14 @@ class App:
             self._display_settle_id = None
         if self.hk:
             self.hk.stop()
+        # 告诉外层守护脚本「这是用户主动退出，不要重启」：守护靠退出码区分
+        # 正常退出与崩溃，但 abort 类崩溃的退出码不可预期，用标记文件更可靠。
+        try:
+            import os as _os
+            _flag = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                  ".no_restart")
+            with open(_flag, "w", encoding="utf-8") as _f:
+                _f.write("1")
+        except Exception:  # noqa: BLE001
+            pass
         self.root.destroy()

@@ -14,6 +14,7 @@ Fatal Python error: PyEval_RestoreThread: GIL is released。
 """
 import ctypes
 import ctypes.util
+import logging
 import queue
 import threading
 
@@ -74,6 +75,8 @@ VK_B = 11
 VK_S = 1
 # D 键（取回暂存窗口），macOS CGKeycode
 VK_D = 2
+# Q 键（一键 2×2 排最近四个窗口），macOS CGKeycode
+VK_Q = 12
 
 # 数字键 1-9 的 macOS 虚拟键码（CGKeycode）。注意它与 ASCII 不同：
 # 例如 "1" 的 CGKeycode 是 18 而非 ord("1")=49，用 ord() 注册会导致快捷键
@@ -169,40 +172,67 @@ class HotkeyManager:
         if self._running or not self.hotkeys or not _HAS_QUARTZ:
             if not _HAS_QUARTZ:
                 print("[hotkeys_mac] 未找到 Quartz 框架，全局快捷键不可用")
+                logging.getLogger(__name__).warning(
+                    "热键启动失败：未找到 Quartz 框架")
+            elif not self.hotkeys:
+                print("[hotkeys_mac] 没有已注册的快捷键，跳过启动")
+                logging.getLogger(__name__).warning("热键启动失败：没有已注册快捷键")
             return
         self._running = True
         self._queue = queue.Queue()
-        # 关键：事件 tap 挂到「主线程」CFRunLoop，由 Tk 的 mainloop 驱动。
-        # 绝不能再开后台线程跑 CFRunLoopRun —— 两个 CFRunLoop（Tk 的在
-        # 主线程、我们的在后台线程）同时跑会打架，在 Python 3.13/3.14 上会
-        # 触发 Fatal Python error: PyEval_RestoreThread: GIL is released。
-        if not self._setup_on_main_runloop():
+        # 事件 tap 建在专用线程自己的 CFRunLoop 上。早期实现挂在主线程
+        # runloop，实测在 Python 3.14 + Tk mainloop 下会周期性崩溃：
+        # Fatal Python error: PyEval_RestoreThread: GIL is released，
+        # 现场停在 tkinter mainloop 并伴随 IMKCFRunLoopWakeUpReliable 报错
+        # —— Tk 的输入法 mach port 与我们的 source 在同一 runloop 抢唤醒。
+        # 回调只做「入队 + 返回 event」，不碰 tkinter，因此放后台线程安全。
+        if not self._setup_tap_runloop():
+            logging.getLogger(__name__).warning("热键启动失败：事件 tap 未建立")
             return
-        # 耗时动作（osascript）仍交给普通工作线程，但它只是普通 Python 线程，
-        # 不跑 CFRunLoop、不触碰 tkinter，是安全的。
+        # 耗时动作（osascript）交给普通工作线程执行，它不跑 CFRunLoop。
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
+        logging.getLogger(__name__).info(
+            "热键已启动：%d 个组合（tap=%s, source=%s, 专用线程 runloop）",
+            len(self.hotkeys), bool(self._tap), bool(self._src))
 
-    def _setup_on_main_runloop(self):
-        """在主线程创建事件 tap，并把 source 加到主线程 CFRunLoop。"""
-        self._cb = CGEventTapCallBack(self._handler)
-        self._tap = _quartz.CGEventTapCreate(
-            kCGSessionEventTap, kCGHeadInsertEventTap,
-            kCGEventTapOptionDefault, kCGEventMaskKeyDown,
-            self._cb, None,
-        )
-        if not self._tap:
-            print("[hotkeys_mac] 创建事件监听失败（需要辅助功能权限）")
+    def _setup_tap_runloop(self):
+        """在专用线程里创建事件 tap，并让该线程跑自己的 CFRunLoop。"""
+        ready = threading.Event()
+        failed = threading.Event()
+
+        def _run():
+            self._cb = CGEventTapCallBack(self._handler)
+            self._tap = _quartz.CGEventTapCreate(
+                kCGSessionEventTap, kCGHeadInsertEventTap,
+                kCGEventTapOptionDefault, kCGEventMaskKeyDown,
+                self._cb, None,
+            )
+            if not self._tap:
+                print("[hotkeys_mac] 创建事件监听失败（需要辅助功能权限）")
+                failed.set()
+                ready.set()
+                return
+            self._src = _quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
+            if not self._src:
+                print("[hotkeys_mac] 创建 runloop source 失败")
+                self._tap = None
+                failed.set()
+                ready.set()
+                return
+            # 必须在**该线程**取当前 runloop：CFRunLoopGetCurrent 是线程局部的
+            self._rl = _quartz.CFRunLoopGetCurrent()
+            _quartz.CFRunLoopAddSource(self._rl, self._src, _COMMON_MODES)
+            ready.set()
+            # 阻塞在本线程的 runloop 上派发事件；stop() 里 CFRunLoopStop 唤醒
+            _quartz.CFRunLoopRun()
+
+        self._tap_thread = threading.Thread(target=_run, daemon=True)
+        self._tap_thread.start()
+        ready.wait(5)
+        if failed.is_set() or not self._tap or not self._src:
             self._running = False
             return False
-        self._src = _quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
-        if not self._src:
-            print("[hotkeys_mac] 创建 runloop source 失败")
-            self._running = False
-            self._tap = None
-            return False
-        self._rl = _quartz.CFRunLoopGetMain()
-        _quartz.CFRunLoopAddSource(self._rl, self._src, _COMMON_MODES)
         return True
 
     def _handler(self, proxy, etype, event, refcon):
@@ -222,7 +252,6 @@ class HotkeyManager:
                 except Exception:  # noqa: BLE001
                     pass
             return event
-
         if etype != kCGEventKeyDown:
             return event
         code = _quartz.CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
@@ -277,10 +306,16 @@ class HotkeyManager:
                 _quartz.CGEventTapEnable(self._tap, False)
             except Exception:  # noqa: BLE001
                 pass
-        # 从主线程 runloop 摘掉 source，否则停止后仍会收到按键
+        # 从 runloop 摘掉 source，否则停止后仍会收到按键
         if self._rl and self._src:
             try:
                 _quartz.CFRunLoopRemoveSource(self._rl, self._src, _COMMON_MODES)
+            except Exception:  # noqa: BLE001
+                pass
+        # 停掉专用线程的 runloop，否则该线程一直阻塞
+        if self._rl:
+            try:
+                _quartz.CFRunLoopStop(self._rl)
             except Exception:  # noqa: BLE001
                 pass
         # 唤醒工作线程退出（否则它会一直阻塞在 get）

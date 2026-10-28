@@ -14,10 +14,12 @@ ctypes.windll，在 macOS 上无法导入。
 """
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import grid_plan  # noqa: E402
 import windows_mac as wm  # noqa: E402
 
 
@@ -59,8 +61,19 @@ def _run(wins, mons, **kw):
     for attr in ("list_target_windows", "monitors", "_find_window",
                  "get_window_rect", "set_window_rect", "push_undo",
                  "_osa", "_probe_min_size", "list_windows_front_to_back",
-                 "_readback_rect", "_gap_settings"):
+                 "_readback_rect", "_gap_settings", "_quad_cache_file"):
         prev[attr] = getattr(wm, attr)
+    # 尺寸缓存是模块级全局，且正式排布现在会顺带写盘 quad_cache.json：
+    # 缓存按例隔离（清空 + 跑完还原），写盘路径指到临时文件，否则测试会
+    # 把 quad_cache.json 落进仓库目录、上一下的缓存漏进下一例
+    prev_min_cache = dict(wm._QUAD_MIN_CACHE)
+    prev_max_cache = dict(wm._QUAD_MAX_CACHE)
+    wm._QUAD_MIN_CACHE.clear()
+    wm._QUAD_MAX_CACHE.clear()
+    _cache_fd, _cache_path = tempfile.mkstemp(suffix=".json")
+    os.close(_cache_fd)
+    wm._quad_cache_file = lambda: _cache_path
+    predict = kw.pop("predict", None)
 
     class _Mons:
         def enum_monitors(self):
@@ -120,18 +133,62 @@ def _run(wins, mons, **kw):
                 win["x"], win["y"], win["w"], win["h"] = got
         return True
 
+    if predict is not None:
+        # 预演夹具：注入「上次实测」缓存；set_window_rect / _probe_min_size
+        # 换成抛异常——预演必须一个窗口都不动、一次探测都不做（探测要写
+        # AppleScript 缩窗）
+        wm._QUAD_MIN_CACHE.update(predict.get("mins") or {})
+        wm._QUAD_MAX_CACHE.update(predict.get("maxes") or {})
+
+        def _boom(*a, **k):
+            raise AssertionError("预演不得写入 / 探测窗口")
+
+        wm.set_window_rect = _boom
+        wm._probe_min_size = _boom
+        try:
+            warns, detail = wm.quad_predict(**kw)
+        finally:
+            for k, v in prev.items():
+                setattr(wm, k, v)
+            wm._QUAD_MIN_CACHE.clear()
+            wm._QUAD_MIN_CACHE.update(prev_min_cache)
+            wm._QUAD_MAX_CACHE.clear()
+            wm._QUAD_MAX_CACHE.update(prev_max_cache)
+        return warns, detail, placed
+
     wm.set_window_rect = _place
     try:
         ok = wm.snap_four_quad(**kw)
     finally:
         for k, v in prev.items():
             setattr(wm, k, v)
+        wm._QUAD_MIN_CACHE.clear()
+        wm._QUAD_MIN_CACHE.update(prev_min_cache)
+        wm._QUAD_MAX_CACHE.clear()
+        wm._QUAD_MAX_CACHE.update(prev_max_cache)
     return ok, placed
 
 
 class TestSnapFourQuad(unittest.TestCase):
     WINS = [_win("A::1", x=10, y=20), _win("B::1", x=2000, y=30),
             _win("C::1", x=10, y=2000), _win("D::1", x=3000, y=20)]
+
+    def test_auto_skips_ax_unreachable_owners(self):
+        """自动补足要跳过 AX 够不着的 owner（wine 等）。
+
+        真机日志见过连续 8 次「读取窗口几何失败: 'wine::' -> ''」：wine 跑的是
+        Windows 程序，System Events 拿不到它的 window，每一次读写几何都失败，
+        整轮四宫格被拖到 20 秒以上还排不齐。这类窗口 CG 层可见（会被枚举到），
+        所以必须在选窗阶段就滤掉，不能等写入失败。
+        """
+        wins = [_win("wine::1", x=10, y=20), _win("A::1", x=10, y=20),
+                _win("B::1", x=2000, y=30), _win("C::1", x=10, y=2000),
+                _win("D::1", x=3000, y=20)]
+        ok, placed = _run(wins, [_Mon()])
+        self.assertTrue(ok)
+        owners = [h.split("::")[0] for h, *_ in placed]
+        self.assertNotIn("wine", owners)
+        self.assertEqual(len(placed), 4)
 
     def test_auto_four_windows_fill_2x2(self):
         """四个格子必须严格铺满工作区（2x2 四等分），窗口落在各自格子里。"""
@@ -749,6 +806,106 @@ class TestSnapFourQuad(unittest.TestCase):
             dy = min(p[1] + p[3], q[1] + q[3]) - max(p[1], q[1])
             self.assertEqual(max(0, dx) * max(0, dy), 0)
 
+    def test_both_columns_capped_split_follows_caps(self):
+        """两列都被 App 卡上限时，格子按上限贴边分配，不把窗口留在空白里。
+
+        真机现场：系统设置最大窗宽 754、iPhone镜像最大窗宽 242，工作区
+        1512x863。旧实现先按左列 cap 切（1264/248），系统设置实际只占 754，
+        右列被让成 248 宽装 242 的窗口——左列留下 510px 空白；双上限修复
+        后又把右窗推到屏幕右缘，516px 缝留在两个窗口之间。最终语义：左列
+        是限制因素时左格=左窗上限，右窗在格内贴左界锚定，余量落屏幕外缘。
+        """
+        ww, wh = 1920, 1080
+        mon = _Mon(left=0, top=0, width=ww, height=wh)
+        wins = [_win("A::1", x=0, y=33), _win("B::1", x=1270, y=33)]
+        readback = {"A::1": (0, 33, 754, 536), "B::1": (1270, 33, 242, 535)}
+        ok, placed = _run(wins, [mon], tl_hwnd="A::1", tr_hwnd="B::1",
+                          readback=readback)
+        self.assertTrue(ok)
+        cells = wm._last_quad_boxes
+        # 左格 = 左窗上限 754 + 半间距 6 = 760；右窗在格内贴左界，余量落右缘
+        self.assertEqual(cells[0][0], 0)
+        self.assertEqual(cells[0][2], 760)
+        self.assertEqual(cells[1][0], 760)
+        self.assertEqual(cells[1][2], ww - 760)
+        # 右上窗口锚定自己格子的左界（紧贴左上窗口），不贴屏幕右缘
+        last_b = [p for p in placed if p[0] == "B::1"][-1]
+        self.assertEqual(last_b[1], 766)   # 760 + 半间距，贴左邻居
+        self.assertEqual(last_b[3], 242)
+
+    def test_cap_confirmation_does_not_rewrite_window(self):
+        """上限确认用只读轮询，不为读稳定值给同一目标补写。
+
+        真机 AppleScript 每次写入上百毫秒，钳制窗口被反复写用户能直接看到
+        窗口抖。上限确认（clamped）只能读不能写；每遍的写入次数 = 目标写入
+        + 贴边写入，上限 2。多出来的写入说明确认逻辑在重写窗口。
+
+        1920x1080 下两遍收敛（第一遍请求 954 就超过 754 上限，第二遍按
+        cap 切 760 后读回即目标）：每窗正好 4 次写入。1512x863 下第一遍
+        请求 750 小于上限，要第三遍才收敛，写入次数必然超 4——那是钳制
+        发现时机问题，不是本测试要抓的「确认逻辑在重写窗口」。
+        """
+        ww, wh = 1920, 1080
+        mon = _Mon(left=0, top=0, width=ww, height=wh)
+        wins = [_win("A::1", x=0, y=33), _win("B::1", x=1270, y=33)]
+        readback = {"A::1": (0, 33, 754, 536), "B::1": (1270, 33, 242, 535)}
+        ok, placed = _run(wins, [mon], tl_hwnd="A::1", tr_hwnd="B::1",
+                          readback=readback)
+        self.assertTrue(ok)
+        # 两遍重排 + 每遍每窗最多 2 次写入（目标 + 贴边）= 4 次。若上限确认
+        # 也在写窗口，次数会变成 5 次以上。
+        writes = {}
+        for hwnd, _x, _y, _w, _h in placed:
+            writes[hwnd] = writes.get(hwnd, 0) + 1
+        for hwnd, n in writes.items():
+            self.assertLessEqual(n, 4, "%s 被写了 %d 次" % (hwnd, n))
+
+    def test_shrink_request_is_not_recorded_as_cap(self):
+        """收缩请求的宽高联动不是尺寸上限：不能记成 maxes 卡死二趟重排。
+
+        真机 iPhone镜像宽高比锁定 ~0.455：请求 750 宽读回 242 是收缩请求
+        的几何约束。旧代码不看写入方向，把它当最大宽记进 maxes，右列被
+        切成 248 宽、窗口被推到屏幕右缘，缝留在两个窗口之间——用户看到
+        的「不准」。新代码只把「要求放大却被读回更小」记成上限。
+        """
+        ww, wh = 1512, 863
+        mon = _Mon(left=0, top=0, width=ww, height=wh)
+        # B 初始宽 1400：第一遍请求 750 是收缩，读回 242 只是宽高比联动
+        wins = [_win("A::1", x=0, y=33),
+                _win("B::1", x=100, y=33, w=1400, h=800)]
+        readback = {"A::1": (0, 33, 754, 536), "B::1": (200, 33, 242, 536)}
+        ok, placed = _run(wins, [mon], tl_hwnd="A::1", tr_hwnd="B::1",
+                          readback=readback)
+        self.assertTrue(ok)
+        cells = wm._last_quad_boxes
+        # 没有幻影宽度上限：两列仍按对半切，右窗贴自己格子的左界（762）
+        self.assertEqual(cells[1][0], ww // 2)
+        last_b = [p for p in placed if p[0] == "B::1"][-1]
+        self.assertEqual(last_b[1], ww // 2 + 6)
+
+    def test_double_cap_right_dominant_keeps_left_full(self):
+        """双上限且右列上限更大时：左窗撑满自己的上限，右窗贴左界锚定。
+
+        旧实现双上限一律取 ww - cap_col[1]（右窗贴屏幕右缘），左窗够不到
+        上限时缝留在两个窗口之间。新实现取 min(cap_col[0], ww - cap_col[1])
+        ——左列是限制因素时左格=左窗上限，右窗在格内贴左界，余量落屏幕
+        外缘：缝在屏幕边上，不在两个窗口之间。
+        """
+        ww, wh = 1512, 863
+        mon = _Mon(left=0, top=0, width=ww, height=wh)
+        wins = [_win("A::1", x=0, y=33),
+                _win("B::1", x=500, y=33, w=1000, h=857)]
+        readback = {"A::1": (0, 0, 400, 857), "B::1": (500, 0, 1000, 857)}
+        ok, placed = _run(wins, [mon], tl_hwnd="A::1", tr_hwnd="B::1",
+                          readback=readback)
+        self.assertTrue(ok)
+        cells = wm._last_quad_boxes
+        # 左格 = 左窗上限 400 + 半间距 6；右窗贴自己格子的左界（412）
+        self.assertEqual(cells[0][2], 406)
+        self.assertEqual(cells[1][0], 406)
+        last_b = [p for p in placed if p[0] == "B::1"][-1]
+        self.assertEqual(last_b[1], 412)
+
     def test_writeback_within_gap_tolerance_keeps_all_four(self):
         """读回只比目标大、但不比格子大时不减载：四个照排，不留任何说明。
 
@@ -809,6 +966,85 @@ def _run_fill(wins, mons, **kw):
         for k, v in prev.items():
             setattr(wm, k, v)
     return done, placed
+
+
+def _run_grid(wins, mons, **kw):
+    """同 _run_fill，但跑 fill_grid，返回 (done, placed)。
+
+    readback / min_sizes / frozen 与 _run 同语义：readback 模拟「App 把尺寸
+    钳制在别处」，min_sizes 模拟 App 最小窗口尺寸，frozen 模拟「被系统钉死」
+    （任何写入都不生效）。间距固定 12/False，与四宫格各例同一套数值。
+    """
+    placed = []
+    prev = {}
+    for attr in ("list_target_windows", "monitors", "_find_window",
+                 "get_window_rect", "set_window_rect", "push_undo",
+                 "_osa", "_probe_min_size", "list_windows_front_to_back",
+                 "_readback_rect", "_settled_readback", "_cg_rect",
+                 "_gap_settings", "_quad_cache_file"):
+        prev[attr] = getattr(wm, attr)
+    prev_notes = list(wm._last_grid_notes)
+    # 说明要留给调用方读（测试据此断言「装不下/写入无效被如实报出」），
+    # 跑完再还原成上一轮的值，避免漏进下一例
+    notes_out = []
+
+    class _Mons:
+        def enum_monitors(self):
+            return mons
+
+    readback = kw.pop("readback", {})
+    min_sizes = kw.pop("min_sizes", {})
+    frozen = set(kw.pop("frozen", ()))
+    state = {}
+    wins = [dict(w) for w in wins]
+
+    wm.monitors = _Mons()
+    wm.list_target_windows = lambda: wins
+    wm._find_window = lambda hwnd: next(
+        (w for w in wins if w["hwnd"] == hwnd), None)
+    wm.get_window_rect = lambda hwnd, *a, **k: (
+        readback.get(hwnd) or state.get(hwnd) or (0, 0, 0, 0))
+    wm.push_undo = lambda *a, **k: None
+    wm._osa = lambda script: ""
+    wm._probe_min_size = lambda hwnd, at_x, at_y: tuple(
+        min_sizes.get(hwnd, (0, 0)))
+    wm.list_windows_front_to_back = lambda *a, **k: wins
+    wm._gap_settings = lambda: (12, False)
+
+    def _readback(hwnd, target=None):
+        return readback.get(hwnd) or state.get(hwnd) or (0, 0, 0, 0)
+
+    wm._readback_rect = _readback
+    wm._settled_readback = _readback
+
+    def _cg(hwnd):
+        if hwnd in frozen:
+            return state.get(hwnd) or (0, 0, 0, 0)
+        return next(((w["x"], w["y"], w["w"], w["h"])
+                     for w in wins if w["hwnd"] == hwnd), None)
+
+    wm._cg_rect = _cg
+
+    def _place(hwnd, x, y, w, h, activate=True):
+        placed.append((hwnd, x, y, w, h))
+        if hwnd in frozen:
+            return True          # 写入被系统忽略：几何一步不变
+        got = readback.get(hwnd) or (x, y, w, h)
+        state[hwnd] = (x, y, w, h)
+        for win in wins:
+            if win["hwnd"] == hwnd:
+                win["x"], win["y"], win["w"], win["h"] = got
+        return True
+
+    wm.set_window_rect = _place
+    try:
+        done = wm.fill_grid(**kw)
+        notes_out[:] = wm._last_grid_notes
+    finally:
+        for k, v in prev.items():
+            setattr(wm, k, v)
+        wm._last_grid_notes[:] = prev_notes
+    return done, placed, notes_out
 
 
 class TestFillAllMonitors(unittest.TestCase):
@@ -877,6 +1113,373 @@ class TestFillAllMonitors(unittest.TestCase):
                                  monitor_indices=[])
         self.assertEqual(done, 0)
         self.assertEqual(placed, [])
+
+class TestQuadPredict(unittest.TestCase):
+    """排列预演 quad_predict：用缓存只读推算，不动任何窗口。
+
+    预演的价值全在「预告」与「只读」两头：算出来的空白/放不下必须与正式
+    排布同一套数学（_quad_place + _quad_cells），而推算过程一个窗口都不
+    能碰——fixture 已把 set_window_rect / _probe_min_size 换成抛异常。
+    """
+
+    WINS = [_win("A::1", x=10, y=20), _win("B::1", x=2000, y=30),
+            _win("C::1", x=10, y=2000), _win("D::1", x=3000, y=20)]
+    MINS = {"A::1": (600, 400), "B::1": (242, 500),
+            "C::1": (600, 400), "D::1": (600, 400)}
+
+    def _predict(self, wins=None, mons=None, mins=None, maxes=None, **kw):
+        warns, detail, placed = _run(
+            list(wins if wins is not None else self.WINS),
+            mons or [_Mon()], predict={"mins": mins if mins is not None
+                                       else self.MINS,
+                                       "maxes": maxes or {}}, **kw)
+        return warns, detail
+
+    def test_blank_warning_mentions_window_and_pixels(self):
+        """有上限缓存的窗口格子装不满：预警带窗口名与空白 px，且只读。
+
+        手动比例（split_x=0.3）下 _quad_cells 不做上限重分配，右格 1332
+        宽而 B 上次实测最多 242——正是「排完右侧一大片空白」的现场。
+        """
+        warns, _detail = self._predict(maxes={"B::1": (242, 500)},
+                                       split_x=0.3)
+        self.assertTrue(warns)
+        w = warns[0]
+        self.assertIn("「B」", w)
+        self.assertIn("242", w)
+        self.assertIn("右侧", w)
+        self.assertIn("空白", w)
+
+    def test_predict_never_touches_windows(self):
+        """预演全程不写窗口：fixture 已把 set_window_rect 换成抛异常，
+        能跑完且 placed 为空即证明只读。"""
+        warns, detail = self._predict(maxes={"B::1": (242, 500)},
+                                      split_x=0.3)
+        self.assertTrue(warns)
+        self.assertEqual(detail["fit"], 4)
+        # placed 由假 set_window_rect 记录：预演一次都没调它
+
+    def test_no_warning_when_cap_covers_cell(self):
+        """上限比格子还大：没有空白，不该弹确认框。"""
+        warns, detail = self._predict(maxes={"B::1": (2000, 2000)},
+                                      split_x=0.3)
+        self.assertEqual(warns, [])
+        self.assertEqual(detail["blank"], [])
+
+    def test_uncached_window_is_silent(self):
+        """没探过最小尺寸的窗口：预演闭嘴（猜错比不猜更糟）。"""
+        warns, detail = self._predict(mins={"A::1": (600, 400)})
+        self.assertEqual(warns, [])
+        self.assertEqual(len(detail["uncached"]), 3)
+
+    def test_single_window_is_silent(self):
+        """只有一个窗口排不出四宫格：静默，交给正式排布去拒绝。"""
+        warns, detail = self._predict(wins=self.WINS[:1],
+                                      mins={"A::1": (600, 400)})
+        self.assertEqual(warns, [])
+        self.assertEqual(detail["fit"], 0)
+
+    def test_unplaced_warning_names_window(self):
+        """按上次实测的最小尺寸放不下：预警说清排几个、谁放不下。"""
+        mins = {"A::1": (900, 600), "B::1": (900, 600),
+                "C::1": (900, 600), "D::1": (900, 600)}
+        warns, detail = self._predict(mins=mins)
+        self.assertTrue(warns)
+        self.assertIn("只排 2/4", warns[0])
+        self.assertIn("C", warns[0])
+        self.assertIn("D", warns[0])
+        self.assertEqual(detail["fit"], 2)
+
+    def test_smart_mode_predicts_too(self):
+        """智能模式走同一条预演路径：按宽高比重排角后照常推算。"""
+        mins = {"A::1": (700, 500), "B::1": (500, 700),
+                "C::1": (700, 500), "D::1": (500, 700)}
+        warns, detail = self._predict(mins=mins, smart=True)
+        # 700x500 的窗两块屏只放得下同排两个：智能分配也改变不了物理上限
+        self.assertEqual(detail["fit"], 2)
+        self.assertTrue(any("只排 2/4" in w for w in warns))
+        self.assertIsInstance(detail["splits"], tuple)
+
+    def test_cache_roundtrip_and_corrupt_file(self):
+        """缓存存盘/读盘 roundtrip；文件损坏时静默按无缓存处理。"""
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        prev_file = wm._quad_cache_file
+        prev_min, prev_max = dict(wm._QUAD_MIN_CACHE), dict(wm._QUAD_MAX_CACHE)
+        try:
+            wm._quad_cache_file = lambda: path
+            wm._QUAD_MIN_CACHE.clear()
+            wm._QUAD_MAX_CACHE.clear()
+            wm._QUAD_MIN_CACHE["A::1"] = (600, 400)
+            wm._QUAD_MAX_CACHE["A::1"] = (754, 0)
+            wm._quad_cache_save()
+            self.assertTrue(os.path.exists(path))
+            wm._QUAD_MIN_CACHE.clear()
+            wm._QUAD_MAX_CACHE.clear()
+            wm._quad_cache_load()
+            self.assertEqual(wm._QUAD_MIN_CACHE.get("A::1"), (600, 400))
+            self.assertEqual(wm._QUAD_MAX_CACHE.get("A::1"), (754, 0))
+            # 损坏文件：不抛异常，缓存保持读入前（空）状态
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{ not json")
+            wm._QUAD_MIN_CACHE.clear()
+            wm._QUAD_MAX_CACHE.clear()
+            wm._quad_cache_load()
+            self.assertEqual(wm._QUAD_MIN_CACHE, {})
+            self.assertEqual(wm._QUAD_MAX_CACHE, {})
+        finally:
+            wm._quad_cache_file = prev_file
+            wm._QUAD_MIN_CACHE.clear()
+            wm._QUAD_MIN_CACHE.update(prev_min)
+            wm._QUAD_MAX_CACHE.clear()
+            wm._QUAD_MAX_CACHE.update(prev_max)
+            os.unlink(path)
+
+class TestFillGrid(unittest.TestCase):
+    """虚拟桌面网格：跨屏 m×n 批排。
+
+    与四宫格共用同一套真机教训：格子绝不跨屏（macOS 把横跨两屏的窗口判给
+    其中一块）、装不下的窗口不硬排、间距按贴边算。这里只覆盖 windows_mac：
+    windows.py 依赖 ctypes.windll，在 macOS 上无法导入。
+    """
+
+    # 真机三屏的摆法：主屏 (0,33) 1512x887、RV200 在主屏**上方**
+    # (0,-900) 1600x870、DELL U2414H 竖屏在**左侧** (-1080,-1100) 1080x1920。
+    # 刻意排得「不齐」：虚拟桌面的包围盒因此含屏间空隙，正是要验「落在空隙里
+    # 的格子丢掉、跨空隙的格子裁进一块屏」的真机形状。
+    MONS = [_Mon(0, 33, 1512, 887, "Built-in"),
+            _Mon(0, -900, 1600, 870, "RV200"),
+            _Mon(-1080, -1100, 1080, 1920, "竖屏")]
+
+    def _run(self, wins, mons=None, **kw):
+        mons = mons if mons is not None else list(self.MONS)
+        return _run_grid(list(wins), mons, **kw)
+
+    def test_2x2_cells_never_cross_screens(self):
+        """2×2 四格，每格都必须完整落在某一块屏的工作区内。"""
+        wins = [_win("A::1", 10, 20), _win("B::1", 2000, 30),
+                _win("C::1", 10, 2000), _win("D::1", 3000, 20)]
+        done, placed, notes = self._run(wins)
+        self.assertEqual(done, 4)
+        for hwnd, x, y, w, h in placed:
+            inside = any(
+                m.work_left <= x and x + w <= m.work_left + m.work_width
+                and m.work_top <= y and y + h <= m.work_top + m.work_height
+                for m in self.MONS)
+            self.assertTrue(
+                inside,
+                "%s 的目标 %s 跨屏或越界" % (hwnd, (x, y, w, h)))
+
+    def test_six_cells_3x2(self):
+        """3×2 六等分：6 个格子、6 个窗口，一窗一格。"""
+        wins = [_win("%s::1" % n) for n in "ABCDEF"]
+        done, placed, notes = self._run(wins, layout="3×2 六等分")
+        self.assertEqual(done, 6)
+        self.assertEqual(len({p[0] for p in placed}), 6)
+
+    def test_layout_wins_over_cols_rows(self):
+        """layout 给了就以它为准（界面下拉优先于 Spinbox 自定义行列）。"""
+        wins = [_win("%s::1" % n) for n in "ABCDEF"]
+        done, placed, notes = self._run(wins, cols=2, rows=2,
+                                 layout="3×2 六等分")
+        self.assertEqual(done, 6)
+
+    def test_custom_cols_rows(self):
+        """自定义行列：2×3 六等分（按比例就是 2 列 3 行）。"""
+        wins = [_win("%s::1" % n) for n in "ABCDEF"]
+        done, placed, notes = self._run(wins, cols=2, rows=3)
+        self.assertEqual(done, 6)
+
+    def test_over_max_grid_rejected(self):
+        """超出 4 列 / 4 行的网格直接拒了：每格只剩几十像素，摆出来没意义。"""
+        wins = [_win("A::1")]
+        done, _placed, notes = self._run(wins, cols=5, rows=2)
+        self.assertEqual(done, 0)
+        done, _placed, notes = self._run(wins, cols=2, rows=5)
+        self.assertEqual(done, 0)
+
+    def test_portrait_excluded_by_indices(self):
+        """只勾横屏时，格子不该落在竖屏上。"""
+        wins = [_win("A::1"), _win("B::1")]
+        done, placed, notes = self._run(wins, monitor_indices=[0, 1])
+        self.assertEqual(done, 2)
+        for hwnd, x, y, w, h in placed:
+            self.assertLess(x, 1512, "%s 落在竖屏上" % hwnd)
+
+    def test_portrait_when_explicitly_selected(self):
+        """显式勾竖屏才往竖屏排（不适合竖屏的窗口默认不发过去）。"""
+        wins = [_win("A::1"), _win("B::1")]
+        done, placed, notes = self._run(wins, monitor_indices=[2])
+        self.assertEqual(done, 2)
+        for _hwnd, x, y, w, h in placed:
+            self.assertGreaterEqual(x, -1080)
+            self.assertLessEqual(x + w, 0)
+
+    def test_fewer_windows_than_cells(self):
+        """窗口比格子少：有几个排几个，剩下的格子空着（不硬凑）。"""
+        wins = [_win("A::1"), _win("B::1")]
+        done, placed, notes = self._run(wins, layout="3×2 六等分")
+        self.assertEqual(done, 2)
+        self.assertEqual([p[0] for p in placed], ["A::1", "B::1"])
+
+    def test_explicit_hwnds_resolved(self):
+        """显式指定窗口：按给定顺序排，不偷换窗口。"""
+        wins = [_win("A::1"), _win("B::1"), _win("C::1"), _win("D::1")]
+        done, placed, notes = self._run(wins, hwnds=["C::1", "A::1"])
+        self.assertEqual(done, 2)
+        self.assertEqual([p[0] for p in placed], ["C::1", "A::1"])
+
+    def test_missing_hwnd_reported_not_silently_replaced(self):
+        """选中的窗口已关掉：如实报出来，不静默用别的窗口顶上。"""
+        wins = [_win("A::1"), _win("B::1"), _win("C::1")]
+        done, _placed, notes = self._run(wins, hwnds=["A::1", "Z::9"])
+        self.assertEqual(done, 1)
+        self.assertTrue(any("Z" in n for n in notes),
+                        "关掉的窗口必须出现在说明里：%s" % notes)
+
+    def test_notes_cleared_between_runs(self):
+        """上一轮的说明不能报在这一次成功的排列上。"""
+        wins = [_win("A::1")]
+        _d, _p, notes = self._run(wins, hwnds=["A::1", "Z::9"])
+        self.assertTrue(notes)
+        _d, _p, notes2 = self._run([_win("A::1"), _win("B::1")])
+        self.assertEqual(notes2, [])
+
+    def test_smart_mode_reorders_by_aspect_ratio(self):
+        """智能模式：最横的窗去最横的格，且不丢窗口。"""
+        wins = [_win("wide::1", 1600, 600), _win("tall::1", 400, 1200),
+                _win("mid::1", 800, 800)]
+        done, placed, notes = self._run(wins, layout="3×2 六等分", smart=True)
+        self.assertEqual(done, 3)
+        self.assertEqual({p[0] for p in placed},
+                         {"wide::1", "tall::1", "mid::1"})
+
+    def test_smart_mode_actually_reorders_cells(self):
+        """智能模式必须真的换格子：勾与不勾结果不同，否则等于没这个开关。
+
+        历史 bug：fill_grid 里智能分配的 order 算完之后**没有被写入循环用上**，
+        格子与窗口仍是 fit_report 的顺序对应——勾不勾「智能」排出来一模一样，
+        用户看到的就是「智能模式没效果」。用例刻意让输入顺序与宽高比最优顺序
+        不同：tall(400x1200) 排第 1、wide(1600x600) 排第 2，而 2/3+1/3 的宽格
+        在第 1、3 列。智能时 wide 该被换到宽格去。
+        """
+        wins = [_win("tall::1", 0, 0, 400, 1200),
+                _win("wide::1", 0, 0, 1600, 600),
+                _win("mid::1", 0, 0, 800, 800),
+                _win("sq::1", 0, 0, 900, 900)]
+        mons = [_Mon(0, 0, 1920, 1080, "S")]
+        done, placed, _notes = self._run(wins, mons=mons,
+                                         layout="2/3+1/3 左右", smart=True)
+        self.assertEqual(done, 4)
+        # 第 1 格是宽格（2/3 宽）：最横的 wide 该在这里，不是 tall
+        self.assertEqual(placed[0][0], "wide::1",
+                         "智能模式没把最横的窗换到最宽的格：%s"
+                         % [p[0] for p in placed])
+        _done2, placed2, _n2 = self._run(wins, mons=mons,
+                                         layout="2/3+1/3 左右", smart=False)
+        self.assertEqual([p[0] for p in placed2],
+                         ["tall::1", "wide::1", "mid::1", "sq::1"],
+                         "非智能必须保持输入顺序")
+
+    def test_smart_mode_uses_slots_not_wins_prefix(self):
+        """有窗口装不下时，智能分配要按**实际参与**的窗口算，不能按 wins[:n]。
+
+        历史 bug：拿 wins[:n] 去分配，而 fit_report 已把装不下的窗口从 slots
+        里剔除，两个列表的下标从此错开——被剔除的窗口会被分到格子上，真正
+        该排的窗口反而没格可去。这里 C 装不下，智能分配只能在 A/B/D 之间换，
+        结果里绝不能出现 C，也不能漏掉 D。
+        """
+        # 装不下的 BIG 排在**中段**（第 2 个）：剔除后 wins 与 slots 的下标
+        # 错开一位。旧实现拿 wins[:n] 去分配，会把已被剔除的 BIG 算进去——
+        # 它占掉一个位置，真正该排的 sq 反而没格可去，智能分配整体串味。
+        # 装不下的 BIG 排在**中段**（第 2 个）：剔除后 wins 与 slots 的下标
+        # 错开一位。旧实现拿 wins[:n] 去算分配，等于拿「tall、BIG、wide」
+        # 的形状去配「tall、wide、thin」的三个格子——perm 与按真实窗口算的不
+        # 同，宽格落到竖窗头上。窗口数要正好 4 个（3 个格子 + 1 个装不下的），
+        # 否则 slots 会补上第 4 格、wins[:n] 与 slots 又对齐了。
+        wins = [_win("tall::1", 0, 0, 400, 1200),
+                _win("BIG::1", 0, 0, 800, 800),
+                _win("wide::1", 0, 0, 1600, 600),
+                _win("thin::1", 0, 0, 300, 900)]
+        mons = [_Mon(0, 0, 1920, 1080, "S")]
+        done, placed, notes = self._run(wins, mons=mons,
+                                        layout="2/3+1/3 左右", smart=True,
+                                        min_sizes={"BIG::1": (2000, 2000)})
+        self.assertEqual(done, 3)
+        got = [p[0] for p in placed]
+        self.assertNotIn("BIG::1", got,
+                         "装不下的窗口不该被排进格子（wins[:n] 串味的典型症状）")
+        self.assertEqual(set(got), {"tall::1", "wide::1", "thin::1"},
+                         "三个装得下的窗口一个都不能少：%s" % got)
+        # 三个格子：r0c0 与 r1c0 是宽格（2/3 宽）、r1c1 是窄格（1/3 宽）。
+        # 按真实窗口（tall 0.33 / wide 2.67 / thin 0.33）算，宽格依次给 tall
+        # 与 wide、窄格给 thin；拿 wins[:n]（tall / BIG / wide）算则会整批换格，
+        # 变成 wide、thin、tall —— 宽格落到竖窗头上。
+        self.assertEqual([p[0] for p in placed],
+                         ["tall::1", "wide::1", "thin::1"],
+                         "智能分配串味：应按真实参与排列的窗口算，实际 %s"
+                         % [p[0] for p in placed])
+
+    def test_manual_mode_keeps_order(self):
+        """非智能：第 k 个窗口去第 k 格，不被重排。"""
+        wins = [_win("A::1"), _win("B::1"), _win("C::1"), _win("D::1")]
+        done, placed, notes = self._run(wins, layout="2×2 四等分")
+        self.assertEqual(done, 4)
+        self.assertEqual([p[0] for p in placed],
+                         ["A::1", "B::1", "C::1", "D::1"])
+
+    def test_window_gap_applied(self):
+        """窗口之间留缝、屏幕外缘不留缝（gap_screen_edges 关闭时）。"""
+        wins = [_win("A::1"), _win("B::1")]
+        done, placed, notes = self._run(wins, mons=[_Mon(0, 0, 1920, 1080, "S")],
+                                 cols=2, rows=1)
+        self.assertEqual(done, 2)
+        a = placed[0]
+        b = placed[1]
+        # 左列贴左、右列贴右；中间正好隔一个 window_gap（12px）
+        self.assertEqual(a[1], 0)
+        self.assertEqual(b[1] + b[3], 1920)
+        self.assertEqual(b[1] - (a[1] + a[3]), 12)
+        # 两窗都不越屏
+        self.assertEqual(a[1] + a[3], 954)
+        self.assertEqual(b[1], 966)
+
+    def test_too_small_window_left_in_place(self):
+        """最小尺寸放不进格子：该窗口保持原位，说明里点名它。"""
+        wins = [_win("A::1"), _win("B::1"), _win("C::1"), _win("D::1")]
+        done, placed, notes = self._run(wins, layout="2×2 四等分",
+                                 min_sizes={"A::1": (2000, 2000)})
+        self.assertEqual(done, 3)
+        self.assertNotIn("A::1", [p[0] for p in placed])
+        self.assertTrue(any("A" in n and "放不下" in n for n in notes),
+                        "装不下的窗口必须点名：%s" % notes)
+
+    def test_no_windows(self):
+        done, _placed, notes = self._run([])
+        self.assertEqual(done, 0)
+        self.assertTrue(notes)
+
+    def test_single_monitor_grid(self):
+        """单屏时退化成这块屏上的 m×n 网格（跨屏铺满在单屏下没有意义）。"""
+        wins = [_win("A::1"), _win("B::1"), _win("C::1"), _win("D::1")]
+        done, placed, notes = self._run(wins, mons=[_Mon(0, 0, 1920, 1080, "S")],
+                                 layout="2×2 四等分")
+        self.assertEqual(done, 4)
+        # 单屏 2×2 与四宫格同一套几何：左列贴左、上排贴顶、中间隔 12px 缝、
+        # 右下角补齐（1920-6=1914、1080-6=1074）
+        self.assertEqual(placed[0], ("A::1", 0, 0, 954, 534))
+        self.assertEqual(placed[1], ("B::1", 966, 0, 954, 534))
+        self.assertEqual(placed[2], ("C::1", 0, 546, 954, 534))
+        self.assertEqual(placed[3], ("D::1", 966, 546, 954, 534))
+
+    def test_unwritable_window_reported(self):
+        """App 不开放自动化 / 被系统钉死：写入无效要单独说，不能算成排好了。"""
+        wins = [_win("A::1"), _win("B::1")]
+        done, _placed, notes = self._run(wins, cols=2, rows=1, frozen={"A::1"})
+        self.assertTrue(any("写入后位置尺寸都没变" in n for n in notes),
+                        "写入无效必须报出来：%s" % notes)
+
+
 
 
 if __name__ == "__main__":

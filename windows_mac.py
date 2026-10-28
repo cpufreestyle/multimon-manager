@@ -16,9 +16,12 @@ macOS 坐标系原点在左上，与 Windows 转换后的坐标系一致。
 """
 import ctypes
 import ctypes.util
+import json
 import logging
 import os
+import re
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -26,6 +29,7 @@ import monitors_mac as monitors
 from monitors_mac import CGRect
 
 import quad_plan
+import grid_plan
 import screen_math
 
 logger = logging.getLogger(__name__)
@@ -169,7 +173,11 @@ _QUAD_NAMES = ("左上", "右上", "左下", "右下")
 # 到的最小尺寸切格子，写入后读回的是窗口**实际**占的尺寸：App 的最小尺寸探测
 # 偏小时，窗口被钳得比格子大，上下两排必然重叠。多写几遍、每遍把实测尺寸并进
 # 最小尺寸（只升不降，单调收敛），格子随之长到「装得下实测尺寸」为止。
-_QUAD_MAX_PASSES = 3
+_QUAD_MAX_PASSES = 5
+
+# 写入后实测钳制做二趟重排的容差：与 quad_plan._SLACK_TOL 同语义，
+# 1~6px 的读回噪声不把格子判成「装不下」。
+_QUAD_SLACK_TOL = 6
 
 
 def _gap_settings():
@@ -294,6 +302,20 @@ def _osa(script):
         return ""
 
 
+def _parse_nums(text):
+    """从 AppleScript 输出里抽出全部整数（含负数），忽略分隔符噪声。
+
+    AppleScript 的数字经 as text 会按当前 locale 插入千位分隔符：坐标 1054
+    可能输出成 "1,054"，于是 "546,1,054,-870,870" 被 split(",") 切成 5 段
+    而解析失败。真机日志里见过 "546, ,, -870, ,, 1054, ,, 870" 这种 8 段
+    输出，几何读取直接报废，四宫格退化成按序号选窗。因此这里不按逗号
+    切分，而是扫描整段文本取所有数字 token。
+    """
+    if not text:
+        return []
+    return [int(t) for t in re.findall(r"-?\d+", text)]
+
+
 # ── Quartz（CoreGraphics + CoreFoundation）ctypes 绑定 ───────────────
 
 _cg = None
@@ -416,6 +438,18 @@ _SKIP_OWNERS = {
     "MenuBarAgent",
     "UIKitSystem",
     "System Events",
+}
+
+
+# 四宫格自动选窗时要跳过的 owner：这些进程在 CG 层有窗口（会被枚举到），
+# 但 AppleScript / AX 完全操作不了——wine 跑的是 Windows 程序，System Events
+# 拿不到它的 window，写几何永远失败。真机日志见过连续 8 次
+# 「读取窗口几何失败: 'wine::' -> ''」，整个四宫格流程被拖到 20 秒以上。
+# 只影响自动补足，不影响界面下拉框（用户显式选它就照排，失败有提示）。
+_QUAD_SKIP_OWNERS = {
+    "wine",
+    "wine64",
+    "wine64-preloader",
 }
 
 
@@ -748,7 +782,7 @@ def get_window_rect(hwnd):
     )
     out = _osa(script)
     try:
-        x, y, w, h = (int(float(v)) for v in out.split(","))
+        x, y, w, h = _parse_nums(out)
         rect = (x, y, w, h)
     except Exception:  # noqa: BLE001
         logger.warning("读取窗口几何失败: %r -> %r", hwnd, out)
@@ -808,12 +842,12 @@ def _ax_window_by_geometry(app, rect, name=None):
         item = item.strip()
         if not item:
             continue
-        parts = item.split(",")
-        if len(parts) != 4:
-            continue
-        try:
-            nums = [abs(int(float(v))) for v in parts]
-        except ValueError:  # noqa: BLE001
+        # 不能按逗号切分：坐标过千时 as text 会插入千位分隔符，切出来不是 4 段
+        # 不能用 abs()：副屏窗口的 x/y 是负数（如 RV200 Pro 的 y=-870），
+        # 取绝对值后目标 y=-870 与实测 y=870 相差 1740，副屏上所有窗口的
+        # 几何匹配全部失效，退化成按序号选窗——窗口就跑到别人身上去了。
+        nums = _parse_nums(item)
+        if len(nums) != 4:
             continue
         dev = (abs(nums[0] - tx) + abs(nums[1] - ty)
                + abs(nums[2] - tw) + abs(nums[3] - th))
@@ -931,13 +965,25 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
         return
     # 「上次摆放位」只记程序摆放，不记撤销/回位这类内部复位
     _internal = _suppress_undo
+    # 先用**当前真实几何**刷新缓存：四宫格连排时前一个窗口刚被移走，
+    # _last_rect 里还是移动前的旧值，拿它去 AX 列表匹配必然偏差过大
+    # （真机日志 1696px），只能退化成按序号选窗——窗口就写到别人身上。
+    _fresh = None
     if not _suppress_undo:
         try:
-            push_undo(hwnd, get_window_rect(hwnd))
+            # 必须绕过 _last_rect 缓存读：get_window_rect 命中缓存就直接返回
+            # 缓存值，前一个窗口刚搬完时这里拿到的是移动前的旧几何，拿它去
+            # AX 列表匹配必然「偏差过大」而退化成按序号选窗——几何就写到
+            # 同名/同序的别的窗口上（真机日志偏差 1293~2354px）。先 pop 再读
+            # 才是当下的真实几何（_fresh_rect 就是干这个的）。
+            _fresh = _fresh_rect(hwnd)
+            if _fresh and _fresh != (0, 0, 0, 0):
+                _last_rect[hwnd] = _fresh
+            push_undo(hwnd, _fresh)
         except Exception:  # noqa: BLE001
             pass
     app2, nm, _sq = parse_hwnd(hwnd)
-    known = _last_rect.get(hwnd)
+    known = _fresh if (_fresh and _fresh != (0, 0, 0, 0)) else _last_rect.get(hwnd)
     win_sel = (_ax_window_by_geometry(app2, known, nm)
                or _ax_window_selector(hwnd))
     # 优先按几何在 AX 窗口列表里定位：CG 枚举顺序与 AX 顺序未必一致，
@@ -1221,6 +1267,9 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, moni
 
     cands = [w for w in list_target_windows()
              if w["pid"] not in _OWN_PIDS and w["owner"]]
+    # 自动补足时跳过 AX 够不着的 owner（如 wine）：它们会被选进四宫格，
+    # 然后每一次读写几何都失败，整轮排列卡在重试里。
+    cands = [w for w in cands if w["owner"] not in _QUAD_SKIP_OWNERS]
     cands_by_hwnd = {w["hwnd"]: w for w in cands}
 
     # 解析左窗口：显式指定 > 界面固定目标 > 最前面窗口
@@ -1403,6 +1452,102 @@ _last_quad_slots = []
 # 会把用户窗口无故缩小再还原（闪烁、白占一步撤销栈），所以这里只缓存只读。
 _QUAD_MIN_CACHE = {}
 
+# 上次排布探到的 App 尺寸上限 {hwnd: (max_w, max_h)}（0 = 该轴无上限）。
+# 与最小尺寸同源：写入方向是「要求放大」却被读回更小，说明 App 把窗口钳在
+# 更小处（真机「系统设置」最大窗宽 754、iPhone镜像 宽高比锁定）。四宫格
+# 预演 quad_predict 消费它：点排列前就能说出「这一格会留多少空白」。
+_QUAD_MAX_CACHE = {}
+
+# 缓存文件条目上限：窗口关掉后条目只增不减，钉个顶，超出丢最早的
+_QUAD_CACHE_MAX_ENTRIES = 500
+
+
+def _quad_cache_file():
+    """四宫格尺寸缓存文件路径（quad_cache.json）。
+
+    与 settings.json 同目录：frozen 后在 ~/Library/Application Support/
+    MultiMonManager，开发时在仓库目录。import settings 失败（极少数打包
+    场景）时退回本文件所在目录。测试可整体替换此函数，把缓存指到临时
+    目录，避免往仓库里写文件。
+    """
+    try:
+        import settings
+        base = settings.data_dir()
+    except Exception:  # noqa: BLE001  缓存只是优化，读不到目录就退回本目录
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "quad_cache.json")
+
+
+def _quad_cache_save():
+    """把最小尺寸 / 尺寸上限缓存合并写盘（原子写，静默失败）。
+
+    缓存的意义全在「下次点排列之前就能说话」：App 的最小尺寸与钳制上限是
+    真机物理限制、跨会话不变，写盘后重启 App 的第一次预演就有据可依。写
+    失败不该影响排布本身，一切异常只进日志。
+    """
+    try:
+        data = {
+            "version": 1,
+            "mins": {h: [int(v[0]), int(v[1])]
+                     for h, v in _QUAD_MIN_CACHE.items() if v},
+            "maxes": {h: [int(v[0]), int(v[1])]
+                      for h, v in _QUAD_MAX_CACHE.items() if v},
+        }
+        for _d in (data["mins"], data["maxes"]):
+            while len(_d) > _QUAD_CACHE_MAX_ENTRIES:
+                _d.pop(next(iter(_d)))     # dict 保序，先插入的就是最早的
+        path = _quad_cache_file()
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                                   prefix=".quad_cache.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:  # noqa: BLE001  原子写中途失败：清掉半成品再抛
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning("四宫格缓存写盘失败: %s", e)
+
+
+def _quad_cache_load():
+    """App 启动时调一次：把上次的尺寸缓存读进内存（静默失败）。
+
+    不在 import 时调用：导入 windows_mac 的路径很多（测试、托盘面板），
+    启动时显式调一次即可。文件损坏 / 格式不对当没有缓存——预演退化成
+    静默放行（现行为），不该拦着用户排窗。
+    """
+    try:
+        path = _quad_cache_file()
+        if not os.path.exists(path):
+            return
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        mins, maxes = {}, {}
+
+        def _pair(v):
+            return (isinstance(v, list) and len(v) == 2
+                    and all(isinstance(x, int) and not isinstance(x, bool)
+                            for x in v))
+
+        for h, v in (data.get("mins") or {}).items():
+            if _pair(v):
+                mins[h] = (v[0], v[1])
+        for h, v in (data.get("maxes") or {}).items():
+            if _pair(v):
+                maxes[h] = (v[0], v[1])
+        _QUAD_MIN_CACHE.update(mins)
+        _QUAD_MAX_CACHE.update(maxes)
+        logger.info("四宫格缓存已读入：%d 个最小尺寸、%d 个尺寸上限",
+                    len(mins), len(maxes))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("四宫格缓存读盘失败，按无缓存处理: %s", e)
+
 
 # 最近一次四宫格需要如实告知用户的情况（屏幕装不下四个最小尺寸、某窗口
 # 被系统判给了别的屏……）。界面读它在状态栏里提示，而不是只说「排列完成」。
@@ -1488,10 +1633,267 @@ def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",
                 done, len(ms), mode)
     return done
 
+# ── 虚拟桌面网格（跨屏 m×n 批排）─────────────────────────────────────
+
+# 最近一次虚拟网格需要如实告知用户的情况（哪个窗口放不下它那一格、哪个窗口
+# 写入无效、哪个被应用钳制）。界面读它在状态栏里提示，而不是只说「排列完成」
+# ——用户历史上反复抱怨「不准」，而多数不准其实是这三类物理限制。
+_last_grid_notes = []
+
+# 最近一次虚拟网格的实测报告 [(hwnd, 目标矩形, 实测矩形或None), ...]，
+# 与 _last_quad_report 同用途：供界面说清「哪一格留了空白、为什么」。
+_last_grid_report = []
+
+
+def fill_grid(hwnds=None, cols=None, rows=None, layout=None, smart=False,
+              monitor_indices=None, use_pinned=True):
+    """把若干窗口排进跨屏虚拟桌面的 m×n（或加权比例）网格。
+
+    与 fill_all_monitors（一个窗口一块屏）互补：那个是「屏多窗口少」，这个是
+    「窗口多、屏要合起来用」——把勾选的多块屏当成一块大桌面，按比例切格子，
+    一个格子一个窗口。等分（2×2 / 3×2 / 3×3）与加权（2/3+1/3）走同一条路，
+    由 grid_plan 的比例元组描述：界面下拉选预设，Spinbox 自定义行列。
+
+    三条不可动的约束（都是真机踩过的坑）：
+
+    1. **格子绝不跨屏**。macOS 会把横跨两屏的窗口判给其中一块（真机右下窗
+       x+w=2880 越过 DELL 右界，整个窗被搬到 Sidecar），用户看到的就是「四个
+       窗口不在一个屏幕上」。grid_plan.assign_cells 把每格归到交集最大的屏并
+       裁进那块屏的工作区，与任何屏无交集的格子（屏间空隙）直接丢掉。
+    2. **装不下的窗口不硬排**。按实测最小尺寸逐格判，装不下的保持原位并在
+       说明里逐个列出。硬排的结局是窗口被 App 顶出格子、压住邻居。
+    3. **间距按贴边算**。网格线落在屏中间是窗间缝；格子被裁到屏边界后那条线
+       已是屏幕外缘，再留缝就是「没吸附到边上」（cell_gap_rect 的判据）。
+
+    layout 是 grid_plan.LAYOUTS 的显示名（界面下拉），优先于 cols/rows；
+    两者都没给时按 2×2。
+
+    monitor_indices: 只排这些下标的屏（按给定顺序）。None 时取全部屏——竖屏
+    不适合放横屏应用，界面默认不勾，但用户显式勾了就尊重（函数层不猜）。
+    """
+    ms = monitors.enum_monitors()
+    if not ms:
+        return 0
+
+    if monitor_indices is not None:
+        keep = []
+        for i in monitor_indices:
+            if isinstance(i, int) and 0 <= i < len(ms) and i not in keep:
+                keep.append(i)
+        ms = [ms[i] for i in keep]
+        if not ms:
+            logger.warning("虚拟网格：没有可用的目标屏")
+            return 0
+
+    # 上一轮的说明先清空：界面读 _last_grid_notes 做提示，留着旧值会把上次
+    # 的「装不下」报在这一次成功的排列上
+    global _last_grid_notes, _last_grid_report
+    _last_grid_notes.clear()
+    _last_grid_report = []
+
+    # 1) 比例：预设（layout）优先，其次自定义行列，再退回 2×2
+    if layout:
+        got = grid_plan.layout_by_label(layout)
+        if got is None:
+            logger.warning("虚拟网格：未知布局 %r，按自定义行列处理", layout)
+            got = (grid_plan.equal_fracs(cols or 2),
+                   grid_plan.equal_fracs(rows or 2))
+    else:
+        got = (grid_plan.equal_fracs(cols or 2), grid_plan.equal_fracs(rows or 2))
+    col_fracs, row_fracs = got
+    n_cols, n_rows = len(col_fracs), len(row_fracs)
+    if n_cols > grid_plan.MAX_COLS or n_rows > grid_plan.MAX_ROWS:
+        logger.warning("虚拟网格：%d×%d 超出上限（最多 %d列×%d行）",
+                       n_cols, n_rows, grid_plan.MAX_COLS, grid_plan.MAX_ROWS)
+        return 0
+
+    # 2) 虚拟桌面 = 勾选屏工作区的包围盒；按比例切格子；每格裁进各自的屏
+    vr = grid_plan.virtual_rect(ms)
+    if vr is None:
+        return 0
+    cells = grid_plan.grid_cells(vr[0], vr[1], vr[2], vr[3],
+                                 col_fracs, row_fracs)
+    asg = grid_plan.assign_cells(cells, ms)
+    if not asg:
+        _last_grid_notes.append("勾选的屏摆不出可用的网格（屏之间有重叠？）")
+        logger.warning("虚拟网格：格子与任何屏都没有交集")
+        return 0
+
+    # 3) 选窗。显式 hwnd 优先（找不到的如实报，不静默换窗口——那正是
+    #    「智能/非智能都不准」的观感来源之一）；没给就按 z 序取前 len(asg) 个，
+    #    滤掉自身进程与 AX 够不着的 owner（wine 之类：选进来整轮排列都卡在
+    #    读写失败上）。
+    wins = []
+    if hwnds:
+        cands = [w for w in list_target_windows()
+                 if w["pid"] not in _OWN_PIDS and w["owner"]]
+        wins, missing = grid_plan.resolve_hwnds(hwnds, cands, _find_window)
+        if missing:
+            names = "、".join(x.split("::")[0] for x in missing[:3])
+            _last_grid_notes.append(
+                "指定的窗口 %s 已关闭/改名，未参与排列" % names)
+            logger.warning("虚拟网格：指定的窗口 %s 已不可用", names)
+    if not wins:
+        cands = [w for w in list_target_windows()
+                 if w["pid"] not in _OWN_PIDS and w["owner"]]
+        cands = [w for w in cands if w["owner"] not in _QUAD_SKIP_OWNERS]
+        wins = grid_plan.pick_windows(cands, len(asg),
+                                      skip_owners=_QUAD_SKIP_OWNERS,
+                                      own_pids=_OWN_PIDS)
+        # 界面固定的目标窗口优先（与四宫格、跨屏铺满同一语义）：只有它时
+        # 也排——单窗网格等价于把它铺到第一格
+        if use_pinned and _pinned_target and not wins:
+            pinned = _find_window(_pinned_target)
+            if pinned is not None:
+                wins = [pinned]
+    if not wins:
+        _last_grid_notes.append("没有可操作的窗口")
+        logger.warning("虚拟网格：没有可操作的窗口")
+        return 0
+
+    # 4) 实测每个窗口的最小尺寸。格子装不下 App 的最小尺寸时窗口会被顶出格
+    #    子、压住邻居，甚至被 macOS 判给别的屏。探测前记下当前几何，探测完放回
+    #    原状——带着探测后的残局排，窗口会停在探测位置（真机 UU远程 就这么被
+    #    判去过 Sidecar）。
+    mins, orig_rect = {}, {}
+    for w in wins:
+        h = w.get("hwnd")
+        try:
+            orig_rect[h] = _readback_rect(h, (w["x"], w["y"], w["w"], w["h"]))
+        except Exception:  # noqa: BLE001
+            orig_rect[h] = None
+        try:
+            mins[h] = _probe_min_size(h, w["x"], w["y"])
+        except Exception:  # noqa: BLE001
+            mins[h] = (0, 0)
+    for w in wins:
+        h = w.get("hwnd")
+        was = orig_rect.get(h)
+        if (was and was != (0, 0, 0, 0)
+                and (w["x"], w["y"], w["w"], w["h"]) != was):
+            try:
+                set_window_rect(h, was[0], was[1], was[2], was[3],
+                                activate=False)
+                _last_rect[h] = was
+            except Exception:  # noqa: BLE001
+                pass
+
+    # 5) 装不下的窗口退出排列：fit_report 按最小尺寸逐格判。格子与窗口都按
+    #    「格子的行主序号」对齐——第 k 个窗口去第 k 个格子，用户才可预期。
+    #    窗口多于格子时，多出的窗口没有格子可去（保持原位，如实报告）。
+    gap, edge_gap = _gap_settings()
+    slots, too_small = grid_plan.fit_report(asg, wins, mins, gap, edge_gap, ms)
+    if not slots:
+        _last_grid_notes.append(
+            "这些窗口的最小尺寸都放不进网格格子，未做排列")
+        logger.warning("虚拟网格：%d 个窗口全部装不下各自格子", len(wins))
+        return 0
+
+    # 6) 智能分配：按宽高比把窗口贴到最合适的格子。口径与四宫格一致（比例差
+    #    + 面积不足 + 最小尺寸软惩罚），n≤6 穷举、n>6 排序配对；perm[i] =
+    #    窗口 i 占第几格。非智能时严格按顺序对应。
+    #
+    # 必须拿 **slots 里的窗口**去分配，不能拿 wins[:n]：fit_report 会把装不下
+    # 的窗口从 slots 里剔掉，wins 与 slots 的下标从此错开——用 wins[:n] 会
+    # 把一个已经被剔除的窗口分到格子上，而真正该排的窗口反而没格可去
+    # （真机「智能/非智能都不准」的一部分来源）。slots[i][2] 就是与第 i 格
+    # 配对的那个窗口 dict（fit_report 按 i 一并写入）。
+    n = len(slots)
+    slot_wins = [s[2] for s in slots]
+    order = list(range(n))
+    if smart and n > 1:
+        sizes = [(a[5], a[6]) for a, _h, _w in slots]
+        perm = grid_plan.assign_windows(slot_wins, sizes, smart=True)
+        # assign_windows 返回 perm[i] = 窗口 i 占第几格；反排成
+        # order[k] = 第 k 格放哪个窗口（在 slot_wins 里的下标）
+        order = [0] * n
+        for wi, ci in enumerate(perm):
+            if 0 <= ci < n:
+                order[ci] = wi
+
+    # 7) 写入：每格一个窗口，贴所在屏的锚定边；读回实测，被 App 顶出格子时
+    #    按锚定边收尾（绝不居中：居中写完不更新尺寸，且居中坐标常越出工作区，
+    #    用户看到的就是「没吸附到边上」）。
+    #
+    # order 必须真的用上：智能分配算完的 order 若不被写入循环读，格子与窗口
+    # 就仍是 fit_report 的顺序对应，勾不勾「智能」排出来一模一样——那就是
+    # 用户说的「智能模式没效果」。
+    report = []
+    unwritable = []
+    for k in range(n):
+        row, col, mi, gx, gy, gw, gh = slots[k][0]
+        hwnd = slot_wins[order[k]].get("hwnd") or slots[k][1]
+        mon = ms[mi]
+        try:
+            pre = _cg_rect(hwnd)
+            set_window_rect(hwnd, gx, gy, gw, gh, activate=False)
+            got = _settled_readback(hwnd, (gx, gy, gw, gh))
+            post = _cg_rect(hwnd)
+            # 要求了一个有意义的变化、CG 几何却一步没变 = 窗口动不了：App 不
+            # 开放自动化（真机微信、CrossPaste 恒报 -1719）或被系统钉死
+            # （真机 Sidecar 上的 UU远程）。与「被最小尺寸钳制」分开说。
+            if (pre and post and hwnd not in unwritable
+                    and any(abs(p - t) > 2
+                            for p, t in zip(pre, (gx, gy, gw, gh)))
+                    and all(abs(p - t) <= 2 for p, t in zip(pre, post))):
+                unwritable.append(hwnd)
+                _last_grid_notes.append(
+                    "%s 写入后位置尺寸都没变，无法移动"
+                    "（不开放自动化或被系统钉住）" % hwnd.split("::")[0])
+                logger.warning("虚拟网格：%s 写入无效：要求 %s，CG 几何仍是 %s",
+                               hwnd, (gx, gy, gw, gh), post)
+            if not got or got == (0, 0, 0, 0):
+                report.append((hwnd, (gx, gy, gw, gh), None))
+                _last_grid_notes.append("%s 读不到几何" % hwnd.split("::")[0])
+                continue
+            report.append((hwnd, (gx, gy, gw, gh), got))
+            if abs(got[2] - gw) <= 8 and abs(got[3] - gh) <= 8:
+                continue
+            # 被 App 顶出格子：只重锚定贴边的那一侧（右列贴右、下行贴底），
+            # 溢出只发生在远离锚定边的那一侧（BTT windowAnchor 同语义）。
+            if hwnd in unwritable:
+                continue
+            ax, ay = gx, gy
+            if col >= n_cols - 1:
+                ax = gx + gw - got[2]
+            if row >= n_rows - 1:
+                ay = gy + gh - got[3]
+            ax = max(int(mon.work_left),
+                     min(ax, int(mon.work_left) + int(mon.work_width) - got[2]))
+            ay = max(int(mon.work_top),
+                     min(ay, int(mon.work_top) + int(mon.work_height) - got[3]))
+            if (ax, ay) != (got[0], got[1]):
+                set_window_rect(hwnd, ax, ay, got[2], got[3], activate=False)
+            _last_grid_notes.append(
+                "%s 实际 %dx%d（被应用最小尺寸顶大，格子 %dx%d）"
+                % (hwnd.split("::")[0], got[2], got[3], gw, gh))
+        except Exception:  # noqa: BLE001
+            logger.warning("虚拟网格：写入 %s 失败", hwnd, exc_info=True)
+            unwritable.append(hwnd)
+
+    # 8) 装不下的逐个说明：排了几个、谁没排、为什么。用户才知道该关谁、换谁。
+    for h, _w, r in too_small:
+        mw, mh = mins.get(h, (0, 0))
+        _last_grid_notes.append(
+            "%s(最小%dx%d) 放不下它那一格（%dx%d），已保持原位"
+            % (h.split("::")[0], mw, mh, r[2], r[3]))
+    _last_grid_report = report
+    logger.info("虚拟网格完成: %d/%d 个窗口 -> %d 格（%d列×%d行，%d 块屏）",
+                len(report), len(wins), len(asg), n_cols, n_rows, len(ms))
+    return len(report)
+
+
 # ── 四宫格：最小尺寸实测与几何 ─────────────────────────────────────────
 
 # 探测最小尺寸时请求的尺寸：宽高都明显小于常见 App 的下限，读回的就是下限
 _PROBE_W, _PROBE_H = 320, 120
+
+# 读回值必须比请求值大多少才承认是 App / 系统下限。差值不足说明写入已到达
+# 目标尺寸——读回的是「这次写入的结果」，不是可缩空间的下限。
+_PROBE_MIN_SLACK = 4
+
+# 按住缩放角逐轮逼近的容差：读回连续两轮逐维一致才停。
+_PROBE_RESIZE_TOL = 2
 
 # 探测写入后等动画的时间（真机实测 0.3s 已稳定，留点余量）
 _probe_settle_secs = 0.45
@@ -1535,7 +1937,7 @@ def _ax_read_rect(app, win_sel):
     )
     out = _osa(script)
     try:
-        x, y, w, h = (int(float(v)) for v in out.split(","))
+        x, y, w, h = _parse_nums(out)
         return (x, y, w, h)
     except Exception:  # noqa: BLE001
         return None
@@ -1619,58 +2021,105 @@ def _readback_rect(hwnd, target):
     return _fresh_rect(hwnd)
 
 
-def _probe_min_size(hwnd, at_x, at_y):
-    """实测一个窗口的最小可用尺寸：写一个小尺寸，读回被 App 钳制后的几何。
+def _probe_resize(hwnd, app, sel, at_x, at_y, target):
+    """把窗口缩到 target 并读回稳定后的 (w, h)。
 
-    macOS 上查不到这个值——真机实测 ChatGPT / Qoder CN 等窗口根本没有
-    AXMinSize 属性，只能写小再读回。返回 (min_w, min_h)；读不到时返回 (0, 0)。
-
-    位置先挪到目标屏工作区左上角再缩小：App 的最小尺寸会把窗口撑回去，
-    贴着屏幕底边缩小时撑回去的那部分就出了屏，macOS 会把整个窗口判给别的屏
-    （真机实测 RV200 Pro 上 ChatGPT y=-200 被搬到主屏）——探测不能反过来把
-    窗口搬走。写完留下的几何无所谓，紧接着的正式排布会把它放进自己的格子。
+    反复写同一个目标尺寸，直到动画稳定。返回读不到几何时是 None。
     """
-    app, name, _seq = parse_hwnd(hwnd)
-    # 探测用的选择子在探测前算好：探测会把窗口缩到 320x120，之后任何按几何
-    # 匹配都会因偏差过大而失效（真机实测偏差 2939），序号选择又会落到别的
-    # 同名窗口上——这正是「四宫格把窗口送到 Sidecar」的根因。
-    sel = (_ax_window_by_geometry(app, _last_rect.get(hwnd), name)
-           or _ax_window_selector(hwnd) or "window 1")
     script = (
         'tell application "System Events"\n'
         f'  tell process "{app}"\n'
         f'    set position of {sel} to {{{int(at_x)}, {int(at_y)}}}\n'
-        f'    set size of {sel} to {{{_PROBE_W}, {_PROBE_H}}}\n'
+        f'    set size of {sel} to {{{int(target[0])}, {int(target[1])}}}\n'
         '  end tell\n'
         'end tell\n'
     )
-    # 真机实测：同一个 App 用同一个小尺寸写入，读回值不稳定——有时是钳制后的
-    # 下限、有时是写入过程里的中间值（还带着旧的大尺寸）。旧的「探两次取逐维
-    # 更小」因此取到了收缩中间帧：访达探出 322、实际下限 404，四宫格按 322
-    # 留空间，写入时窗口被撑回 404，上下两排重叠 40px——「不准」的来源之一。
-    # 改成连续轮询：连续两次读数逐维一致（±2px）才认，读满 6 轮仍不一致就取
-    # 最后一次（至少比中间帧接近真实下限）。
-    stable = None
     last = None
+    same = 0
     for i in range(_PROBE_MAX_READS):
         _osa(script)
         time.sleep(_probe_settle_secs if i == 0 else _probe_poll_secs)
         got = _readback_rect(hwnd, (int(at_x), int(at_y),
-                                    _PROBE_W, _PROBE_H))
+                                    int(target[0]), int(target[1])))
         if not got or got == (0, 0, 0, 0):
             continue
         cur = (got[2], got[3])
         if cur[0] <= 0 or cur[1] <= 0:
             continue
+        if last is not None and all(abs(a - b) <= _PROBE_RESIZE_TOL
+                                    for a, b in zip(cur, last)):
+            same += 1
+            if same >= 2:
+                return cur
+        else:
+            same = 0
         last = cur
-        if stable is not None and all(abs(a - b) <= 2
-                                      for a, b in zip(cur, stable)):
-            return cur
-        stable = cur
-    if last is None:
+    return last
+
+
+def _probe_min_size(hwnd, at_x, at_y):
+    """实测一个窗口的最小可用尺寸：按住缩放角逐步收紧，直到读回不再变小。
+
+    macOS 上查不到这个值——真机实测 ChatGPT / Qoder CN 等窗口根本没有
+    AXMinSize 属性，只能写小再读回。返回 (min_w, min_h)；读不到时返回 (0, 0)。
+
+    旧探针只把窗口压到 (_PROBE_W, _PROBE_H) 然后读回。问题是 App 不给下限时
+    macOS 会照常执行缩放：稳定值就是这次写入的结果，不是可缩空间的下限。真机
+    实测「系统设置」被探成 754x540，四宫格留出 754 宽，但正式写入能收进 488
+    高的格子；「iPhone镜像」反过来探成 204x452。二者都造成几百像素偏差。
+    正确做法是模拟人手拖缩放角：一次比一次小，读回不再变小（或小于合理值）才
+    承认是真实下限。
+    """
+    app, name, _seq = parse_hwnd(hwnd)
+    # 探测前刷新一次真实几何：_last_rect 可能是上一个窗口刚搬完留下的旧值，
+    # 拿它算 AX 选择子必然偏差过大（真机日志 999~1176px），选择子落到别的
+    # 同名窗口上，整轮最小尺寸探测就是错的。
+    _fresh = _fresh_rect(hwnd)
+    if _fresh and _fresh != (0, 0, 0, 0):
+        _last_rect[hwnd] = _fresh
+    # 探测用的选择子在探测前算好：探测会把窗口缩得很小，之后任何按几何
+    # 匹配都会因偏差过大而失效（真机实测偏差 2939），序号选择又会落到别的
+    # 同名窗口上——这正是「四宫格把窗口送到 Sidecar」的根因。
+    sel = (_ax_window_by_geometry(app, _last_rect.get(hwnd), name)
+           or _ax_window_selector(hwnd) or "window 1")
+    # 第一次必须读到一个明显大于目标的值；没到说明这条路探不出真实下限。
+    first = _probe_resize(hwnd, app, sel, at_x, at_y,
+                          (_PROBE_W, _PROBE_H))
+    if not first:
         logger.warning("最小尺寸探测读不到几何: %s", hwnd)
         return (0, 0)
-    return last
+    # 多窗串读保险：AX 选择子可能按旧几何错位，写入小尺寸后读到另一个窗口。
+    # 探测期间先回到被写窗口再确认一次；如果读回仍在屏幕远处，说明不是
+    # 被探测窗口，放弃下限推断以免把别人的几何当成自己的下限。
+    pos = _readback_rect(hwnd, (int(at_x), int(at_y),
+                                _PROBE_W, _PROBE_H))
+    if pos and pos[:2] != (int(at_x), int(at_y)):
+        logger.warning("最小尺寸探测读回串窗: %s", hwnd)
+        return (0, 0)
+    if any(b < a + _PROBE_MIN_SLACK
+           for a, b in zip((_PROBE_W, _PROBE_H), first)):
+        return first
+    # 缩放角逼近：宽/高交替收紧到上轮的 0.7，最少留 24px。读回不再变小
+    # （连续两次相同）说明触到了 App 或系统下限；目标过小则停在合理值。
+    prev = first
+    for i in range(6):
+        tw = max(24, int(round(prev[0] * 0.7)))
+        th = max(24, int(round(prev[1] * 0.7)))
+        if (tw, th) == prev:
+            break
+        got = _probe_resize(hwnd, app, sel, at_x, at_y, (tw, th))
+        if not got:
+            break
+        if got[0] > prev[0] + _PROBE_RESIZE_TOL or got[1] > prev[1] + _PROBE_RESIZE_TOL:
+            # 往小写反而变大：App 把窗口撑回去了，上一轮就是下限。
+            break
+        if (got[0] < prev[0] - _PROBE_RESIZE_TOL
+                or got[1] < prev[1] - _PROBE_RESIZE_TOL):
+            prev = got
+            continue
+        prev = got
+        break
+    return prev
 
 
 def _cg_rect(hwnd):
@@ -1872,7 +2321,7 @@ def _quad_needs(placed_slots, mins, shape, gap, edge_gap):
 
 
 def _quad_cells(placed_slots, mins, wl, wt, ww, wh, gap, edge_gap,
-                sx, sy):
+                sx, sy, maxes=None, manual_split=False):
     """按形状 + 需求 + 比例切出格子与写入目标。
 
     placed_slots: [(corner, hwnd, win_dict), ...] 实际排放的窗口（1~4 个）
@@ -1894,17 +2343,85 @@ def _quad_cells(placed_slots, mins, wl, wt, ww, wh, gap, edge_gap,
     occ = [c for c, _h, _w in placed_slots]
     shape = quad_plan.quad_shape(occ)
     need_col, need_row = _quad_needs(placed_slots, mins, shape, gap, edge_gap)
+    # 实测上限：App 拒绝长到目标时（真机「系统设置」最大窗宽 754），
+    # 把多出来的空间让给另一侧，而不是留出一个 450px 的空格子让用户看成
+    # 「不准」。maxes[h] = (max_w, max_h)；没有实测上限的轴按原逻辑走。
+    # manual_split 由调用方传：智能模式算出的 sx/sy 不是 0.5，不能据此
+    # 误判成手动比例。真正的手动 split_x/split_y 会破坏上限重分配契约。
+    maxes = maxes or {}
+    cap_col = [None, None]
+    cap_row = [None, None]
+    if maxes and not manual_split:
+        half = gap / 2.0
+        for corner, h, _w in placed_slots:
+            mx = maxes.get(h)
+            if not mx:
+                continue
+            gl, gt, gr, gb = _quad_gap_insets(shape, corner, half, edge_gap)
+            ci = 0 if corner in (0, 2) else 1
+            ri = 0 if corner in (0, 1) else 1
+            if mx[0] > 0:
+                cap_col[ci] = max(cap_col[ci] or 0, int(round(mx[0] + gl + gr)))
+            if mx[1] > 0:
+                cap_row[ri] = max(cap_row[ri] or 0, int(round(mx[1] + gt + gb)))
     base_c1 = int(round(ww * sx))
     base_r1 = int(round(wh * sy))
     # row_full / col_full / wide 都由 quad_shape 定，quad_cells 按 c1/r1 落地：
     # 只有一排/列有窗口时那一排/列撑满；某排只占一格那一格拉通整宽（T 形）
     if shape["row_full"]:
-        r1 = wh if shape["cnt_row"][0] else 0
+        # 一排撑满时没有上下邻居，不能被 cap_row 硬切小；但 cap_row 仍然有用：
+        # 下排若有窗口、高度被钳住，上排可以先按 cap_row[0] 切，余量给下排。
+        if (cap_row[0] is not None and cap_row[1] is not None
+                and cap_row[0] + cap_row[1] > wh + _QUAD_SLACK_TOL
+                and cap_row[1] <= wh):
+            r1 = max(0, wh - cap_row[1])
+        else:
+            r1 = wh if shape["cnt_row"][0] else 0
+    elif (cap_row[0] is not None
+          and cap_row[0] + need_row[1] <= wh + _QUAD_SLACK_TOL):
+        # 与列同理：两排都有上限时按上限贴边，剩余给另一排。双上限时上排
+        # 是限制因素就取其上限当格高，下排在格内贴上排锚定，余量落屏幕
+        # 外缘（下排窗口贴邻居，不贴屏幕外缘——与列分支同一语义）。
+        if cap_row[1] is not None:
+            r1 = max(0, min(cap_row[0], wh - cap_row[1]))
+        else:
+            r1 = min(wh, cap_row[0])
+        # 上限不能让需求落空：本排有窗口实测要 606 高、上限却只有 576（上限
+        # 来自同排另一个窗口的最大高度）——压到 576，要 606 的窗口必溢出到
+        # 下排，用户看到的就是「上下重叠」。需求优先，上限只用来收余量。
+        if need_row[0] > r1:
+            r1 = min(wh, need_row[0])
+    elif (cap_row[1] is not None
+          and need_row[0] + cap_row[1] <= wh + _QUAD_SLACK_TOL):
+        r1 = max(0, wh - cap_row[1])
     else:
         r1, _r2 = _quad_split(wh, need_row[0], need_row[1], base_r1,
                               wh - base_r1)
     if shape["col_full"]:
         c1 = ww if shape["cnt_col"][0] else 0
+    elif (cap_col[0] is not None
+          and cap_col[0] + need_col[1] <= ww + _QUAD_SLACK_TOL):
+        # 左列有上限。若右列也有上限，两列都按各自上限贴边：右侧窗口贴右边
+        # 界、吃自己的上限，剩余全给左列（左列的上限只是「不超过」，不是
+        # 「必须等于」——真机系统设置 754 是最大窗宽，格子给 1264 它也只占
+        # 754，多出来的 510px 会变成右列的空白）。只有右列没有上限时才把
+        # 左列压到 cap，否则左列格子比窗口大一大截，用户看到的就是「不准」。
+        if cap_col[1] is not None:
+            # 双上限贴邻居：左列是限制因素时左格=其上限，右窗在格内贴左
+            # 界锚定，余量落屏幕右缘；右列上限更大时左窗撑满、右窗贴右
+            # 缘。旧实现取 ww - cap_col[1]，左窗够不到上限时间隙留在两
+            # 个窗口之间——用户看到的就是「不准」（真机 516px 缝）。
+            c1 = max(0, min(cap_col[0], ww - cap_col[1]))
+        else:
+            c1 = min(ww, cap_col[0])
+        # 与排同款：左列需求大于上限时（上限可能来自右列窗口的最大宽）
+        # 需求优先，否则左窗必溢出到右列——用户看到的就是「左右重叠」。
+        if need_col[0] > c1:
+            c1 = min(ww, need_col[0])
+    elif (cap_col[1] is not None
+          and need_col[0] + cap_col[1] <= ww + _QUAD_SLACK_TOL):
+        # 只有右列有上限：把它紧贴右边界，左列吃剩余空间。
+        c1 = max(0, ww - cap_col[1])
     else:
         c1, _c2 = _quad_split(ww, need_col[0], need_col[1], base_c1,
                               ww - base_c1)
@@ -1938,13 +2455,17 @@ def _quad_overload(placed_slots, mins, ww, wh, gap, edge_gap):
     （取到收缩中间帧）时两者能差出 170px 以上——预检说装得下，写进去窗口被
     App 撑大，两个方向的需求随之超过工作区，这时候照原样切格子只能按需求占比
     硬分，上下两排互相压住。用户看到的就是「不准」，所以写入后必须再判一次。
+
+    探测有 1~2px 抖动，总和只超屏几个像素时允许微重叠——零容差会把差几像素
+    就能放下四格的窗口全丢掉。与 quad_plan._SLACK_TOL 保持一致。
     """
     if not placed_slots:
         return False
     shape = quad_plan.quad_shape([c for c, _h, _w in placed_slots])
     need_col, need_row = _quad_needs(placed_slots, mins, shape, gap, edge_gap)
-    return (need_col[0] + need_col[1] > ww
-            or need_row[0] + need_row[1] > wh)
+    tol = getattr(quad_plan, "_SLACK_TOL", 6)
+    return (need_col[0] + need_col[1] > ww + tol
+            or need_row[0] + need_row[1] > wh + tol)
 
 
 def _quad_smart_ratio(placed_slots, mins, ww, wh, sx, sy, origin=(0, 0)):
@@ -1975,6 +2496,17 @@ def _quad_smart_ratio(placed_slots, mins, ww, wh, sx, sy, origin=(0, 0)):
     return sx, sy
 
 
+def _gap_rect_raw(r, wl, wt, ww, wh):
+    """矩形与工作区交集，绕过 _last_gap_all。
+
+    _quad_anchor 的右/下边界计算必须保留被 App 撑大后越出工作区的原始
+    负值（用于取「贴远侧」的 min），不能被 gap_rect 全局缓存改成 0。
+    """
+    return (max(r[0], wl), max(r[1], wt),
+            max(1, min(r[0] + r[2], wl + ww) - max(r[0], wl)),
+            max(1, min(r[1] + r[3], wt + wh) - max(r[1], wt)))
+
+
 def _quad_anchor(corner, fx, fy, fw, fh, gw, gh, wl, wt, ww, wh):
     """窗口被 App 最小尺寸顶大/顶小后，按方位把该贴的边贴住的目标位置。
 
@@ -1986,12 +2518,27 @@ def _quad_anchor(corner, fx, fy, fw, fh, gw, gh, wl, wt, ww, wh):
     RV200 Pro）。
     """
     ax, ay = fx, fy
-    if corner in (1, 3):          # 右列：贴目标矩形右边
-        ax = min(max(fx + fw - gw, wl), max(fx, wl + ww - gw))
+    # 被钳小（读回比目标小）与被顶大（读回比目标大）锚定语义相反：钳小
+    # 时窗口贴目标矩形的内侧边（挨着邻居），顶大时才贴屏幕外缘防越界
+    # 搬屏。两轴独立：宽高比联动的窗口（真机 iPhone镜像）宽钳缩、高
+    # 不钳，各轴各贴各的。
+    shrink_w = gw < fw - 8
+    shrink_h = gh < fh - 8
+    # 目标矩形可能因 App 上限撑出工作区（真机系统设置最大化后仍被钳在
+    # 754，撑大目标时右缘可到 1526）。gap_rect 会把越界裁到 0，导致
+    # min/max 顺序失效、窗被推到屏幕左侧。这里用交集绕过 _last_gap_all，
+    # 保留原值以维持 BTT 语义：贴边角永远贴住，溢出只发生在远离角的一侧。
+    if corner in (1, 3) and not shrink_w:   # 右列未被钳小：贴目标矩形右边
+        _rx = _gap_rect_raw((fx, fy, fw, fh), wl, wt, ww, wh)
+        ax = min(max(_rx[0] + _rx[2] - gw, wl),
+                 max(fx, _gap_rect_raw((fx, fy, fw, fh), wl, wt, ww, wh)[0]
+                     + _rx[2] - gw))
     else:                          # 左列：贴目标矩形左边
         ax = max(min(fx, wl + ww - gw), wl)
-    if corner in (2, 3):          # 下排：贴目标矩形底边，底缘优先
-        ay = min(max(fy + fh - gh, wt), max(fy, wt + wh - gh))
+    if corner in (2, 3) and not shrink_h:   # 下排未被钳小：贴目标矩形底边
+        _by = _gap_rect_raw((fx, fy, fw, fh), wl, wt, ww, wh)
+        ay = min(max(_by[1] + _by[3] - gh, wt),
+                 max(fy, _by[1] + _by[3] - gh))
     else:                          # 上排：贴目标矩形上边
         ay = max(min(fy, wt + wh - gh), wt)
     return ax, ay
@@ -2008,11 +2555,17 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
     第一趟的结果，被钳制的窗口两趟读回相同，会被误判成「一步没动、写不动」。
     """
     measured = {}
+    clamped = {}
     for corner, h, fx, fy, fw, fh in finals:
         # 写入前先取 CG 几何：判「写入有没有生效」用它，不用 _last_rect（探测
         # 失败时它可能停留在很久以前的枚举值），也不用 AX 读回（App 不开放
         # 自动化时读回直接失败，真机微信、CrossPaste 恒报 -1719）
-        pre = _cg_rect(h) if detect_unwritable else None
+        # 写入前几何始终读：钳制判定要看「这次写入是放大请求还是缩小请求」
+        # ——宽高比锁定的窗口（真机 iPhone镜像 ~0.455）收缩时宽高联动，
+        # 读回比目标小是几何约束不是尺寸上限；当上限记进 maxes 会永久
+        # 卡死二趟重排（min(old,new) 只收紧不放宽）。CG 枚举不走
+        # AppleScript，便宜；detect_unwritable 仍只门「写入无效」判定。
+        pre = _cg_rect(h)
         set_window_rect(h, fx, fy, fw, fh, activate=False)
         got = _settled_readback(h, (fx, fy, fw, fh))
         post = _cg_rect(h) if detect_unwritable else None
@@ -2035,6 +2588,40 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
             continue
         gx, gy, gw, gh = got
         measured[h] = got
+        # 上限钳制：App 拒绝长到目标（真机「系统设置」的最大窗宽 754，
+        # AXMinSize/MaxSize 都是 missing value）。这不是间距噪声，必须
+        # 交给二趟重排当硬上限用，否则那 450px 偏差会一直留在报告里。
+        # 钳制判定看写入方向：只有「要求放大却被读回更小」才是 App 的最大
+        # 尺寸上限。缩小请求下读回更小只是宽高比联动（真机 iPhone镜像锁
+        # ~0.455，要求 296 读回 242），当上限记会让格子只收紧不放宽。
+        _grow_w = pre is not None and pre[2] > 0 and pre[2] < fw - 8
+        _grow_h = pre is not None and pre[3] > 0 and pre[3] < fh - 8
+        _cap_w = _grow_w and gw < fw - 8
+        _cap_h = _grow_h and gh < fh - 8
+        if (_cap_w or _cap_h) and h not in unwritable:
+            # 一次读回可能是收缩中间帧（真机 iPhone镜像 411/234/242 不定）。
+            # 用**只读**方式多确认几次（不重写、不多动窗口）：连续两次读数
+            # 一致、或读数逐次更小并开始收敛，就取当前最小值当上限。单次读
+            # 会把中间帧当成真实上限，格子来回跳不收敛；真机 AppleScript 每
+            # 次写入上百毫秒，这里绝不多写。
+            cap = (int(gw), int(gh))
+            for _retry in range(2):
+                again = _settled_readback(h, (fx, fy, fw, fh))
+                if not again or again == (0, 0, 0, 0):
+                    break
+                aw, ah = int(again[2]), int(again[3])
+                settled = abs(aw - cap[0]) <= 2 and abs(ah - cap[1]) <= 2
+                cap = (min(cap[0], aw), min(cap[1], ah))
+                if settled:
+                    break
+            # 0 = 该轴没有实测上限（不是放大请求，或读回没更小）。主循环
+            # 按轴合并时避 0，_quad_cells 按 >0 消费。
+            clamped[h] = (cap[0] if _cap_w else 0,
+                          cap[1] if _cap_h else 0)
+            if _cap_w:
+                gw = cap[0]
+            if _cap_h:
+                gh = cap[1]
         # 被 App 最小尺寸顶大时不居中：居中坐标常越出工作区（左上格算出的
         # cy 会被 max(wt, ...) 夹回 wt，等价于贴顶；右上格窄窗被推到工作区
         # 左边界外），而且居中写完 gw/gh 没更新，下面的四角锚定仍会把居中
@@ -2045,6 +2632,9 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
         # 少 1~2px 是常态（AX 读回噪声），不该触发重排。
         if abs(gw - fw) <= 8 and abs(gh - fh) <= 8:
             continue
+        # 反向钳制不需要补写同一目标：上面的只读轮询已经把 gw/gh 收敛到稳定
+        # 值，再写一次目标只会让 App 再拒绝一次、窗口再抖一下（真机每个 AX
+        # 写入上百毫秒）。贴边收尾在下面按 gw/gh 写，锚定角永远贴住目标边。
         # 刚判过「写入无效」的窗口不再补刀：它动不了，再写一次只是白等一个
         # AppleScript 往返（真机每个 AX 写入上百毫秒），报告里已经有了
         if h in unwritable:
@@ -2058,7 +2648,7 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
                               wl, wt, ww, wh)
         if (ax, ay) != (gx, gy):
             set_window_rect(h, ax, ay, gw, gh, activate=False)
-    return measured
+    return measured, clamped
 
 
 def _fresh_win(entry, pre_probe):
@@ -2074,6 +2664,79 @@ def _fresh_win(entry, pre_probe):
     if cur and cur != (0, 0, 0, 0):
         w = dict(w, x=cur[0], y=cur[1], w=cur[2], h=cur[3])
     return h, w
+
+
+def _quad_pick_windows(wants, use_pinned=True):
+    """按四角选出要排的窗口：显式 hwnd 优先，空格自动补足（前几个未占用的）。
+
+    snap_four_quad 与 quad_predict（排列预演）共用这一套：预演算的必须和
+    正式排布动的是同一批窗口，两边选得不一样，预告本身就是错的——那正是
+    「预告说排四个、实际动了三个」的不准来源。
+
+    wants: (左上, 右上, 左下, 右下) 的 hwnd，None = 该格「自动」。
+    use_pinned: 空格是否优先用界面固定的目标窗口（与 snap_four_quad 同义）。
+    返回 (picked, picked_corners, missing)：
+      picked         [(hwnd, win_dict)]，按角序排好的待排窗口
+      picked_corners 每个窗口对应的角序号 0..3
+      missing        显式选中但已不可用（关掉/改名）的 hwnd。如实报出来，
+                     不能静默用别的窗口顶上——真机实测选 CodeBuddy 的格子
+                     被换成 ChatGPT，用户看到的就是「不准」
+    """
+    cands = [w for w in list_target_windows()
+             if w["pid"] not in _OWN_PIDS and w["owner"]]
+    # 自动补足时跳过 AX 够不着的 owner（如 wine）：它们会被选进四宫格，
+    # 然后每一次读写几何都失败，整轮排列卡在重试里。
+    cands = [w for w in cands if w["owner"] not in _QUAD_SKIP_OWNERS]
+    cands_by_hwnd = {w["hwnd"]: w for w in cands}
+
+    # 选几个就排几个：在网格里点掉不想要的格（或下拉里选「自动」）即可只排
+    # 两三个。这块屏放不下四个是常态（真机 Built-in 1512x896，四个窗口的
+    # App 最小尺寸总和动辄 1800x1300），能让用户主动选 2 个 / 3 个来排，比
+    # 每次放不下再解释一遍有用。显式选满 2 个及以上时不再自动补足；只选 1 个
+    # 或一个都没选时按老行为补足四个（用户还在选，或想用固定的目标窗口）。
+    keep_only_selected = len([x for x in wants if x]) >= 2
+    picked, picked_corners, seen, missing = [], [], set(), []
+    for corner, want in enumerate(wants):
+        w = None
+        if want:
+            w = cands_by_hwnd.get(want) or _find_window(want)
+            if w is None and want not in seen:
+                logger.warning("四宫格：指定的窗口 %s 已不可用", want)
+                missing.append(want)
+        elif (not keep_only_selected and use_pinned and _pinned_target
+              and _pinned_target not in seen):
+            w = _find_window(_pinned_target)
+        if w is None:
+            if keep_only_selected:
+                continue          # 用户点掉了这个角：留空，不补
+            for c in cands:
+                h = c.get("hwnd") or make_hwnd(c["owner"], c["name"] or "")
+                if h not in seen:
+                    w = c
+                    break
+        if w is None:
+            # 桌面上一共没那么多窗口：排已有的，少于两个才失败
+            continue
+        h = w.get("hwnd") or make_hwnd(w["owner"], w["name"] or "")
+        # 四宫格候选必须一对一：同一个 hwnd 占两个角时 AX 只会写/读同一扇窗，
+        # 两格互相串读。这里给第二份同键候选补上真实序号。
+        if h in seen:
+            same = _same_name_windows(w["owner"], w["name"] or "")
+            seq = None
+            for si, s in enumerate(same, 1):
+                if (s.get("wid") is not None and s.get("wid") == w.get("wid")):
+                    seq = si
+                    break
+            h = make_hwnd(w["owner"], w["name"] or "", seq or 1)
+            _last_rect[h] = (w["x"], w["y"], w["w"], w["h"])
+            logger.info("四宫格：同名候选 %s 补序号为 %s", h, h)
+        # 登记 CG 侧几何：set_window_rect 靠它在 AX 窗口列表里认出这个窗口
+        # （CG 枚举序与 AX 序不一致时，纯按序号会选到别的窗口）
+        _last_rect[h] = (w["x"], w["y"], w["w"], w["h"])
+        picked.append((h, w))
+        picked_corners.append(corner)
+        seen.add(h)
+    return picked, picked_corners, missing
 
 
 def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
@@ -2116,51 +2779,8 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     _last_quad_notes.clear()
     # 用户在下拉里选过但已不可用（关掉/改名）的窗口：如实报出来，不能静默
     # 用别的窗口顶上——那正是「智能/非智能都不准」的观感来源之一
-    _missing_windows = []
-
-    cands = [w for w in list_target_windows()
-             if w["pid"] not in _OWN_PIDS and w["owner"]]
-    cands_by_hwnd = {w["hwnd"]: w for w in cands}
-
-    # 选几个就排几个：在网格里点掉不想要的格（或下拉里选「自动」）即可只排
-    # 两三个。这块屏放不下四个是常态（真机 Built-in 1512x896，四个窗口的
-    # App 最小尺寸总和动辄 1800x1300），能让用户主动选 2 个 / 3 个来排，比
-    # 每次放不下再解释一遍有用。显式选满 2 个及以上时不再自动补足；只选 1 个
-    # 或一个都没选时按老行为补足四个（用户还在选，或想用固定的目标窗口）。
-    wants = (tl_hwnd, tr_hwnd, bl_hwnd, br_hwnd)
-    keep_only_selected = len([x for x in wants if x]) >= 2
-    picked, picked_corners, seen = [], [], set()
-    for corner, want in enumerate(wants):
-        w = None
-        if want:
-            w = cands_by_hwnd.get(want) or _find_window(want)
-            if w is None and want not in seen:
-                # 下拉里选中的窗口已经关掉/改名：如实说明，不能静默换一个
-                # 别的窗口顶上（真机实测选 CodeBuddy 的格子被换成了 ChatGPT，
-                # 用户看到的就是「智能/非智能都不准」）
-                logger.warning("四宫格：指定的窗口 %s 已不可用", want)
-                _missing_windows.append(want)
-        elif (not keep_only_selected and use_pinned and _pinned_target
-              and _pinned_target not in seen):
-            w = _find_window(_pinned_target)
-        if w is None:
-            if keep_only_selected:
-                continue          # 用户点掉了这个角：留空，不补
-            for c in cands:
-                h = c.get("hwnd") or make_hwnd(c["owner"], c["name"] or "")
-                if h not in seen:
-                    w = c
-                    break
-        if w is None:
-            # 桌面上一共没那么多窗口：排已有的，少于两个才失败
-            continue
-        h = w.get("hwnd") or make_hwnd(w["owner"], w["name"] or "")
-        # 登记 CG 侧几何：set_window_rect 靠它在 AX 窗口列表里认出这个窗口
-        # （CG 枚举序与 AX 序不一致时，纯按序号会选到别的窗口）
-        _last_rect[h] = (w["x"], w["y"], w["w"], w["h"])
-        picked.append((h, w))
-        picked_corners.append(corner)
-        seen.add(h)
+    picked, picked_corners, _missing_windows = _quad_pick_windows(
+        (tl_hwnd, tr_hwnd, bl_hwnd, br_hwnd), use_pinned=use_pinned)
     if len(picked) < 2:
         logger.warning("可排列的窗口不足两个（选中 %d 个）", len(picked))
         return False
@@ -2342,15 +2962,17 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # 写入无效的窗口（App 不开放自动化 / 被系统钉住）：写入前后几何一步没变
     unwritable = []
 
+    maxes = {}
     cells, finals, splits = _quad_cells(
-        placed_slots, mins, wl, wt, ww, wh, gap, edge_gap, sx, sy)
+        placed_slots, mins, wl, wt, ww, wh, gap, edge_gap, sx, sy,
+        maxes=maxes, manual_split=(split_x != 0.5 or split_y != 0.5))
     # 二趟重排：第一遍按探测到的最小尺寸切格子，写入后读回的是窗口**实际**占的
     # 尺寸。探测偏小（取到收缩中间帧）时窗口被 App 撑得比格子大，上下两排必然
     # 重叠——把实测尺寸并进最小尺寸（只升不降）再切一遍格子，单调收敛，最多三遍。
     for attempt in range(_QUAD_MAX_PASSES):
-        measured = _quad_write(finals, cells, wl, wt, ww, wh, smart,
-                               unwritable, notes,
-                               detect_unwritable=attempt == 0)
+        measured, clamped = _quad_write(finals, cells, wl, wt, ww, wh,
+                                        smart, unwritable, notes,
+                                        detect_unwritable=attempt == 0)
         grew = False
         for corner, h, _fx, _fy, _fw, _fh in finals:
             got = measured.get(h)
@@ -2362,6 +2984,26 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
             # 的重排；比格子还大 8px 以上，说明这一格真的装不下这个窗口。
             nw = max(mw, got[2]) if got[2] > cw + 8 else mw
             nh = max(mh, got[3]) if got[3] > ch + 8 else mh
+            # 上限钳制：旧代码只在「实测比格子大」时把下限抬上去。真机
+            # 「系统设置」相反——写 1204 宽被 App 卡回 754，实测比目标小。
+            # 不把它记为有效上限，二趟会继续切出装不下的宽格，450px 偏差
+            # 一直留在报告里。钳制值 >8px 才记（1~2px 是 AX 读回噪声）。
+            if h in clamped:
+                old_cap = maxes.get(h)
+                # 每轮只收紧不放宽：读回可能取到收缩中间帧（真机 iPhone镜像
+                # 第一轮 411、第二轮才稳定 242），放宽会让格子来回跳。
+                new_cap = clamped[h]
+                if old_cap:
+                    # 按轴合并：0 表示该轴没有实测上限，min 会把另一轴已探到
+                    # 的上限清掉（真机第二遍只确认高度上限，宽度上限来自
+                    # 第一遍——第一遍宽度不是放大请求，记的就是 0）
+                    merged = []
+                    for _o, _n in zip(old_cap, new_cap):
+                        merged.append(min(_o, _n) if (_o and _n) else (_o or _n))
+                    new_cap = tuple(merged)
+                if old_cap != new_cap:
+                    grew = True
+                maxes[h] = new_cap
             if (nw, nh) != (mw, mh):
                 mins[h] = (nw, nh)
                 grew = True
@@ -2406,7 +3048,8 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
             sx, sy = _quad_smart_ratio(placed_slots, mins, ww, wh, sx, sy,
                                        origin=(wl, wt))
         cells2, finals2, splits2 = _quad_cells(
-            placed_slots, mins, wl, wt, ww, wh, gap, edge_gap, sx, sy)
+            placed_slots, mins, wl, wt, ww, wh, gap, edge_gap, sx, sy,
+            maxes=maxes, manual_split=(split_x != 0.5 or split_y != 0.5))
         if cells2 == cells and finals2 == finals and not reduced:
             break
         cells, finals, splits = cells2, finals2, splits2
@@ -2462,8 +3105,21 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
                          % (h.split("::")[0], got))
             logger.warning("四宫格：%s 被移到别的屏 -> %s", h, got)
         elif dev > 8:
+            # 偏差方向说明限制来自哪一侧：比目标小是 App 的最大尺寸或
+            # 宽高比锁死（真机 iPhone镜像宽高比 ~0.455，写宽必缩高），
+            # 比目标大是最小窗口尺寸顶大。说反了用户按错误的方向去调。
+            _why = []
+            if any(g < t - 8 for g, t in zip(got[2:], want[2:])):
+                _why.append("被应用的最大尺寸或宽高比限制")
+            if any(g > t + 8 for g, t in zip(got[2:], want[2:])):
+                _why.append("被应用的最小窗口尺寸顶大")
+            _why_s = "、".join(_why) or "被应用钳制"
             logger.info("四宫格偏差 %s：目标=%s 实测=%s（最大偏差 %d px，"
-                        "可能被应用的最小窗口尺寸钳制）", h, want, got, dev)
+                        "%s）", h, want, got, dev, _why_s)
+            # 物理限制要摆到用户眼前：只进日志的话，状态栏显示「排列
+            # 完成」，旁边却留着几百 px 空白，用户不知道是 App 锁的
+            notes.append("%s 实际 %dx%d（%s）"
+                         % (h.split("::")[0], got[2], got[3], _why_s))
     global _last_quad_report
     _last_quad_report = report
     global _last_quad_unwritable
@@ -2518,6 +3174,13 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     for _h, _m in mins.items():
         if _m and _m[0] > 0 and _m[1] > 0:
             _QUAD_MIN_CACHE[_h] = (int(_m[0]), int(_m[1]))
+    # 尺寸上限缓存给预演（quad_predict）用：点排列前就能说出「这一格会留
+    # 多少空白」。0 = 该轴没有实测上限，与最小尺寸一样只存至少一轴有值的
+    # 条目——全 0 记上去会让 _quad_cells 把格子按 0 切。
+    for _h, _c in maxes.items():
+        if _c and (_c[0] > 0 or _c[1] > 0):
+            _QUAD_MAX_CACHE[_h] = (int(_c[0]), int(_c[1]))
+    _quad_cache_save()
     _last_quad_notes[:] = notes
     return True
 
@@ -2598,6 +3261,152 @@ def quad_capacity(hwnds, monitor=None):
             "fit": _fit(best), "total": len(hwnds),
             "need": need,
             "uncached": [h.split("::")[0] for h in hwnds if h not in cached]}
+
+
+def quad_predict(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
+                 use_pinned=True, monitor=None, smart=False, split_x=0.5,
+                 split_y=0.5, blank_tol=100):
+    """预演：用上次实测缓存的尺寸推算一次四宫格，**不动任何窗口**。
+
+    为什么需要它：有两类「不准」在点下按钮之前就能知道。一是 App 把窗口
+    钳在更小处（真机「系统设置」最大窗宽 754、iPhone镜像 宽高比锁定），
+    格子却按满屏切，排完留几百 px 空白；二是这块屏按上次实测的最小尺寸
+    其实装不下这么多窗口，硬排只能重叠、或把窗口判给别的屏。预演把这两类
+    结果提前摆出来，用户点头再动窗口。
+
+    与 snap_four_quad 的关系：**同一套数学**（_quad_place 选子集 + 智能
+    分配 + _quad_cells 切格子），只把「现场实测」换成「上次排布的缓存」
+    （_QUAD_MIN_CACHE / _QUAD_MAX_CACHE，排完写盘 quad_cache.json，App
+    启动时读入），一个 set_window_rect 都不调。
+
+    任一窗口没有最小尺寸缓存（从没排过）时返回空警告——预演只能闭嘴，正式
+    排布会现场实测。这是已知限制：首次排列没有预告，行为与以前一致。
+
+    参数与 snap_four_quad 一一对应（角序、目标屏、比例、智能模式）。
+    返回 (warnings, detail)：warnings 是给用户看的一句话列表（空 = 没什么
+    要预告的）；detail 是 dict（screen / work / fit / total / splits /
+    blank / uncached），供界面与日志使用。
+    """
+    # 选窗与 snap_four_quad 同一套（「自动」补足 / 钉住窗口 / 同名补序号）：
+    # 预演必须算正式排布会动的那批窗口，选得不一样，预告本身就是错的
+    picked, picked_corners, missing = _quad_pick_windows(
+        (tl_hwnd, tr_hwnd, bl_hwnd, br_hwnd), use_pinned=use_pinned)
+    detail = {"screen": "", "work": (0, 0), "fit": 0, "total": len(picked),
+              "splits": None, "blank": [], "uncached": []}
+    warnings = []
+    if missing:
+        # 下拉里选中的窗口已关掉/改名：正式排列会跳过它，预演照说
+        names = "、".join(x.split("::")[0] for x in missing[:3])
+        warnings.append("「%s」已不可用，将只排列剩下的窗口" % names)
+    if len(picked) < 2:
+        return warnings, detail
+    # 最小尺寸必须全部有缓存：没探过的窗口只能瞎猜，而猜错比不猜更糟——
+    # 把「装得下」说成「装不下」，用户白关一个窗口
+    mins = {}
+    for h, _w in picked:
+        m = _QUAD_MIN_CACHE.get(h)
+        if not m or m[0] <= 0 or m[1] <= 0:
+            # 没探过最小尺寸的窗口全都记下来再闭嘴：detail 是给日志/排障用的，
+            # 只记第一个会让人以为「只有一个窗口没探过」
+            detail["uncached"].append(h)
+            continue
+        mins[h] = m
+    if detail["uncached"]:
+        return warnings, detail
+    try:
+        ms = monitors.enum_monitors()
+    except Exception:  # noqa: BLE001  预演只是预告，读不到屏就闭嘴
+        ms = []
+    if not ms:
+        return [], detail
+    _h0, w0 = picked[0]
+    idx = _resolve_monitor_index(ms, monitor)
+    if idx is None:
+        idx = _monitor_index_by_rect(ms, w0["x"], w0["y"], w0["w"], w0["h"])
+    if idx is None or not (0 <= idx < len(ms)):
+        idx = 0
+    mon = ms[idx]
+    wl, wt, ww, wh = mon.work_rect
+    sx, sy = float(split_x), float(split_y)
+    if smart:
+        # 与 snap_four_quad 的智能分配同一条路径：按宽高比重排角的归属。
+        # 预演不探测（探测是写操作），所以没有「钉死的窗口」那一档。
+        try:
+            plan_wins = []
+            for h_i, w_i in picked:
+                d = dict(w_i)
+                d.update(hwnd=h_i, min_w=mins[h_i][0], min_h=mins[h_i][1])
+                plan_wins.append(d)
+            planned, sx2, sy2 = quad_plan.plan_quad_layout(
+                plan_wins, ww, wh, corners=sorted(set(picked_corners)),
+                origin=(wl, wt))
+        except ValueError as e:  # noqa: BLE001  算不出就退回手动比例
+            logger.warning("预演：智能分配失败，按手动比例推算: %s", e)
+        else:
+            reordered = [(w.get("hwnd"), w) for _c, w in planned]
+            if (len(reordered) == len(picked)
+                    and all(h for h, _w in reordered)):
+                picked = reordered
+                picked_corners = [c for c, _w in planned]
+                sx, sy = sx2, sy2
+    # 比例钳在安全区间：与 snap_four_quad 同一口径，否则预演算的分割线与
+    # 正式排布的不是一条
+    sx = min(max(sx, 0.15), 0.85)
+    sy = min(max(sy, 0.15), 0.85)
+    gap, edge_gap = _gap_settings()
+    idx, placed_slots, unplaced = _quad_place(
+        picked, mins, picked_corners, ms, idx, gap, edge_gap,
+        allow_switch=monitor is None)
+    mon = ms[idx]
+    wl, wt, ww, wh = mon.work_rect
+    if smart:
+        sx, sy = _quad_smart_ratio(placed_slots, mins, ww, wh, sx, sy,
+                                   origin=(wl, wt))
+    # 上限缓存只取参与排列的窗口：_quad_cells 按轴消费（0 = 该轴无上限）
+    maxes = {h: _QUAD_MAX_CACHE[h] for _c, h, _w in placed_slots
+             if h in _QUAD_MAX_CACHE}
+    _cells, finals, splits = _quad_cells(
+        placed_slots, mins, wl, wt, ww, wh, gap, edge_gap, sx, sy,
+        maxes=maxes, manual_split=(split_x != 0.5 or split_y != 0.5))
+    for _corner, h, _fx, _fy, fw, fh in finals:
+        cap = maxes.get(h) or (0, 0)
+        # 这一格窗口实际能占多大：有上限的轴按上限，没上限的轴按格子
+        pw = min(fw, cap[0]) if cap[0] > 0 else fw
+        ph = min(fh, cap[1]) if cap[1] > 0 else fh
+        bw, bh = fw - pw, fh - ph
+        if bw <= blank_tol and bh <= blank_tol:
+            continue
+        app = h.split("::")[0]
+        cap_s = []
+        if cap[0] > 0:
+            cap_s.append("宽最多 %d" % cap[0])
+        if cap[1] > 0:
+            cap_s.append("高最多 %d" % cap[1])
+        side = []
+        if bw > blank_tol:
+            side.append("右侧")
+        if bh > blank_tol:
+            side.append("下方")
+        warnings.append(
+            "「%s」上次实测%s，这一格是 %d×%d，排完%s约 %dpx 空白"
+            % (app, "、".join(cap_s), fw, fh, "、".join(side), max(bw, bh)))
+        detail["blank"].append((h, bw, bh))
+    if unplaced:
+        names = "、".join(
+            "%s(最小%dx%d)" % (h.split("::")[0], mins[h][0], mins[h][1])
+            for h, _w in unplaced)
+        warnings.insert(
+            0, "只排 %d/%d 个：%s 按上次实测的最小尺寸放不下这块屏的四宫格，"
+               "将保持原位" % (len(placed_slots), len(picked), names))
+    detail["screen"] = mon.device_name
+    detail["work"] = (ww, wh)
+    detail["fit"] = len(placed_slots)
+    detail["splits"] = splits
+    if warnings:
+        logger.info("四宫格预演：%s（%s %dx%d，预计 %d/%d 个）",
+                    "；".join(warnings), mon.device_name, ww, wh,
+                    len(placed_slots), len(picked))
+    return warnings, detail
 
 
 def monitors_list_snapshot():
