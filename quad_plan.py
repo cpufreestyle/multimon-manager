@@ -25,6 +25,7 @@ plan_quad_layout 接受 1~4 个窗口与「用户在界面上点选的角」—�
 也能按宽高比分配（只占被选中的格，空格子不参与成本与比例搜索）。
 """
 import itertools
+import math
 
 
 # 每个格子至少要达到窗口原尺寸的这个比例（宽、高各自判断）。
@@ -298,43 +299,66 @@ def plan_quad_layout(wins, work_w, work_h, corners=None,
         sy_grid = [1.0] if has_row[0] else [0.0]
 
     ox, oy = origin
-    best = None
-    for sx in sx_grid:
-        for sy in sy_grid:
-            for perm in itertools.permutations(corner_list):
-                # 格子严格按比例铺满（与 windows 侧一致）：最小尺寸不抬格，
-                # 只通过 _fit_cost 的惩罚影响「谁去哪个角 / 用什么比例」。
-                pairs = list(zip(wins, perm))
-                # 按形状算实际格子：T 形下拉通整宽的那格、堆叠的那格，尺寸
-                # 与 windows 侧 _quad_cells 写出去的完全一致
+
+    all_perms = list(itertools.permutations(corner_list))
+    diag = (work_w ** 2 + work_h ** 2) ** 0.5
+    # 窗口面积与 tot_win 只跟配对有关，这里只有 n 种，先算好省掉内层乘法
+    win_area = {id(w): float(w.get("w") or 0) * float(w.get("h") or 0)
+                for w in wins}
+
+    def _search(gx, gy):
+        best = None
+        for sx in gx:
+            for sy in gy:
+                # 格子几何只取决于 (sx, sy) 和形状，与「谁去哪个角」无关：
+                # 按比例点算一次，内层的排列循环直接复用。全排列细扫因此
+                # 不必为每个排列重算 quad_cells。
                 cells = quad_cells(shape, int(round(work_w * sx)),
                                    int(round(work_h * sy)), ox, oy,
                                    work_w, work_h)
                 sizes = [(c[2], c[3]) for c in cells]
-                # 只用被占的角算成本：空格子不罚
-                cost = sum(_fit_cost(w, *sizes[c]) for w, c in pairs)
-                # 面积均衡项：被占格子的「窗口面积占比」应与其「格子面积占比」
-                # 接近。少了这一项，算法会把小窗口挤进极小格、剩下的全给大
-                # 窗口——纯凑比例的话这样总成本更低，但四格大小失衡，
-                # 不是用户要的「合适」。
-                tot_win = sum(float(w.get("w") or 0) * float(w.get("h") or 0)
-                              for w, _c in pairs) or 1.0
-                tot_cell = sum(sizes[c][0] * sizes[c][1]
-                               for _w, c in pairs) or 1.0
-                for w, c in pairs:
-                    a_w = float(w.get("w") or 0) * float(w.get("h") or 0)
-                    share_win = a_w / tot_win
-                    share_cell = (sizes[c][0] * sizes[c][1]) / tot_cell
-                    cost += BALANCE_WEIGHT * abs(share_win - share_cell)
-                # Moom 4 的 snapshotMatchingSelector 兜底判据：窗口中心点到
-                # 所去格子中心的平均距离。契合成本打平的几种摆法之间，选
-                # 「窗口不用横穿屏幕」的那个——权重见 PROX_WEIGHT，只打破
-                # 平局，不颠倒「谁合适去哪个角」的结论。
-                cost += PROX_WEIGHT * _prox_cost(
-                    pairs, _cell_centers(cells),
-                    (work_w ** 2 + work_h ** 2) ** 0.5)
-                if best is None or cost < best[0]:
-                    best = (cost, pairs, sx, sy)
+                centers = _cell_centers(cells)
+                for perm in all_perms:
+                    # 格子严格按比例铺满（与 windows 侧一致）：最小尺寸不抬格，
+                    # 只通过 _fit_cost 的惩罚影响「谁去哪个角 / 用什么比例」。
+                    pairs = list(zip(wins, perm))
+                    # 只用被占的角算成本：空格子不罚
+                    cost = sum(_fit_cost(w, *sizes[c]) for w, c in pairs)
+                    # 面积均衡项：被占格子的「窗口面积占比」应与其「格子面积占比」
+                    # 接近。少了这一项，算法会把小窗口挤进极小格、剩下的全给大
+                    # 窗口——纯凑比例的话这样总成本更低，但四格大小失衡，
+                    # 不是用户要的「合适」。
+                    tot_win = sum(win_area[id(w)]
+                                  for w, _c in pairs) or 1.0
+                    tot_cell = sum(sizes[c][0] * sizes[c][1]
+                                   for _w, c in pairs) or 1.0
+                    for w, c in pairs:
+                        share_win = win_area[id(w)] / tot_win
+                        share_cell = (sizes[c][0] * sizes[c][1]) / tot_cell
+                        cost += BALANCE_WEIGHT * abs(share_win - share_cell)
+                    # Moom 4 的 snapshotMatchingSelector 兜底判据：窗口中心点到
+                    # 所去格子中心的平均距离。契合成本打平的几种摆法之间，选
+                    # 「窗口不用横穿屏幕」的那个——权重见 PROX_WEIGHT，只打破
+                    # 平局，不颠倒「谁合适去哪个角」的结论。
+                    cost += PROX_WEIGHT * _prox_cost(pairs, centers, diag)
+                    if best is None or cost < best[0]:
+                        best = (cost, pairs, sx, sy)
+        return best
+
+    best = _search(sx_grid, sy_grid)
+    # 粗网格步长 0.05，在 1512 宽的屏上分割线误差就是 75px——真机报的
+    # 「不准」很大一部分其实是这个量化误差。围绕粗扫最优值再按 1% 绝对
+    # 格点细扫一轮（见 _fine_grid），只在找到更优解时替换。整排/整列空时
+    # 对应比例是定值（0.0/1.0），没有细化的余地，保持原样。
+    if best is not None:
+        _c, _bpairs, bsx, bsy = best
+        fx = (_fine_grid(bsx, lo, hi)
+              if has_col[0] and has_col[1] else [bsx])
+        fy = (_fine_grid(bsy, lo, hi)
+              if has_row[0] and has_row[1] else [bsy])
+        fine = _search(fx, fy)
+        if fine is not None and fine[0] < best[0]:
+            best = fine
     if best is None:
         # 理论上不会发生（候选网格非空、窗口数已校验）
         raise ValueError("没有可用的布局候选")
@@ -529,6 +553,27 @@ def _grid(center, lo, hi, step=0.05):
         n += 1
     vals.append(min(max(center, lo), hi))
     return sorted(set(round(x, 6) for x in vals))
+
+
+def _fine_grid(center, lo, hi, step=0.01, radius=0.06):
+    """细扫候选：以 1% 为绝对格点，取 center ± radius 内、钳在 [lo, hi] 的值。
+
+    必须锚在 1% 的绝对格点（0.57、0.58…），不能从 center 起按步长递推——
+    center 是窗口比例推出来的 hint（实测有过 0.582197 这种值），从它起步
+    生成的格点落在 0.572197、0.562197 上，永远踩不到 0.57，细扫再怎么密
+    也只是在错的位置上加密。radius 取 0.06（略大于粗步长 0.05）保证能覆盖
+    到粗扫最优值两侧的邻格。
+    """
+    start = int(math.ceil((center - radius - 1e-9) / step))
+    end = int(math.floor((center + radius + 1e-9) / step))
+    vals = []
+    for k in range(start, end + 1):
+        v = round(k * step, 6)
+        if lo - 1e-9 <= v <= hi + 1e-9:
+            vals.append(min(max(v, lo), hi))
+    if not vals:
+        vals.append(min(max(round(center / step) * step, lo), hi))
+    return sorted(set(vals))
 
 
 def choose_quad_slots(wins, mins, work_w, work_h, gap=0, edge_gap=False,

@@ -109,6 +109,85 @@ class TestQuadPlanSmart(unittest.TestCase):
         lay, _sx, _sy = plan_quad_smart(wins, 1920, 1080)
         self.assertEqual(len({w["hwnd"] for w in lay}), 4)
 
+    def test_split_refined_beyond_coarse_grid(self):
+        """分割比例要细化到 1% 量级，不能被粗网格的 5% 步长量化。
+
+        粗网格步长 0.05 在 1512 宽的屏上就是 75px 的分割线误差，真机报的
+        一大半「不准」是这个量化误差。细扫必须严格不劣于「只用粗网格」的
+        最优解，并在本用例里真的找到更优点。
+        """
+        import itertools
+
+        import quad_plan as qp
+
+        def cost(pairs, sx, sy, ww, wh):
+            corners = [c for _w, c in pairs]
+            shape = qp.quad_shape(corners)
+            cells = qp.quad_cells(shape, int(round(ww * sx)),
+                                  int(round(wh * sy)), 0, 0, ww, wh)
+            sizes = [(c[2], c[3]) for c in cells]
+            total = sum(qp._fit_cost(w, *sizes[c]) for w, c in pairs)
+            tot_win = sum(float(w.get("w") or 0) * float(w.get("h") or 0)
+                          for w, _c in pairs) or 1.0
+            tot_cell = sum(sizes[c][0] * sizes[c][1]
+                           for _w, c in pairs) or 1.0
+            for w, c in pairs:
+                a_w = float(w.get("w") or 0) * float(w.get("h") or 0)
+                total += qp.BALANCE_WEIGHT * abs(a_w / tot_win
+                                                - sizes[c][0] * sizes[c][1]
+                                                / tot_cell)
+            total += qp.PROX_WEIGHT * qp._prox_cost(
+                pairs, qp._cell_centers(cells),
+                (ww ** 2 + wh ** 2) ** 0.5)
+            return total
+
+        wins = [W("A", 1600, 400), W("B", 600, 1200)]
+        corners = [0, 1]
+        ww, wh = 1920, 1080
+
+        slots, sx, sy = plan_quad_layout(wins, ww, wh, corners=corners)
+        pairs = [(w, c) for c, w in slots]
+        refined = cost(pairs, sx, sy, ww, wh)
+
+        # 复算「只用 0.05 粗网格」能拿到的最好成本
+        coarse = None
+        for csx in qp._grid(0.5, 0.15, 0.85, 0.05):
+            for perm in itertools.permutations(corners):
+                c = cost(list(zip(wins, perm)), csx, 1.0, ww, wh)
+                if coarse is None or c < coarse:
+                    coarse = c
+        self.assertLessEqual(refined, coarse + 1e-9,
+                             "细扫结果不应劣于粗网格最优解")
+        self.assertLess(refined, coarse,
+                        "本用例应当真的被细扫改进（否则说明精化没生效）")
+        # 分割比例落在 1% 的绝对格点上，而不是 5% 网格、也不是
+        # 「hint 值 ± 0.01」这种跟着 hint 漂移的格点。
+        self.assertAlmostEqual(sx * 100, round(sx * 100), places=6)
+
+    def test_fine_grid_anchors_on_absolute_percent(self):
+        """细扫格点锚在 1% 绝对值上，不跟着 hint 漂移。
+
+        hint（窗口比例推出来的粗值）实测出现过 0.582197 这种值。若细扫从
+        hint 起按步长递推，格点是 0.572197 / 0.562197，永远踩不到 0.57——
+        加密也没用。这里直接对 _fine_grid 断言格点。
+        """
+        from quad_plan import _fine_grid
+
+        vals = _fine_grid(0.582197, 0.15, 0.85)
+        self.assertIn(0.57, vals)
+        self.assertIn(0.58, vals)
+        for v in vals:
+            self.assertAlmostEqual(v * 100, round(v * 100), places=6,
+                                   msg="格点 %r 不在 1%% 绝对格上" % (v,))
+        # 覆盖 center 两侧的邻格，且钳在 [lo, hi] 内
+        self.assertLess(min(vals), 0.582197)
+        self.assertGreater(max(vals), 0.582197)
+        self.assertGreaterEqual(min(vals), 0.15)
+        self.assertLessEqual(max(vals), 0.85)
+        # 下界附近不能生成越界值
+        self.assertGreaterEqual(min(_fine_grid(0.15, 0.15, 0.85)), 0.15)
+        self.assertLessEqual(max(_fine_grid(0.85, 0.15, 0.85)), 0.85)
+
     def test_rejects_wrong_window_count(self):
         with self.assertRaises(ValueError):
             plan_quad_smart(self.WINS[:3], 1920, 1080)
