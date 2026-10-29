@@ -52,6 +52,9 @@ def _run(wins, mons, **kw):
     min_sizes: {hwnd: (min_w, min_h)}，模拟 App 的最小窗口尺寸。snap_four_quad
     会先实测每个窗口的最小尺寸（真机是写个小尺寸再读回，走 AppleScript），
     单测必须把这一步也换掉——否则会真的去动用户的窗口。
+
+    keep_cache: 跑完不还原 §_QUAD_MIN_CACHE（供「连排两次验证缓存复用」这类
+    跨调用用例），调用方负责自己收尾。
     """
     # 每例都拿一份窗口副本：fake 写入会把新几何写回窗口 dict（CG 枚举要跟着
     # 变，否则「写入无效」的判据全落空），共用 WINS 会把上一例的几何带给下一例
@@ -68,8 +71,12 @@ def _run(wins, mons, **kw):
     # 把 quad_cache.json 落进仓库目录、上一下的缓存漏进下一例
     prev_min_cache = dict(wm._QUAD_MIN_CACHE)
     prev_max_cache = dict(wm._QUAD_MAX_CACHE)
-    wm._QUAD_MIN_CACHE.clear()
-    wm._QUAD_MAX_CACHE.clear()
+    prev_stamp = dict(wm._QUAD_CACHE_STAMP)
+    keep_cache = bool(kw.pop("keep_cache", False))
+    if not keep_cache:
+        wm._QUAD_MIN_CACHE.clear()
+        wm._QUAD_MAX_CACHE.clear()
+        wm._QUAD_CACHE_STAMP.clear()
     _cache_fd, _cache_path = tempfile.mkstemp(suffix=".json")
     os.close(_cache_fd)
     wm._quad_cache_file = lambda: _cache_path
@@ -154,6 +161,8 @@ def _run(wins, mons, **kw):
             wm._QUAD_MIN_CACHE.update(prev_min_cache)
             wm._QUAD_MAX_CACHE.clear()
             wm._QUAD_MAX_CACHE.update(prev_max_cache)
+            wm._QUAD_CACHE_STAMP.clear()
+            wm._QUAD_CACHE_STAMP.update(prev_stamp)
         return warns, detail, placed
 
     wm.set_window_rect = _place
@@ -162,10 +171,13 @@ def _run(wins, mons, **kw):
     finally:
         for k, v in prev.items():
             setattr(wm, k, v)
-        wm._QUAD_MIN_CACHE.clear()
-        wm._QUAD_MIN_CACHE.update(prev_min_cache)
-        wm._QUAD_MAX_CACHE.clear()
-        wm._QUAD_MAX_CACHE.update(prev_max_cache)
+        if not keep_cache:
+            wm._QUAD_MIN_CACHE.clear()
+            wm._QUAD_MIN_CACHE.update(prev_min_cache)
+            wm._QUAD_MAX_CACHE.clear()
+            wm._QUAD_MAX_CACHE.update(prev_max_cache)
+            wm._QUAD_CACHE_STAMP.clear()
+            wm._QUAD_CACHE_STAMP.update(prev_stamp)
     return ok, placed
 
 
@@ -986,6 +998,18 @@ def _run_grid(wins, mons, **kw):
                  "_gap_settings", "_quad_cache_file"):
         prev[attr] = getattr(wm, attr)
     prev_notes = list(wm._last_grid_notes)
+    # 尺寸缓存是模块级全局，正式排布会写它、也会顺带写盘；命中缓存还会跳过
+    # 现场探测。不按例隔离的话，上一例注入的 (2000,2000) 会漏进下一例，
+    # 让「装不下」的窗口被当成缓存命中照排——用例之间互相污染。
+    prev_min_cache = dict(wm._QUAD_MIN_CACHE)
+    prev_max_cache = dict(wm._QUAD_MAX_CACHE)
+    prev_stamp = dict(wm._QUAD_CACHE_STAMP)
+    wm._QUAD_MIN_CACHE.clear()
+    wm._QUAD_MAX_CACHE.clear()
+    wm._QUAD_CACHE_STAMP.clear()
+    _cache_fd, _cache_path = tempfile.mkstemp(suffix=".json")
+    os.close(_cache_fd)
+    wm._quad_cache_file = lambda: _cache_path
     # 说明要留给调用方读（测试据此断言「装不下/写入无效被如实报出」），
     # 跑完再还原成上一轮的值，避免漏进下一例
     notes_out = []
@@ -1046,6 +1070,16 @@ def _run_grid(wins, mons, **kw):
         for k, v in prev.items():
             setattr(wm, k, v)
         wm._last_grid_notes[:] = prev_notes
+        wm._QUAD_MIN_CACHE.clear()
+        wm._QUAD_MIN_CACHE.update(prev_min_cache)
+        wm._QUAD_MAX_CACHE.clear()
+        wm._QUAD_MAX_CACHE.update(prev_max_cache)
+        wm._QUAD_CACHE_STAMP.clear()
+        wm._QUAD_CACHE_STAMP.update(prev_stamp)
+        try:
+            os.unlink(_cache_path)
+        except OSError:
+            pass
     return done, placed, notes_out
 
 
@@ -1482,6 +1516,84 @@ class TestFillGrid(unittest.TestCase):
                         "写入无效必须报出来：%s" % notes)
 
 
+
+
+class TestQuadMinCacheReuse(unittest.TestCase):
+    """正式排布复用最小尺寸缓存：第一次探、之后这次会话内直接用。
+
+    探测是最贵的一步：每个窗口首等 0.45s、再按 0.15s 轮询，四窗要 3~4.8s，
+    期间还在缩窗再放回。缓存命中必须真的**不调用** _probe_min_size，否则
+    「复用」只是把值抄了一遍、等待照旧。
+    """
+
+    WINS = [_win("A::1", x=10, y=20), _win("B::1", x=2000, y=30)]
+    MONS = [_Mon(0, 0, 1920, 1080, "S")]
+
+    def test_probe_called_once_then_skipped(self):
+        """同一窗口连着排两次：第二次直接用第一次的结果，不再探测。
+
+        夹具的 _probe_min_size 桩按 min_sizes 返回（没给就返回 (0,0)）。第二
+        次故意不传 min_sizes：若没命中缓存，mins 会退化成 (0,0)、约束消失。
+        所以「缓存里仍是第一次的值」就是「第二次没重新探测」的证据。
+        """
+        prev_min = dict(wm._QUAD_MIN_CACHE)
+        prev_stamp = dict(wm._QUAD_CACHE_STAMP)
+        wm._QUAD_MIN_CACHE.clear()
+        wm._QUAD_CACHE_STAMP.clear()
+        try:
+            _run(list(self.WINS), list(self.MONS),
+                 min_sizes={"A::1": (600, 400), "B::1": (600, 400)},
+                 keep_cache=True)
+            self.assertIn("A::1", wm._QUAD_MIN_CACHE,
+                          "第一次排布的探测结果必须落进缓存")
+            _ok, placed = _run(list(self.WINS), list(self.MONS),
+                               keep_cache=True)
+            self.assertEqual(len(placed), 2, "第二次仍应排满两个窗口")
+            self.assertEqual(
+                wm._QUAD_MIN_CACHE.get("A::1"), (600, 400),
+                "第二次没传 min_sizes 却仍是原值，说明走的是缓存而非探测")
+        finally:
+            wm._QUAD_MIN_CACHE.clear()
+            wm._QUAD_MIN_CACHE.update(prev_min)
+            wm._QUAD_CACHE_STAMP.clear()
+            wm._QUAD_CACHE_STAMP.update(prev_stamp)
+
+    def test_expired_entry_is_reprobed(self):
+        """缓存过期要重新探测：App 升级可能让下限变大。"""
+        import time as _time
+
+        prev_min = dict(wm._QUAD_MIN_CACHE)
+        prev_stamp = dict(wm._QUAD_CACHE_STAMP)
+        wm._QUAD_MIN_CACHE.clear()
+        wm._QUAD_CACHE_STAMP.clear()
+        wm._QUAD_MIN_CACHE["A::1"] = (600, 400)
+        wm._QUAD_CACHE_STAMP["A::1"] = _time.time() - wm._QUAD_CACHE_TTL - 60
+        try:
+            self.assertIsNone(wm._quad_min_cached("A::1"),
+                              "过期条目不该算命中")
+        finally:
+            wm._QUAD_MIN_CACHE.clear()
+            wm._QUAD_MIN_CACHE.update(prev_min)
+            wm._QUAD_CACHE_STAMP.clear()
+            wm._QUAD_CACHE_STAMP.update(prev_stamp)
+
+    def test_zero_size_never_hits(self):
+        """探测失败留下的 (0,0) 不算命中——拿它切格子等于没约束。"""
+        prev_min = dict(wm._QUAD_MIN_CACHE)
+        prev_stamp = dict(wm._QUAD_CACHE_STAMP)
+        wm._QUAD_MIN_CACHE.clear()
+        wm._QUAD_CACHE_STAMP.clear()
+        wm._QUAD_MIN_CACHE["A::1"] = (0, 0)
+        try:
+            self.assertIsNone(wm._quad_min_cached("A::1"))
+            # 记 (0,0) 也不该进缓存
+            wm._quad_min_remember("B::1", (0, 0))
+            self.assertNotIn("B::1", wm._QUAD_MIN_CACHE)
+        finally:
+            wm._QUAD_MIN_CACHE.clear()
+            wm._QUAD_MIN_CACHE.update(prev_min)
+            wm._QUAD_CACHE_STAMP.clear()
+            wm._QUAD_CACHE_STAMP.update(prev_stamp)
 
 
 if __name__ == "__main__":

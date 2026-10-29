@@ -1461,6 +1461,47 @@ _QUAD_MAX_CACHE = {}
 # 缓存文件条目上限：窗口关掉后条目只增不减，钉个顶，超出丢最早的
 _QUAD_CACHE_MAX_ENTRIES = 500
 
+# 最小尺寸缓存的可用期限（秒）。命中缓存就跳过现场探测，省掉每个窗口
+# 0.75~1.2s 的等待（见 _probe_min_size）；但 App 升级、切主题、改字号都可能
+# 让下限变化，所以不能无限信任。过期后重新探测一次即可刷新。
+_QUAD_CACHE_TTL = 7 * 24 * 3600
+
+# 缓存条目「开始被信任」的时刻 {hwnd: epoch 秒}。只在内存里记，不落盘。
+# 从磁盘读入时也盖一次（表示本次启动从这一刻起信任它），这样长时间不关
+# 的 App 每过 TTL 会重探一次，不会拿着几周前的值一直用。
+_QUAD_CACHE_STAMP = {}
+
+
+def _quad_min_cached(hwnd, ttl=None):
+    """取这个窗口可用的最小尺寸缓存：命中返回 (w, h)，否则 None。
+
+    与 _QUAD_MIN_CACHE 的裸查询区别在新鲜度：条目必须有一个在 ttl 之内的
+    时间戳。时间戳来自实测（_quad_min_remember）或本次启动的读盘
+    （_quad_cache_load），后者让落盘值先被信任一轮。探测失败留下的 (0, 0)
+    永远不算命中——拿它切格子等于没约束。
+
+    为什么值得信：最小尺寸是 App 自己声明的下限（真机实测跨会话不变：
+    访达 729x322、系统设置 754x470、iPhone镜像 204x560）。即使偶有 App
+    升级导致变大，snap_four_quad 写入后会读回实测并触发二趟重排，偏小的
+    缓存能自愈；反过来缓存偏大则会白白浪费格子，所以过期就重探。
+    """
+    v = _QUAD_MIN_CACHE.get(hwnd)
+    if not v or v[0] <= 0 or v[1] <= 0:
+        return None
+    stamp = _QUAD_CACHE_STAMP.get(hwnd)
+    limit = _QUAD_CACHE_TTL if ttl is None else ttl
+    if stamp is not None and time.time() - stamp > limit:
+        return None
+    return (int(v[0]), int(v[1]))
+
+
+def _quad_min_remember(hwnd, size):
+    """把实测到的最小尺寸写进缓存并记下时刻（(0, 0) 表示探测失败，不记）。"""
+    if not size or size[0] <= 0 or size[1] <= 0:
+        return
+    _QUAD_MIN_CACHE[hwnd] = (int(size[0]), int(size[1]))
+    _QUAD_CACHE_STAMP[hwnd] = time.time()
+
 
 def _quad_cache_file():
     """四宫格尺寸缓存文件路径（quad_cache.json）。
@@ -1543,6 +1584,12 @@ def _quad_cache_load():
                 maxes[h] = (v[0], v[1])
         _QUAD_MIN_CACHE.update(mins)
         _QUAD_MAX_CACHE.update(maxes)
+        # 落盘条目没有写入时刻（不写进文件，避免用户手改或时钟漂移造成的
+        # 伪过期）。这里统一盖成「本次启动读入的时刻」：本次启动先信一次，
+        # 长开不关的 App 也会在 TTL 之后重探一轮。
+        now = time.time()
+        for _h in mins:
+            _QUAD_CACHE_STAMP[_h] = now
         logger.info("四宫格缓存已读入：%d 个最小尺寸、%d 个尺寸上限",
                     len(mins), len(maxes))
     except Exception as e:  # noqa: BLE001
@@ -1756,16 +1803,27 @@ def fill_grid(hwnds=None, cols=None, rows=None, layout=None, smart=False,
     #    原状——带着探测后的残局排，窗口会停在探测位置（真机 UU远程 就这么被
     #    判去过 Sidecar）。
     mins, orig_rect = {}, {}
+    cached_n = 0
     for w in wins:
         h = w.get("hwnd")
         try:
             orig_rect[h] = _readback_rect(h, (w["x"], w["y"], w["w"], w["h"]))
         except Exception:  # noqa: BLE001
             orig_rect[h] = None
+        # 与四宫格同理：命中缓存就不缩窗口、不等待（每个窗口省 0.75~1.2s）
+        hit = _quad_min_cached(h)
+        if hit is not None:
+            mins[h] = hit
+            cached_n += 1
+            continue
         try:
             mins[h] = _probe_min_size(h, w["x"], w["y"])
         except Exception:  # noqa: BLE001
             mins[h] = (0, 0)
+        _quad_min_remember(h, mins[h])
+    if cached_n:
+        logger.info("虚拟网格：%d/%d 个窗口的最小尺寸走缓存，跳过现场探测",
+                    cached_n, len(wins))
     for w in wins:
         h = w.get("hwnd")
         was = orig_rect.get(h)
@@ -2799,6 +2857,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     mins = {}
     pre_probe = {}
     pinned_windows = []
+    # 命中缓存就跳过现场探测。探测是排布最贵的一步：首等 0.45s + 每轮 0.15s
+    # 轮询（_probe_settle_secs / _probe_poll_secs），四个窗口 3~4.8s，而且
+    # 这期间还在缩窗口、再放回，用户看到的就是「点了要等好几秒」。
+    cached_min = sum(1 for h, _w in picked if _quad_min_cached(h))
     for h, _w in picked:
         # 探测前先记下当前几何：探测会把窗口缩得很小，排布前要放回原状，
         # 但只在几何真的被探测改动过才放（无谓的复位会白占一步撤销栈）
@@ -2806,10 +2868,21 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
             pre_probe[h] = _readback_rect(h, (_w["x"], _w["y"], _w["w"], _w["h"]))
         except Exception:  # noqa: BLE001
             pre_probe[h] = None
-        mins[h] = _probe_min_size(h, wl + 1, wt + 1)
+        hit = _quad_min_cached(h)
+        if hit is not None:
+            # 缓存值够用：不缩窗口、不等待。写入后读回实测会校验收敛，
+            # App 升级导致下限变大时二趟重排会自动修正（见下方 grew 分支）。
+            mins[h] = hit
+        else:
+            mins[h] = _probe_min_size(h, wl + 1, wt + 1)
+            _quad_min_remember(h, mins[h])
         # 探测前后几何完全没变 = 窗口被系统钉死（真机实测 Sidecar 上的
         # UU远程 窗口，任何 AX 写入都被忽略）。这类窗口不参与比例计算，
         # 否则智能分配会把活窗口的空间分给一个动不了窗口。
+        # 走缓存时没有探测、几何本就不会变，这一步会误判成「钉死」，
+        # 所以只对真探测过的窗口判定。
+        if hit is not None:
+            continue
         try:
             post = _readback_rect(h, pre_probe.get(h))
             was = pre_probe.get(h)
@@ -2819,6 +2892,9 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
                     pinned_windows.append(h)
         except Exception:  # noqa: BLE001
             pass
+    if cached_min:
+        logger.info("四宫格：%d/%d 个窗口的最小尺寸走缓存，跳过现场探测",
+                    cached_min, len(picked))
     # 探测最小尺寸会把窗口缩到很小，这会让 App 的最小尺寸把窗口撑出格子、
     # 甚至触发 macOS 搬屏。探测完把每个窗口放回它**原来的位置**：后面正式
     # 排布按当前几何重新定位，不会带着探测后的残局排（真机实测 UU远程 探测后
@@ -3172,8 +3248,7 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # 说出「这块屏最多排几个」，不必等真的排一遍。只缓存探测到的正值——
     # (0,0) 是探测失败，按 0 计会把容量说得过于乐观。
     for _h, _m in mins.items():
-        if _m and _m[0] > 0 and _m[1] > 0:
-            _QUAD_MIN_CACHE[_h] = (int(_m[0]), int(_m[1]))
+        _quad_min_remember(_h, _m)
     # 尺寸上限缓存给预演（quad_predict）用：点排列前就能说出「这一格会留
     # 多少空白」。0 = 该轴没有实测上限，与最小尺寸一样只存至少一轴有值的
     # 条目——全 0 记上去会让 _quad_cells 把格子按 0 切。
