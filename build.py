@@ -34,6 +34,58 @@ def _py_files():
     return sorted(glob.glob(os.path.join(HERE, "*.py")))
 
 
+# 只存在于包内 Resources 的用户运行时数据（settings.data_dir() 在非 frozen
+# 模式下就指向那里）。重新打包必须把它们带过去，否则升级等于清空设置。
+# 清单按用途显式列出，而不是「所有 .json」——以后往目录里放内置模板文件时
+# 不会被误当成用户数据搬来搬去。
+USER_DATA_FILES = (
+    "settings.json",       # 偏好：间距、快捷键开关、防休眠模式…
+    "profiles.json",       # 情景方案
+    "layouts.json",        # 布局方案
+    "stash.json",          # 暂存窗口
+    "quad_cache.json",     # 最小尺寸 / 尺寸上限学习缓存
+    "rehome.json",         # 插拔归位记录
+)
+
+
+def _snapshot_user_data(res_dir):
+    """把包内仍然有效的用户数据读进内存（构建前调用）。
+
+    返回 {文件名: bytes}。读不到 / 读失败的一律跳过——构建不能因为某个
+    缓存文件损坏而失败。
+    """
+    saved = {}
+    for name in USER_DATA_FILES:
+        p = os.path.join(res_dir, name)
+        try:
+            if os.path.isfile(p):
+                with open(p, "rb") as f:
+                    saved[name] = f.read()
+        except OSError as e:
+            print(f"[build] 跳过读不出的用户数据 {name}: {e}")
+    return saved
+
+
+def _restore_user_data(saved, res_dir):
+    """把构建前快照下来的用户数据写回新包（构建后调用）。
+
+    新包里没有同名文件就写入；有的话也覆盖——新包同名的只可能是代码仓库
+    带进来的旧样例，用户的实测值优先。返回实际恢复的文件名列表。
+    """
+    restored = []
+    for name, blob in saved.items():
+        p = os.path.join(res_dir, name)
+        try:
+            with open(p, "wb") as f:
+                f.write(blob)
+            restored.append(name)
+        except OSError as e:
+            print(f"[build] 恢复用户数据失败 {name}: {e}")
+    if restored:
+        print(f"[build] 已保留用户数据: {'、'.join(restored)}")
+    return restored
+
+
 def prepare_icon():
     """准备统一的应用图标 PNG（app.png）并返回其路径。
 
@@ -220,6 +272,13 @@ def build_macos(icon_png):
         print("[macOS] 当前不是 macOS，跳过 .app 构建")
         return None
     app = os.path.join(DIST, APP_NAME + ".app")
+    res_old = os.path.join(app, "Contents", "Resources")
+    # 重建前先把用户的运行时数据捞出来：下面 rmtree 会把整包删掉，而
+    # settings.json / layouts.json / quad_cache.json 这些**只存在包内**
+    # （settings.data_dir() 在 frozen=False 时就是 Resources 目录）。
+    # 不搬的话每次重新打包都会把用户的偏好、布局方案、最小尺寸学习缓存
+    # 一起清空——真机上表现为「升级后设置全没了」。
+    saved = _snapshot_user_data(res_old)
     shutil.rmtree(app, ignore_errors=True)
     contents = os.path.join(app, "Contents")
     res = os.path.join(contents, "Resources")
@@ -237,6 +296,8 @@ def build_macos(icon_png):
             shutil.copy2(p, res)
 
     _make_icns(icon_png, os.path.join(res, "app.icns"))
+    # 把刚捞出来的用户数据放回新包（新包里的默认模板只在没有旧值时保留）
+    _restore_user_data(saved, res)
 
     exe = EXE_NAME
     with open(os.path.join(contents, "Info.plist"), "w", encoding="utf-8") as f:
