@@ -78,6 +78,15 @@ def _single_instance():
         global _lock_fd
         _lock_fd = open(os.path.join(tempfile.gettempdir(), "multimon_manager.lock"), "w")
         fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # 给锁 fd 置 FD_CLOEXEC：托盘面板由 tray_mac.Popen 派生，macOS 上
+        # Popen 走 posix_spawn 路径时不会逐个 close_fds，子进程会连带继承
+        # 这个 fd；主进程退出后 fd 仍活在托盘面板里，flock 锁就一直不释放，
+        # 表现为「重启 App 提示已有实例在运行」而其实谁都没在跑（实测）。
+        # 置 CLOEXEC 后子进程一律拿不到该 fd，锁随主进程退出立即释放。
+        try:
+            fcntl.fcntl(_lock_fd.fileno(), fcntl.FD_CLOEXEC)
+        except Exception:  # noqa: BLE001
+            pass
         return True
     except (OSError, ImportError):
         return False
