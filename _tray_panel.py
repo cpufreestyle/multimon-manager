@@ -112,7 +112,10 @@ def main(tip=None):
                 pass
         root.destroy()
 
-    tk.Button(root, text="打开主界面", command=activate_main).pack(fill="x", padx=14, pady=2)
+    # 「打开主界面」发 open 命令走主进程 deiconify：只 set frontmost 唤不回
+    # 已隐藏（withdraw）的主窗口，用户会以为按钮坏了
+    tk.Button(root, text="打开主界面",
+              command=lambda: send_and_activate("open")).pack(fill="x", padx=14, pady=2)
     tk.Button(root, text="应用窗口布局",
               command=lambda: send_and_activate("apply_layout")).pack(fill="x", padx=14, pady=2)
     # 2×2 一键：只发命令、不激活主窗。send_and_activate 会把主窗拉到最前，
@@ -143,6 +146,9 @@ def main(tip=None):
               command=lambda: send_and_activate("toggle_slideshow")).pack(fill="x", padx=14, pady=2)
     tk.Button(root, text="刷新显示器",
               command=lambda: send_and_activate("refresh")).pack(fill="x", padx=14, pady=2)
+    # 面板常驻右上角容易挡内容：允许收起，主界面「设置 → 显示快速面板」一键找回
+    tk.Button(root, text="隐藏面板",
+              command=root.destroy).pack(fill="x", padx=14, pady=2)
     tk.Button(root, text="退出", command=do_exit).pack(fill="x", padx=14, pady=2)
 
     # 主进程守护：主进程死了就自行退出。否则托盘变成孤儿——界面照旧显示、
