@@ -29,6 +29,8 @@ except Exception:  # noqa: BLE001  无 tkinter / 无显示环境：整类跳过
 
 if tk is None:
     raise unittest.SkipTest("tkinter 不可用，跳过界面单测")
+# 极简模式会藏起热插拔卡；UI 接线单测必须看到完整界面
+os.environ.setdefault("MMM_ADVANCED_UI", "1")
 
 
 class _FakeBox:

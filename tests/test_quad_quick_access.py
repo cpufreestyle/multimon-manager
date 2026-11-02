@@ -25,6 +25,8 @@ try:  # ui 依赖 tkinter；无显示环境下降级跳过界面层测试
     import ui  # noqa: E402
 except Exception:  # noqa: BLE001
     ui = None
+# 极简模式会藏起任务栏/拖拽吸附等卡；UI 接线单测必须看到完整界面
+os.environ.setdefault("MMM_ADVANCED_UI", "1")
 
 H = {"tl": "11::访达", "tr": "22::iPhone镜像", "bl": "33::系统设置", "br": "44::OneNote"}
 LABELS = {"tl": "访达", "tr": "iPhone镜像", "bl": "系统设置", "br": "OneNote"}
@@ -76,6 +78,7 @@ def _fake_self(smart=False):
     s._refresh_quad_grid = lambda: None
     s._update_quad_capacity = lambda: None
     s._quad_backend_mod = lambda: bm
+    s._bm = bm
     return s
 
 
@@ -153,6 +156,17 @@ class QuadQuickAccessTest(unittest.TestCase):
         ui.App._snap_four_quad(s, force_auto=True)
         self.assertTrue(self.calls["predict"][0]["smart"])
         self.assertTrue(self.calls["snap"][0]["smart"])
+
+    def test_failure_reason_reaches_status_bar(self):
+        """排列失败时要转述后端原因，不能一律说成「窗口不足两个」。"""
+        s = _fake_self()
+        b.snap_four_quad = lambda **kw: False
+        s._bm._last_quad_notes = [
+            "排列失败：ChatGPT 的窗口尺寸被应用锁定，无法铺满格子"]
+        ui.App._snap_four_quad(s)
+        status = s.status_var.get()
+        self.assertIn("窗口尺寸被应用锁定", status)
+        self.assertNotIn("至少需要两个可操作窗口", status)
 
     def test_tray_command_routes_to_force_auto(self):
         """托盘 snap_quad 命令 → _snap_four_quad(force_auto=True)。"""

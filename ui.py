@@ -4,6 +4,7 @@ import sys
 import time
 import threading
 import re
+import os as _os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
@@ -139,6 +140,9 @@ class App:
         self._drag_job = None
         # 规则引擎（F5）：记录已知窗口，用于识别"新出现的窗口"
         self._rule_seen = None
+        # 幻灯片并入轮换卡后不再有独立开关控件；托盘/旧代码仍读写这个
+        # 影子变量，真实状态以 slideshow 模块为准
+        self.slideshow_enabled_var = tk.BooleanVar(value=False)
         self._build()
         self.refresh_monitors()
         self._start_command_poll()
@@ -237,11 +241,26 @@ class App:
         self._tab_active = None
         self._show_tab("common")
 
+        # 极简 / 高级模式：建卡时按 Frame 登记，一键显隐整卡。
+        # 极简只留日常卡片，情景/触发器/规则/防休眠/热插拔/任务栏/拖拽吸附
+        # 这类一次性或进阶配置全部收进高级模式，首屏不再被填满。
+        self._adv_cards = {
+            "情景模式（按显示器组合自动套用）": self._tab_config,
+            "触发器（窗口移动自动触发动作）": self._tab_config,
+            "窗口规则": self._tab_config,
+            "全局快捷键": self._tab_settings,
+            "防休眠": self._tab_settings,
+            "显示器热插拔": self._tab_settings,
+            "多屏任务栏": self._tab_common,
+            "拖拽吸附预览": self._tab_common,
+        }
+
         # 常用页：打开就要用的窗口操作
-        self._build_getting_started(self._tab_common)
         self._build_window_tools(self._tab_common)
         self._build_taskbar(self._tab_common)
         self._build_drag_snap(self._tab_common)
+        # 上手建议放页面最底：环境就绪时整卡隐藏，不再占首屏
+        self._build_getting_started(self._tab_common)
         # 布局与壁纸页：方案类配置，改一次就不常动
         self._build_wallpaper(self._tab_config)
         self._build_profiles(self._tab_config)
@@ -256,7 +275,53 @@ class App:
         self._build_keep_awake(self._tab_settings)
         self._build_backup(self._tab_settings)
         self._build_display_watch(self._tab_settings)
-        self._build_settings_io(self._tab_settings)
+
+        # 开关放标签栏右侧，极简模式默认（与上一轮「界面太多」的诉求一致）
+        self.advanced_mode = tk.BooleanVar(
+            value=bool(settings.load().get("advanced_mode", False))
+            or _os.environ.get("MMM_ADVANCED_UI") == "1")
+        self.advanced_cb = ttk.Checkbutton(
+            tab_bar, text="高级模式", variable=self.advanced_mode,
+            command=self._apply_ui_mode)
+        self.advanced_cb.pack(side="right", padx=(4, 0))
+        # 按 (父页, 卡片标题) 建立索引；多个同名卡时取最后一个（同页内标题唯一）
+        self._card_frames = {}
+        for parent in (self._tab_common, self._tab_config, self._tab_settings):
+            for w in parent.winfo_children():
+                if w.winfo_class() == "TLabelframe":
+                    self._card_frames[(parent, str(w.cget("text")))] = w
+        self._apply_ui_mode()
+
+    def _apply_ui_mode(self):
+        """极简：隐藏进阶卡并把「布局与壁纸/设置」标签一起藏掉（其全部卡片均为进阶）。"""
+        advanced = bool(self.advanced_mode.get())
+        s = settings.load()
+        if bool(s.get("advanced_mode", False)) != advanced:
+            s["advanced_mode"] = advanced
+            settings.save(s)
+        for title, parent in self._adv_cards.items():
+            frame = self._card_frames.get((parent, title))
+            if frame is None:
+                continue
+            if advanced:
+                frame.pack(fill="x", padx=8, pady=6)
+            else:
+                frame.pack_forget()
+        # 布局与壁纸 / 设置 两页在极简模式下没有可见内容，标签一并隐藏
+        for key, label in (("config", "布局与壁纸"), ("settings", "设置")):
+            btn, _frame = self._tab_btns[key]
+            try:
+                if not advanced:
+                    btn.pack_forget()
+                elif btn.winfo_manager() != "pack":
+                    # after=常用按钮：保证顺序仍是 常用 → 布局与壁纸 → 设置
+                    btn.pack(side="left", padx=(0, 4),
+                             after=self._tab_btns["common"][0])
+            except Exception:  # noqa: BLE001
+                pass
+        if not advanced and self._tab_active in ("config", "settings"):
+            self._show_tab("common")
+        self._on_body_configure()
 
     def _show_tab(self, key):
         """切到指定分组：显示目标 Frame、隐藏其余，并高亮当前按钮。"""
@@ -365,34 +430,8 @@ class App:
         ttk.Button(f, text="应用壁纸", command=self.apply_wallpaper).pack(anchor="e", pady=4)
 
         # ---- 壁纸幻灯片：按间隔自动轮换一组图片（纯标准库，主线程定时器驱动）----
-        sf = ttk.LabelFrame(f, text="幻灯片")
-        sf.pack(fill="x", padx=4, pady=(2, 4))
-        row1 = ttk.Frame(sf)
-        row1.pack(fill="x", padx=4, pady=2)
-        ttk.Button(row1, text="添加图片", command=self._slideshow_add).pack(side="left")
-        ttk.Button(row1, text="清空", command=self._slideshow_clear).pack(side="left", padx=4)
-        ttk.Button(row1, text="立即切换",
-                   command=self._slideshow_next_now).pack(side="left", padx=4)
-        ttk.Label(row1, text="间隔(分):").pack(side="left", padx=(8, 2))
-        self.slideshow_interval_var = tk.StringVar(value="5")
-        ttk.Entry(row1, textvariable=self.slideshow_interval_var, width=4).pack(side="left")
-        self.slideshow_shuffle_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row1, text="随机",
-                        variable=self.slideshow_shuffle_var).pack(side="left", padx=6)
-        self.slideshow_enabled_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row1, text="启用", variable=self.slideshow_enabled_var,
-                        command=self._slideshow_toggle).pack(side="left", padx=6)
-
-        self.slideshow_list = tk.Listbox(sf, height=3, activestyle="none")
-        self.slideshow_list.pack(fill="x", padx=4, pady=2)
-        row2 = ttk.Frame(sf)
-        row2.pack(fill="x", padx=4, pady=(0, 2))
-        ttk.Button(row2, text="移除选中",
-                   command=self._slideshow_remove_selected).pack(side="left")
-        self.slideshow_status_var = tk.StringVar(value="")
-        ttk.Label(row2, textvariable=self.slideshow_status_var,
-                  foreground="#666").pack(side="left", padx=8)
-        self._slideshow_refresh()
+        # 幻灯片功能并入下方「壁纸轮换（幻灯片）」卡：同屏两张重复的轮换卡
+        # 曾让用户找不到入口；托盘/启动恢复仍走 slideshow 模块。
 
     def _on_mode(self):
         if self.mode_var.get() == "per":
@@ -1663,8 +1702,16 @@ class App:
             # 接着改选择 / 换屏时，看到的就是最新事实
             self._update_quad_capacity()
         else:
-            self.status_var.set("四宫格失败：至少需要两个可操作窗口"
-                                "（网格里点掉几格可以只排两三个）")
+            # 失败原因不止一种：窗口不足两个、全部锁尺寸、全部不响应写入。
+            # 后端已把具体原因写进 _last_quad_notes（首条以「排列失败」开头），
+            # 直接转述它；没有说明时才退回「窗口不足」这条兜底文案。
+            bm = self._quad_backend_mod()
+            notes = [n for n in (getattr(bm, "_last_quad_notes", None) or []) if n]
+            if notes:
+                self.status_var.set("；".join(notes[:2]))
+            else:
+                self.status_var.set("四宫格失败：至少需要两个可操作窗口"
+                                    "（网格里点掉几格可以只排两三个）")
 
     def _update_quad_capacity(self):
         """刷新四宫格容量预检行：只读后端缓存，不动任何窗口。"""
@@ -2560,17 +2607,17 @@ class App:
 
     # ---------- 上手建议卡片 ----------
     def _build_getting_started(self, parent):
-        """单页顶部的动态「上手建议」卡片：根据授权状态与屏数给出实用建议。"""
+        """常用页底部的动态「上手建议」卡：仅在未授权 / 单屏时显示。"""
         self._gs_frame = ttk.LabelFrame(parent, text="上手建议")
-        self._gs_frame.pack(fill="x", padx=6, pady=(4, 8), anchor="n")
+        self._gs_card_registered = False
 
         self._gs_text = tk.StringVar(value="")
-        # 摘要/全文两套显示：环境就绪时默认只显示一行摘要，把窗口工具、
-        # 四宫格这些核心操作留在首屏；未授权或单屏时才展开全文。
+        # 摘要/全文两套显示：只有需要用户处理（未授权 / 单屏）时才整卡显示，
+        # 把窗口工具、四宫格这些核心操作留在首屏。
         # _gs_brief_var / _gs_expanded 必须在这里建——_refresh_getting_started
         # 在构造末尾就会读它们。
         self._gs_brief_var = tk.StringVar(value="")
-        self._gs_expanded = False
+        self._gs_expanded = True
         self._gs_label = ttk.Label(self._gs_frame, textvariable=self._gs_text,
                                    wraplength=720, justify="left")
         self._gs_brief = ttk.Label(self._gs_frame,
@@ -2579,7 +2626,7 @@ class App:
                                    foreground="#666666", cursor="hand2")
         self._gs_brief.bind("<Button-1>",
                             lambda _e: self._toggle_getting_started())
-        self._gs_brief.pack(fill="x", padx=8, pady=(4, 2), anchor="w")
+        self._gs_label.pack(fill="x", padx=8, pady=(4, 2), anchor="w")
 
         btn_row = ttk.Frame(self._gs_frame)
         btn_row.pack(fill="x", padx=8, pady=(0, 6))
@@ -2604,6 +2651,7 @@ class App:
 
     def _refresh_getting_started(self):
         """根据辅助功能授权状态与显示器数量，动态给出实用建议。"""
+        parent = self._tab_common
         try:
             trusted = b.is_accessibility_trusted()
         except Exception:  # noqa: BLE001
@@ -2642,6 +2690,14 @@ class App:
             pass
         if needs_attention != self._gs_expanded:
             self._toggle_getting_started()
+        # 环境就绪时整卡隐藏，不占版面；需要处理时显示在常用页底部
+        if needs_attention:
+            self._gs_frame.pack(fill="x", padx=6, pady=(4, 8), anchor="n")
+        else:
+            self._gs_frame.pack_forget()
+        if needs_attention and not self._gs_card_registered:
+            self._card_frames[(parent, "上手建议")] = self._gs_frame
+            self._gs_card_registered = True
 
     def _keep_front_after(self, cmd):
         """包装窗口操作：执行后重新置顶，避免被激活的目标窗口盖住。"""
@@ -2971,6 +3027,65 @@ class App:
         ttk.Checkbutton(f, text="开机自启时最小化到托盘（静默启动）",
                         variable=self.autostart_min_var,
                         command=self._toggle_autostart).pack(anchor="w", padx=4, pady=2)
+        # 托盘面板可以自己关掉；这里提供一键找回，不用重启程序
+        ttk.Button(f, text="显示快速面板",
+                   command=self._show_quick_panel).pack(anchor="w", padx=4, pady=2)
+        # Dock 自动隐藏是 macOS 的系统偏好。它会影响 NSScreen.visibleFrame，
+        # 所以切换成功后要刷新显示器工作区；状态以系统读回值为准。
+        if getattr(b, "IS_MAC", False):
+            current = b.dock_autohide_get()
+            self._dock_autohide_last = current
+            self.dock_autohide_var = tk.BooleanVar(value=bool(current))
+            row = ttk.Frame(f)
+            row.pack(fill="x", padx=4, pady=2)
+            self.dock_autohide_cb = ttk.Checkbutton(
+                row, text="自动隐藏 Dock 栏", variable=self.dock_autohide_var,
+                command=self._on_dock_autohide_change)
+            self.dock_autohide_cb.pack(side="left")
+            self._tooltip(
+                self.dock_autohide_cb,
+                "勾选后 Dock 只在鼠标移到屏幕边缘时出现，屏幕底部可以留给窗口。"
+                "这是 macOS 系统设置，关闭本程序后仍会保持。")
+            ttk.Label(
+                row, text="鼠标移到屏幕边缘时显示",
+                foreground="#666666").pack(side="left", padx=(8, 0))
+            self._dock_autohide_status = tk.StringVar(
+                value="" if current is not None else "系统状态读取失败，可勾选后重试")
+            ttk.Label(
+                row, textvariable=self._dock_autohide_status,
+                foreground="#555555").pack(side="left", padx=(8, 0))
+
+    def _on_dock_autohide_change(self):
+        """切换 macOS Dock 自动隐藏；失败时回到系统实际状态。"""
+        wanted = bool(self.dock_autohide_var.get())
+        self._dock_autohide_status.set("正在设置…")
+        try:
+            ok, text = b.dock_autohide_set(wanted)
+        except Exception as e:  # noqa: BLE001
+            ok, text = False, f"设置 Dock 自动隐藏失败：{e}"
+
+        if ok:
+            self._dock_autohide_last = wanted
+            self.dock_autohide_var.set(wanted)
+            self._dock_autohide_status.set(text)
+            # 自动隐藏会改变 macOS 的工作区边界，分屏计算必须用新值。
+            try:
+                self.refresh_monitors()
+            except Exception as e:  # noqa: BLE001
+                text = f"{text}（显示器刷新失败：{e}）"
+            self.status_var.set(text)
+            return
+
+        # 写入可能已经成功、只是重启或复验失败。优先显示系统真实状态，
+        # 读不到时才退回切换前的值，避免勾选框和系统设置互相矛盾。
+        actual = b.dock_autohide_get()
+        if actual is None:
+            actual = bool(self._dock_autohide_last)
+        self._dock_autohide_last = actual
+        self.dock_autohide_var.set(actual)
+        self._dock_autohide_status.set(text)
+        self.status_var.set(text)
+        messagebox.showerror("隐藏 Dock 栏失败", text)
 
     def _build_keep_awake(self, parent):
         """防休眠（复刻 LayoutKeeper 的 KeepAwake）：合盖/拔电/锁屏时继续干活。"""
@@ -3092,14 +3207,23 @@ class App:
         f.pack(fill="x", padx=8, pady=6)
         ttk.Label(
             f,
-            text="把快捷键偏好、热插拔开关、壁纸轮换设置、窗口布局方案与壁纸方案"
-                 "导出为单个 JSON；换机或重装后导入即可恢复（同名覆盖，其它保留）。",
+            text="导出 / 恢复窗口布局、壁纸方案和偏好；换机或重装后导入即可"
+                 "（同名覆盖，其它保留）。",
             justify="left", wraplength=620,
         ).pack(anchor="w", padx=4, pady=(0, 4))
         row = ttk.Frame(f)
         row.pack(fill="x", padx=4, pady=4)
         ttk.Button(row, text="导出配置…", command=self._export_config).pack(side="left", padx=2)
         ttk.Button(row, text="导入配置…", command=self._import_config).pack(side="left", padx=2)
+        # 全量 zip 备份：settings/profiles/layouts 原样打包，导入整体覆盖
+        row2 = ttk.Frame(f)
+        row2.pack(fill="x", padx=4, pady=4)
+        ttk.Button(row2, text="导出完整备份…",
+                   command=self._export_settings).pack(side="left", padx=2)
+        ttk.Button(row2, text="导入完整备份…",
+                   command=self._import_settings).pack(side="left", padx=2)
+        ttk.Label(row2, text="打包全部配置文件，导入时整体覆盖",
+                  foreground="#666666").pack(side="left", padx=6)
 
     def _export_config(self):
         path = filedialog.asksaveasfilename(
@@ -3152,29 +3276,27 @@ class App:
         s = settings.load()
         try:
             self.hk_enabled.set(bool(s.get("hk_enabled", self.hk_enabled.get())))
-            self.rotate_dir_var.set(s.get("rotate_dir", self.rotate_dir_var.get()) or "")
-            self.rotate_interval_var.set(
-                max(1, int(s.get("rotate_interval_min", self.rotate_interval_var.get()))))
             self.watch_enabled.set(bool(s.get("watch_displays", self.watch_enabled.get())))
             self.auto_apply_watch.set(
                 bool(s.get("watch_auto_apply", self.auto_apply_watch.get())))
-            self._update_rotate_status()
             self._toggle_display_watch()
         except Exception:  # noqa: BLE001
             pass
 
     # ---------- 显示器热插拔 ----------
-    def _build_settings_io(self, parent):
-        f = ttk.LabelFrame(parent, text="配置备份")
-        f.pack(fill="x", padx=8, pady=6)
-        ttk.Button(f, text="导出配置…", command=self._export_settings).pack(
-            side="left", padx=4, pady=4)
-        ttk.Button(f, text="导入配置…", command=self._import_settings).pack(
-            side="left", padx=4, pady=4)
-        ttk.Label(f, text="把 settings/profiles/layouts 打包成单个文件，便于备份或迁移",
-                  wraplength=360, foreground="#555").pack(side="left", padx=8)
+    def _show_quick_panel(self):
+        """重新打开常驻的托盘快速面板（隐藏后从设置页一键找回）。"""
+        try:
+            t = b.tray.TrayIcon()
+            t.create(None, "多屏管理器")
+            if getattr(t, "proc", None) is not None:
+                b.windows.register_own_pid(t.proc.pid)
+            self.status_var.set("快速面板已打开")
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("错误", f"打开快速面板失败:\n{e}")
 
     def _export_settings(self):
+        """全量 zip 备份：settings/profiles/layouts 原样打包。"""
         p = filedialog.asksaveasfilename(
             defaultextension=".zip", filetypes=[("配置包", "*.zip")],
             title="导出配置")
@@ -3192,6 +3314,7 @@ class App:
             messagebox.showwarning("提示", "当前没有可导出的配置文件")
 
     def _import_settings(self):
+        """全量 zip 恢复：导入整体覆盖，原配置自动备份。"""
         p = filedialog.askopenfilename(
             filetypes=[("配置包", "*.zip")], title="导入配置")
         if not p:
@@ -4111,10 +4234,6 @@ class App:
         self.slideshow_enabled_var.set(cfg["enabled"])
         self.slideshow_shuffle_var.set(cfg["shuffle"])
         try:
-            self.slideshow_interval_var.set(str(max(1, cfg["interval"] // 60)))
-        except Exception:  # noqa: BLE001
-            pass
-        try:
             self.slideshow_list.delete(0, "end")
             cur = slideshow.current_path()
             for p in cfg["items"]:
@@ -4127,11 +4246,11 @@ class App:
             pass
 
     def _slideshow_minutes(self):
-        """读取间隔输入框（分钟），非法时回退 5 分钟。"""
+        """幻灯片间隔沿用轮换卡的「间隔(分钟)」输入，非法时回退 10 分钟。"""
         try:
-            return max(1, int(float(self.slideshow_interval_var.get() or "5")))
+            return max(1, int(float(self.rotate_interval_var.get())))
         except Exception:  # noqa: BLE001
-            return 5
+            return 10
 
     def _slideshow_schedule(self, secs):
         """（重新）安排下一次切换：主线程 after，安全且随窗口关闭自动取消。"""
@@ -4178,21 +4297,13 @@ class App:
                 pass
 
     def _slideshow_toggle(self):
-        """启用/停用自动轮换。"""
-        enabled = self.slideshow_enabled_var.get()
-        cfg = slideshow.set_config(
-            enabled=enabled,
-            interval=self._slideshow_minutes() * 60,
-            shuffle=self.slideshow_shuffle_var.get(),
-            position=self.fit_var.get() or "fill",
-        )
-        if enabled and cfg["items"]:
-            self._slideshow_schedule(cfg["interval"])
-            self.status_var.set(f"幻灯片已启用：每 {cfg['interval'] // 60} 分钟切换")
+        """托盘「开始/停止幻灯片」：与轮换按钮同一开关。"""
+        if bool(slideshow.get_config()["enabled"]):
+            self._stop_rotate()
+            self.status_var.set("幻灯片已停用")
         else:
-            self._slideshow_cancel()
-            self.status_var.set("幻灯片无图片，请先「添加图片」" if enabled else "幻灯片已停用")
-        self._slideshow_refresh()
+            self._slideshow_start()
+            self.status_var.set("幻灯片已启用")
 
     def _slideshow_tick(self):
         """定时切换壁纸：切换动作放后台线程，避免主界面冻结。"""
@@ -4273,6 +4384,13 @@ class App:
             return
         if cfg["enabled"] and cfg["items"]:
             self._slideshow_schedule(cfg["interval"])
+            self._rotate_running = False
+            try:
+                self.rotate_btn.configure(text="停止轮换")
+            except Exception:  # noqa: BLE001
+                pass
+            self.rotate_status_var.set(
+                f"幻灯片轮换中：{len(cfg['items'])} 张，每 {cfg['interval'] // 60} 分钟切换")
 
     def _refresh_rule_list(self):
         self.rule_rows.delete(0, "end")
@@ -4753,6 +4871,28 @@ class App:
         self.rotate_btn.pack(side="left", padx=(8, 6))
         ttk.Label(row2, textvariable=self.rotate_status_var).pack(side="left", padx=4)
 
+        # 幻灯片：手动挑选的图片列表，与目录轮换共用 slideshow 后端和托盘开关。
+        # 目录为空时这里是唯一入口；两边同时配了以「幻灯片图片」优先。
+        row3 = ttk.Frame(f)
+        row3.pack(fill="x", padx=6, pady=2)
+        ttk.Button(row3, text="添加幻灯片图片…",
+                   command=self._slideshow_add).pack(side="left")
+        ttk.Button(row3, text="移除选中",
+                   command=self._slideshow_remove_selected).pack(side="left", padx=4)
+        ttk.Button(row3, text="清空",
+                   command=self._slideshow_clear).pack(side="left", padx=4)
+        ttk.Button(row3, text="立即切换",
+                   command=self._slideshow_next_now).pack(side="left", padx=4)
+        self.slideshow_shuffle_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row3, text="随机",
+                        variable=self.slideshow_shuffle_var).pack(side="left", padx=6)
+        self.slideshow_list = tk.Listbox(f, height=2, activestyle="none")
+        self.slideshow_list.pack(fill="x", padx=6, pady=2)
+        self.slideshow_status_var = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.slideshow_status_var,
+                  foreground="#666666").pack(anchor="w", padx=6, pady=(0, 2))
+        self._slideshow_refresh()
+
         ttk.Label(
             f,
             text="「每屏不同」模式下同一时刻各屏显示不同图片；「统一单图」模式下所有屏"
@@ -4803,10 +4943,30 @@ class App:
         self.rotate_status_var.set(f"未运行（目录内 {n} 张图片）" if n else "未运行")
 
     def _toggle_rotate(self):
-        if self._rotate_running:
+        """轮换/幻灯片统一开关：有幻灯片图片走 slideshow，否则走目录轮换。"""
+        if self._rotate_running or bool(slideshow.get_config()["enabled"]):
             self._stop_rotate()
         else:
-            self._start_rotate()
+            if slideshow.get_config()["items"]:
+                self._slideshow_start()
+            else:
+                self._start_rotate()
+
+    def _slideshow_start(self):
+        """启用幻灯片轮播：间隔/填充沿用轮换卡与壁纸区的当前设置。"""
+        cfg = slideshow.set_config(
+            enabled=True,
+            interval=self._slideshow_minutes() * 60,
+            position=self.fit_var.get() or "fill",
+        )
+        self._slideshow_schedule(cfg["interval"])
+        self._rotate_running = False
+        try:
+            self.rotate_btn.configure(text="停止轮换")
+        except Exception:  # noqa: BLE001
+            pass
+        self.rotate_status_var.set(
+            f"幻灯片轮换中：{len(cfg['items'])} 张，每 {cfg['interval'] // 60} 分钟切换")
 
     def _start_rotate(self):
         total = len(self._rotate_images())
@@ -4823,8 +4983,13 @@ class App:
             pass
         self._rotate_step()
 
-    def _stop_rotate(self, quiet=False):
+    def _stop_rotate(self, quiet=False, persist=True):
         self._rotate_running = False
+        if persist:
+            try:
+                slideshow.set_config(enabled=False)
+            except Exception:  # noqa: BLE001
+                self.slideshow_enabled_var.set(False)
         if self._rotate_job is not None:
             try:
                 self.root.after_cancel(self._rotate_job)
@@ -4837,6 +5002,7 @@ class App:
             pass
         if not quiet:
             self.rotate_status_var.set(f"已停止（本次切换 {self._rotate_count} 次）")
+        self._slideshow_refresh()
 
     def _rotate_step(self):
         """定时切一张；目录为空或应用失败时自动停止并给出原因。"""
@@ -5025,7 +5191,9 @@ class App:
                 "双击托盘图标可重新打开，右键托盘图标可退出。")
 
     def quit(self):
-        self._stop_rotate(quiet=True)
+        # persist=False：退出只是停本次调度，不改「已启用」的持久化状态，
+        # 否则下次启动幻灯片不再自动恢复
+        self._stop_rotate(quiet=True, persist=False)
         if self._display_poll_id is not None:
             try:
                 self.root.after_cancel(self._display_poll_id)

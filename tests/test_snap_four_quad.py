@@ -55,6 +55,14 @@ def _run(wins, mons, **kw):
 
     keep_cache: 跑完不还原 §_QUAD_MIN_CACHE（供「连排两次验证缓存复用」这类
     跨调用用例），调用方负责自己收尾。
+
+    size_locked: {hwnd, ...}，模拟「位置能动、尺寸改不动」的应用（真机实测
+    ChatGPT / Cua Driver：`set size` 静默无效、`set position` 正常）。这类
+    窗口能摆到角上但铺不满格子，必须与「完全动不了」分开报。
+
+    fullscreen: {hwnd, ...}，模拟处于 macOS 全屏的窗口。全屏时系统接管
+    尺寸（真机 ChatGPT 实测 `set size` 返回成功但读回原尺寸），排布前必须
+    先退出全屏，否则会被误报成「尺寸被应用锁定」。
     """
     # 每例都拿一份窗口副本：fake 写入会把新几何写回窗口 dict（CG 枚举要跟着
     # 变，否则「写入无效」的判据全落空），共用 WINS 会把上一例的几何带给下一例
@@ -64,7 +72,8 @@ def _run(wins, mons, **kw):
     for attr in ("list_target_windows", "monitors", "_find_window",
                  "get_window_rect", "set_window_rect", "push_undo",
                  "_osa", "_probe_min_size", "list_windows_front_to_back",
-                 "_readback_rect", "_gap_settings", "_quad_cache_file"):
+                 "_readback_rect", "_gap_settings", "_quad_cache_file",
+                 "_ax_is_fullscreen", "_ax_set_fullscreen"):
         prev[attr] = getattr(wm, attr)
     # 尺寸缓存是模块级全局，且正式排布现在会顺带写盘 quad_cache.json：
     # 缓存按例隔离（清空 + 跑完还原），写盘路径指到临时文件，否则测试会
@@ -88,7 +97,22 @@ def _run(wins, mons, **kw):
 
     readback = kw.pop("readback", {})
     min_sizes = kw.pop("min_sizes", {})
+    size_locked = set(kw.pop("size_locked", ()))
+    fullscreen = set(kw.pop("fullscreen", ()))
     state = {}
+
+    def _fullscreen(hwnd):
+        return True if hwnd in fullscreen else False
+
+    def _set_fullscreen(hwnd, on):
+        if on:
+            fullscreen.add(hwnd)
+        else:
+            fullscreen.discard(hwnd)
+        return True
+
+    wm._ax_is_fullscreen = _fullscreen
+    wm._ax_set_fullscreen = _set_fullscreen
 
     def _rect(hwnd, *a, **k):
         return readback.get(hwnd) or state.get(hwnd) or (0, 0, 0, 0)
@@ -127,6 +151,18 @@ def _run(wins, mons, **kw):
 
     def _place(hwnd, x, y, w, h, activate=True):
         placed.append((hwnd, x, y, w, h))
+        if hwnd in size_locked:
+            # 位置跟着走、尺寸纹丝不动：读回保留原来的 w/h。只更新 state，
+            # 不动 wins 里的 w/h——_cg_rect 桩从 wins 读几何，那边也得反映
+            # 「尺寸没变」，否则会被判成写入完全无效。
+            old = state.get(hwnd) or next(
+                ((ww["w"], ww["h"]) for ww in wins
+                 if ww["hwnd"] == hwnd), (w, h))
+            state[hwnd] = (x, y, old[0], old[1])
+            for win in wins:
+                if win["hwnd"] == hwnd:
+                    win["x"], win["y"] = x, y
+            return True
         # 见 _exact 说明：未指定 readback 的窗口读回宽度比请求少 1px，
         # 令「读回 + 1」正好回到理想分割点
         state[hwnd] = _exact(hwnd, x, y, w, h)
@@ -995,7 +1031,8 @@ def _run_grid(wins, mons, **kw):
                  "get_window_rect", "set_window_rect", "push_undo",
                  "_osa", "_probe_min_size", "list_windows_front_to_back",
                  "_readback_rect", "_settled_readback", "_cg_rect",
-                 "_gap_settings", "_quad_cache_file"):
+                 "_gap_settings", "_quad_cache_file",
+                 "_ax_is_fullscreen", "_ax_set_fullscreen"):
         prev[attr] = getattr(wm, attr)
     prev_notes = list(wm._last_grid_notes)
     # 尺寸缓存是模块级全局，正式排布会写它、也会顺带写盘；命中缓存还会跳过
@@ -1021,8 +1058,20 @@ def _run_grid(wins, mons, **kw):
     readback = kw.pop("readback", {})
     min_sizes = kw.pop("min_sizes", {})
     frozen = set(kw.pop("frozen", ()))
+    fullscreen = set(kw.pop("fullscreen", ()))
     state = {}
     wins = [dict(w) for w in wins]
+
+    wm._ax_is_fullscreen = lambda hwnd: hwnd in fullscreen
+
+    def _set_fullscreen(hwnd, on):
+        if on:
+            fullscreen.add(hwnd)
+        else:
+            fullscreen.discard(hwnd)
+        return True
+
+    wm._ax_set_fullscreen = _set_fullscreen
 
     wm.monitors = _Mons()
     wm.list_target_windows = lambda: wins
@@ -1514,6 +1563,64 @@ class TestFillGrid(unittest.TestCase):
         done, _placed, notes = self._run(wins, cols=2, rows=1, frozen={"A::1"})
         self.assertTrue(any("写入后位置尺寸都没变" in n for n in notes),
                         "写入无效必须报出来：%s" % notes)
+
+    def test_fullscreen_window_is_exited_before_layout(self):
+        """全屏窗口先退出全屏再排，并如实说明这一步。
+
+        全屏由系统接管尺寸，直接写 size 会成功返回却毫无变化——真机
+        ChatGPT 就是这样被误报成「尺寸被应用锁定」。
+        """
+        wins = [_win("A::1", w=1512, h=949), _win("B::1", w=800, h=600)]
+        # 这里走四宫格夹具（TestFillGrid 的 self._run 跑的是 fill_grid）
+        ok, placed = _run(wins, [_Mon()], fullscreen={"A::1"})
+        self.assertTrue(ok)
+        self.assertEqual({p[0] for p in placed}, {"A::1", "B::1"})
+        self.assertTrue(any("原本处于全屏" in n for n in wm._last_quad_notes),
+                        "退出全屏这一步必须告诉用户：%s"
+                        % (wm._last_quad_notes,))
+
+    def test_size_locked_reported_and_returns_false(self):
+        """位置能动、尺寸改不动：如实报「尺寸被锁定」，且不谎报成功。
+
+        真机实测（ChatGPT 1920x1050、Cua Driver 1600x900）：`set position`
+        生效、`set size` 静默无效（组合写入报 -10003 Access not allowed）。
+        旧代码把这判成「已达可达边界」就收工，最后返回 True，状态栏显示
+        「已 2×2 四宫格排列」，用户看到的却是窗口互相压着、完全没排开。
+        """
+        wins = [_win("A::1", w=1920, h=1050), _win("B::1", w=1600, h=900)]
+        ok, _placed = _run(wins, [_Mon()], size_locked={"A::1", "B::1"})
+        notes = list(wm._last_quad_notes)
+        self.assertFalse(ok, "全部窗口都锁尺寸时必须返回 False，不能谎报成功")
+        joined = "；".join(notes)
+        self.assertIn("窗口尺寸被应用锁定", joined,
+                      "必须说清是尺寸被锁定，而不是笼统的「动不了」：%s" % notes)
+        self.assertIn("排列失败", joined, "状态栏首条要是失败：%s" % notes)
+
+    def test_readback_overlap_returns_false(self):
+        """读回实测两个窗口互相压住：必须判失败，不能因为位置动过就算成功。
+
+        真机实测 ChatGPT 最小宽 480、Cua Driver 锁死 1600x900：并排时前者被
+        撑宽、后者纹丝不动，两个窗口完全叠住。旧实现只在 4 个窗口时算重叠，
+        两个窗口返回 True，状态栏显示「已排列」。
+        """
+        ok, _placed = _run(
+            [_win("A::1", w=1200, h=700), _win("B::1", w=1600, h=900)],
+            [_Mon()],
+            readback={"A::1": (0, 0, 1200, 700),
+                      "B::1": (0, 0, 1600, 900)})
+        notes = list(wm._last_quad_notes)
+        self.assertFalse(ok, "实测重叠必须判失败：%s" % notes)
+        self.assertTrue(any("互相重叠" in n for n in notes),
+                        "必须说清是实测重叠：%s" % notes)
+
+    def test_size_locked_partial_still_reports_success(self):
+        """只有部分窗口锁尺寸：仍算排成功，但要点名是谁铺不满。"""
+        wins = [_win("A::1", w=1920, h=1050), _win("B::1", w=800, h=600)]
+        ok, _placed = _run(wins, [_Mon()], size_locked={"A::1"})
+        notes = list(wm._last_quad_notes)
+        self.assertTrue(ok, "还有窗口正常排上了，不该整体判失败：%s" % notes)
+        self.assertIn("窗口尺寸被应用锁定", "；".join(notes),
+                      "锁尺寸的窗口必须点名：%s" % notes)
 
 
 
