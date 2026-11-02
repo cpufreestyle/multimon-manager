@@ -43,11 +43,16 @@ logger = logging.getLogger(__name__)
 # 且一次命中目标。用完立刻恢复原值，异常也恢复。
 _AX_LIB = None
 _AX_ATTR_ENHANCED = None
+_AX_ATTR_FULLSCREEN = None
+_AX_ATTR_WINDOWS = None
+_AX_ATTR_POSITION = None
+_AX_ATTR_SIZE = None
 
 
 def _load_ax():
     """懒加载 ApplicationServices 与 AXEnhancedUserInterface 的 CFString。"""
-    global _AX_LIB, _AX_ATTR_ENHANCED
+    global _AX_LIB, _AX_ATTR_ENHANCED, _AX_ATTR_FULLSCREEN
+    global _AX_ATTR_WINDOWS, _AX_ATTR_POSITION, _AX_ATTR_SIZE
     if _AX_LIB is not None:
         return _AX_LIB
     try:
@@ -62,11 +67,34 @@ def _load_ax():
         lib.AXUIElementSetAttributeValue.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
         cf = cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+        lib.AXValueCreate.restype = ctypes.c_void_p
+        lib.AXValueCreate.argtypes = [
+            ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32]
+        lib.AXValueGetValue.restype = ctypes.c_bool
+        lib.AXValueGetValue.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+        cf.CFArrayGetCount.restype = ctypes.c_long
+        cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+        cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+        cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+        cf.CFBooleanGetValue.restype = ctypes.c_bool
+        cf.CFBooleanGetValue.argtypes = [ctypes.c_void_p]
+        cf.CFRelease.restype = None
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
         cf.CFStringCreateWithCString.restype = ctypes.c_void_p
         cf.CFStringCreateWithCString.argtypes = [
             ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
         _AX_ATTR_ENHANCED = cf.CFStringCreateWithCString(
             None, b"AXEnhancedUserInterface", 0x08000100)
+        _AX_ATTR_FULLSCREEN = cf.CFStringCreateWithCString(
+            None, b"AXFullScreen", 0x08000100)
+        _AX_ATTR_WINDOWS = cf.CFStringCreateWithCString(
+            None, b"AXWindows", 0x08000100)
+        _AX_ATTR_POSITION = cf.CFStringCreateWithCString(
+            None, b"AXPosition", 0x08000100)
+        _AX_ATTR_SIZE = cf.CFStringCreateWithCString(
+            None, b"AXSize", 0x08000100)
+        lib._cf = cf
         lib._kCFBooleanTrue = ctypes.c_void_p.in_dll(cf, "kCFBooleanTrue")
         lib._kCFBooleanFalse = ctypes.c_void_p.in_dll(cf, "kCFBooleanFalse")
         _AX_LIB = lib
@@ -74,6 +102,134 @@ def _load_ax():
         logger.warning("AX 动画开关不可用，退回默认写入: %s", e)
         _AX_LIB = False
     return _AX_LIB
+
+
+class _CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+class _CGSize(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+
+def _ax_window_elements(pid):
+    """取一个应用的全部 AX 窗口元素，同时把 CFArray 的所有权交还调用方。
+
+    返回 (array_ref, [AXUIElementRef, ...])。CFArrayGetValueAtIndex 返回的是
+    **不持有**的元素指针，数组一释放元素就可能失效——所以调用方必须在用完
+    元素后再 CFRelease(array_ref)。取不到时返回 (None, [])。
+    """
+    lib = _load_ax()
+    if not lib or not pid:
+        return None, []
+    try:
+        el = lib.AXUIElementCreateApplication(int(pid))
+        if not el:
+            return None, []
+        out = ctypes.c_void_p()
+        if lib.AXUIElementCopyAttributeValue(
+                ctypes.c_void_p(el), _AX_ATTR_WINDOWS,
+                ctypes.byref(out)) != 0 or not out.value:
+            return None, []
+        cf = lib._cf
+        arr = ctypes.c_void_p(out.value)
+        count = cf.CFArrayGetCount(arr)
+        els = [ctypes.c_void_p(cf.CFArrayGetValueAtIndex(arr, i))
+               for i in range(count)]
+        return arr, els
+    except Exception as e:  # noqa: BLE001
+        logger.info("枚举 AX 窗口失败: %s", e)
+        return None, []
+
+
+def _ax_is_fullscreen(hwnd):
+    """窗口是否处于 macOS 全屏（AXFullScreen）。判断不了时返回 None。
+
+    全屏窗口的尺寸由系统接管，`set size` 一律被静默忽略：真机实测 ChatGPT
+    在全屏时 AX size 写 900x600 返回 kAXErrorSuccess，读回仍是 1512x949；
+    退出全屏后同一次写入立即生效。四宫格把它当成「窗口尺寸被应用锁定」报
+    只会误导用户——真正要做的是先退出全屏。
+    """
+    lib = _load_ax()
+    if not lib:
+        return None
+    app, name, seq = parse_hwnd(hwnd)
+    w = _find_window(hwnd)
+    pid = (w or {}).get("pid")
+    if not pid:
+        return None
+    arr, els = _ax_window_elements(pid)
+    try:
+        for i, el in enumerate(els, 1):
+            if seq and i != seq:
+                continue
+            try:
+                out = ctypes.c_void_p()
+                if lib.AXUIElementCopyAttributeValue(
+                        el, _AX_ATTR_FULLSCREEN,
+                        ctypes.byref(out)) != 0 or not out.value:
+                    continue
+                return bool(lib._cf.CFBooleanGetValue(
+                    ctypes.c_void_p(out.value)))
+            except Exception:  # noqa: BLE001
+                continue
+    finally:
+        if arr:
+            lib._cf.CFRelease(arr)
+    return None
+
+
+def _ax_set_fullscreen(hwnd, on):
+    """把窗口切进/切出全屏。成功返回 True；不支持或失败返回 False。"""
+    lib = _load_ax()
+    if not lib:
+        return False
+    _app, _name, seq = parse_hwnd(hwnd)
+    w = _find_window(hwnd)
+    pid = (w or {}).get("pid")
+    if not pid:
+        return False
+    want = (lib._kCFBooleanTrue if on else lib._kCFBooleanFalse)
+    arr, els = _ax_window_elements(pid)
+    try:
+        for i, el in enumerate(els, 1):
+            if seq and i != seq:
+                continue
+            try:
+                if lib.AXUIElementSetAttributeValue(
+                        el, _AX_ATTR_FULLSCREEN, want) == 0:
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+    finally:
+        if arr:
+            lib._cf.CFRelease(arr)
+    return False
+
+
+def _exit_fullscreen_for_layout(hwnd, notes):
+    """排布前退出全屏；退出后等系统动画把几何交还窗口。
+
+    返回是否真的发生过「退出全屏」。只在确认处于全屏时才动，普通窗口
+    一律不碰。等待用轮询而不是固定 sleep：真机全屏切换动画 0.3~1.2s，
+    固定值要么白等、要么没退完就开始写几何。
+    """
+    if _ax_is_fullscreen(hwnd) is not True:
+        return False
+    if not _ax_set_fullscreen(hwnd, False):
+        return False
+    deadline = time.time() + 2.5
+    while time.time() < deadline:
+        time.sleep(0.15)
+        if _ax_is_fullscreen(hwnd) is False:
+            # 再给一帧让窗口几何落定，避免读到全屏残留尺寸
+            time.sleep(0.2)
+            name = hwnd.split("::")[0]
+            notes.append("%s 原本处于全屏，已先退出全屏再排列" % name)
+            logger.info("四宫格：%s 已退出全屏", hwnd)
+            return True
+    logger.warning("四宫格：%s 退出全屏超时", hwnd)
+    return False
 
 
 class _AppAnimationOff:
@@ -2603,7 +2759,7 @@ def _quad_anchor(corner, fx, fy, fw, fh, gw, gh, wl, wt, ww, wh):
 
 
 def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
-                detect_unwritable=True):
+                detect_unwritable=True, resize_locked=None):
     """把 finals 写进窗口，读回实测几何，再按方位贴边收尾。
 
     返回 {hwnd: 实测矩形}：调用方据此判断「窗口被 App 钳得比格子大」，用实测
@@ -2611,9 +2767,17 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
 
     detect_unwritable=False 时跳过「写入无效」判定：第二趟的「写入前几何」就是
     第一趟的结果，被钳制的窗口两趟读回相同，会被误判成「一步没动、写不动」。
+
+    resize_locked: 可选 list，尺寸被 App 锁定的窗口会追加进去。与 unwritable
+    分开是因为两者后果不同：unwritable 是连位置都动不了（完全排不了），
+    resize_locked 是位置能跟着走、尺寸却纹丝不动（不能铺满目标格子）。真机
+    实测 ChatGPT / Cua Driver 都是后者——`set size` 静默无效、组合写入报
+    -10003 Access not allowed，但 `set position` 正常。
     """
     measured = {}
     clamped = {}
+    if resize_locked is None:
+        resize_locked = []
     for corner, h, fx, fy, fw, fh in finals:
         # 写入前先取 CG 几何：判「写入有没有生效」用它，不用 _last_rect（探测
         # 失败时它可能停留在很久以前的枚举值），也不用 AX 读回（App 不开放
@@ -2631,17 +2795,43 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
         # 不开放自动化（真机微信、CrossPaste），或被系统钉住（真机 Sidecar 上的
         # UU远程）。必须与「被最小尺寸钳制」分开——钳制会变，写不动是一步不动。
         # 判据放在「读回失败」之前：微信那种 AX 读写全失败的窗口也得报出来。
+        # 位置/尺寸是否被要求变化，分开判：窗口本来就在目标角上（真机实测
+        # ChatGPT 一直在 (0,0)，目标也是 (0,0)），位置没变化并不能说明
+        # 「动不了」，真正的差别在尺寸——这类要归到「尺寸锁定」，不能算
+        # 「完全不响应写入」。
+        _want_move = (pre is not None
+                      and (abs(pre[0] - fx) > 2 or abs(pre[1] - fy) > 2))
+        _want_resize = (pre is not None
+                        and (abs(pre[2] - fw) > 2 or abs(pre[3] - fh) > 2))
+        _moved = (pre is not None and post is not None
+                  and (abs(pre[0] - post[0]) > 2
+                       or abs(pre[1] - post[1]) > 2))
+        _resized = (pre is not None and post is not None
+                    and (abs(pre[2] - post[2]) > 2
+                         or abs(pre[3] - post[3]) > 2))
         if (detect_unwritable and pre and post
                 and h not in unwritable
-                and any(abs(a - b) > 2
-                        for a, b in zip(pre, (fx, fy, fw, fh)))
-                and all(abs(a - b) <= 2 for a, b in zip(pre, post))):
+                and _want_move
+                and not _moved and not _resized):
             unwritable.append(h)
             notes.append("%s 写入后位置尺寸都没变，无法移动"
                          "（不开放自动化或被系统钉住）"
                          % h.split("::")[0])
             logger.warning("四宫格：%s 写入无效：要求 %s，CG 几何仍是 %s",
                            h, (fx, fy, fw, fh), post)
+        # 要求改尺寸、尺寸却没变 = App 锁定了窗口尺寸（`set size` 被忽略）。
+        # 这一类仍能摆到正确的角上，只是没法铺满格子，必须与「完全动不了」
+        # 分开报：用户看到的现象是「窗口都挤在角上、大小没变」，说成
+        # 「动不了」会让人以为程序没执行。
+        elif (detect_unwritable and pre and post
+                and h not in unwritable and h not in resize_locked
+                and _want_resize and not _resized):
+            resize_locked.append(h)
+            notes.append("%s 的窗口尺寸被应用锁定，只能摆位置、不能铺满格子"
+                         % h.split("::")[0])
+            logger.warning("四宫格：%s 尺寸锁定：要求 %dx%d，实测仍是 %dx%d"
+                           "（位置已移动）",
+                           h, fw, fh, post[2], post[3])
         if not got or got == (0, 0, 0, 0):
             continue
         gx, gy, gw, gh = got
@@ -2843,6 +3033,25 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
         logger.warning("可排列的窗口不足两个（选中 %d 个）", len(picked))
         return False
 
+    # 全屏窗口的尺寸由系统接管：真机实测 ChatGPT 在全屏时 `set size` 返回
+    # 成功却读回原尺寸，退出全屏后同一写入立即生效。四宫格必须先退出全屏，
+    # 否则后面只会得到「尺寸被应用锁定」的假结论。说明写进 _last_quad_notes，
+    # 用户能看到这次多做了这一步。
+    # 退出全屏的说明单独存：本函数后半段会把 notes 重新绑定成新列表
+    # （`notes = []`），直接写进 _last_quad_notes 会被那次重绑定覆盖掉。
+    fullscreen_notes = []
+    for h, _w in picked:
+        if _exit_fullscreen_for_layout(h, fullscreen_notes):
+            # 退出全屏后窗口会回到原来的 Space/位置，几何必须重新读一遍，
+            # 否则后面按全屏尺寸算窗口落点
+            _fresh = _fresh_rect(h)
+            if _fresh and _fresh != (0, 0, 0, 0):
+                _last_rect[h] = _fresh
+    if fullscreen_notes:
+        # 重新枚举：全屏退出后目标窗口可能换了屏或改了 z 序
+        picked, picked_corners, _missing_windows = _quad_pick_windows(
+            (tl_hwnd, tr_hwnd, bl_hwnd, br_hwnd), use_pinned=use_pinned)
+
     tl_hwnd, tl_w = picked[0]
     idx = _resolve_monitor_index(ms, monitor)
     if idx is None:
@@ -3034,9 +3243,11 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     if smart:
         sx, sy = _quad_smart_ratio(placed_slots, mins, ww, wh, sx, sy,
                                    origin=(wl, wt))
-    notes = []
+    notes = list(fullscreen_notes)
     # 写入无效的窗口（App 不开放自动化 / 被系统钉住）：写入前后几何一步没变
     unwritable = []
+    # 位置能改、尺寸改不动的窗口（App 锁定了窗口尺寸）
+    resize_locked = []
 
     maxes = {}
     cells, finals, splits = _quad_cells(
@@ -3048,7 +3259,8 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     for attempt in range(_QUAD_MAX_PASSES):
         measured, clamped = _quad_write(finals, cells, wl, wt, ww, wh,
                                         smart, unwritable, notes,
-                                        detect_unwritable=attempt == 0)
+                                        detect_unwritable=attempt == 0,
+                                        resize_locked=resize_locked)
         grew = False
         for corner, h, _fx, _fy, _fw, _fh in finals:
             got = measured.get(h)
@@ -3225,6 +3437,25 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
             notes.append("四格没完全排开：实测上下重叠 %dpx、左右重叠 %dpx"
                          % (real_ov_y, real_ov_x))
             logger.warning("四宫格：%s", notes[-1])
+    elif len(live) >= 2:
+        # 两个窗口也可能互相压住：真机实测 ChatGPT（最小宽 480）与 Cua Driver
+        # （尺寸完全锁死 1600x900）并排时，前者被撑宽、后者纹丝不动，两个窗口
+        # 叠在一起。旧实现只检查 4 个窗口的重叠，这类「2 个窗压住」会返回
+        # 成功——用户看到的就是「点完了还是叠着」。
+        overlap = False
+        for i in range(len(live)):
+            for j in range(i + 1, len(live)):
+                a, b = live[i], live[j]
+                ov_w = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+                ov_h = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+                if ov_w > 8 and ov_h > 8:
+                    overlap = True
+                    break
+            if overlap:
+                break
+        if overlap:
+            notes.append("窗口实测互相重叠，没能真正排开")
+            logger.warning("四宫格：实测有窗口互相重叠")
     # 放不下的窗口逐个说明：排了多少、谁没排、为什么。这块屏的四宫格容量是
     # 硬上限（App 的最小尺寸改不了），说清楚用户才知道该关谁、换谁。
     pos = 1 if _missing_windows else 0
@@ -3256,6 +3487,43 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
         if _c and (_c[0] > 0 or _c[1] > 0):
             _QUAD_MAX_CACHE[_h] = (int(_c[0]), int(_c[1]))
     _quad_cache_save()
+    # 如实返回：窗口本来该排、却一个都没摆成时必须报失败，不能返回 True 让
+    # 界面说「排列完成」。真机实测（ChatGPT 1920x1050、Cua Driver 1600x900，
+    # 两个都锁尺寸）：位置动了、尺寸没动，窗口仍互相压着，旧代码却返回 True，
+    # 状态栏显示「已 2×2 四宫格排列」，用户看到的是完全没排开——谎报成功比
+    # 报错更糟。
+    #
+    # 与「装不下」区分开：所有窗口都放不进格子时压根没写过东西（unplaced 全
+    # 覆盖、report 为空），那是既有的「只排 0/4」语义，仍算正常返回——用户
+    # 看到的是容量不足的说明，不是失败。
+    _blocked = set(unwritable) | set(resize_locked)
+    _ok_count = len([1 for _h, _w, r in report if r
+                     and _h not in _blocked])
+    _overlapped = any("互相重叠" in _n for _n in notes)
+    if not _ok_count and _blocked and report:
+        if resize_locked:
+            notes.insert(0, "排列失败：%s 的窗口尺寸被应用锁定，无法铺满格子"
+                         % "、".join(x.split("::")[0]
+                                    for x in resize_locked[:3]))
+        elif unwritable:
+            notes.insert(0, "排列失败：%s 完全不响应写入"
+                         "（不开放自动化或被系统钉住）"
+                         % "、".join(x.split("::")[0] for x in unwritable[:3]))
+        logger.warning("四宫格：一个窗口都没排成功（尺寸锁定 %d 个，"
+                       "完全动不了 %d 个）",
+                       len(resize_locked), len(unwritable))
+        # 先插失败说明再发布：界面读的是 _last_quad_notes 的内容，早一步拷贝
+        # 会让「排列失败」只留在局部 notes 里，状态栏仍然看不到。
+        _last_quad_notes[:] = notes
+        return False
+    if _overlapped and _blocked:
+        # 有窗口被物理限制顶大、实测确实压在一起：这是失败，不能因为「位置
+        # 动过」就算成功。真机 ChatGPT 480 最小宽 + Cua Driver 锁死
+        # 1600x900 并排时两个窗口完全叠住，用户看到的就是「完全没排开」。
+        notes.insert(0, "排列失败：窗口被应用尺寸限制顶大，实测仍然互相重叠")
+        _last_quad_notes[:] = notes
+        logger.warning("四宫格：物理限制导致窗口重叠，判失败")
+        return False
     _last_quad_notes[:] = notes
     return True
 
