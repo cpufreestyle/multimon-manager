@@ -24,6 +24,7 @@ if IS_MAC:
     import accessibility_mac as accessibility
     import rehome
     import keep_awake
+    import dock_autohide_mac
     import dragsnap_mac as dragsnap
 else:
     import monitors
@@ -127,6 +128,16 @@ def keep_awake_snapshot():
 
 
 keep_awake_has_lid = keep_awake.has_lid
+# Dock 自动隐藏（macOS 系统设置；其它平台没有对应概念）
+if IS_MAC:
+    dock_autohide_get = dock_autohide_mac.get_autohide
+    dock_autohide_set = dock_autohide_mac.set_autohide
+else:
+    def dock_autohide_get():
+        return None
+
+    def dock_autohide_set(enabled):
+        return False, "Dock 自动隐藏仅支持 macOS"
 # 撤销上一次窗口移动（F7）
 undo_last_move = windows.undo_last_move
 # 窗口暂存（复刻 Rectangle Pro 的 Stash）

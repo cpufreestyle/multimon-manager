@@ -13,6 +13,11 @@ import subprocess
 import time
 from dataclasses import dataclass
 
+try:
+    import dock_autohide_mac as _dock
+except Exception:  # noqa: BLE001  Dock 只影响工作区，模块异常不该拖垮显示器枚举
+    _dock = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -300,7 +305,14 @@ def stage_manager_enabled():
 
 
 def _compute_work_areas(monitors):
-    """按 NSScreen.visibleFrame 填充各屏可用工作区；失败则退化为扣除菜单栏。"""
+    """填充各屏可用工作区，并避开固定显示的 Dock。
+
+    NSScreen.visibleFrame 通常会扣掉 Dock，但真机 macOS 27.2 上它给出的底边
+    仍比 Dock 面板顶边低 4pt（visibleFrame 底边 930、Dock 顶边 926），窗口
+    贴到工作区底边就会压住 Dock。因此再用 Dock 的实际 AX 面板矩形收紧一次，
+    并留安全距离；所有吸附/四格/网格/跨屏铺满都消费 work_rect，修在这里
+    才能覆盖全部入口。
+    """
     frames = _ns_screen_frames()
     main_h = None
     for full, _v in frames:
@@ -334,14 +346,147 @@ def _compute_work_areas(monitors):
         if applied:
             logger.debug("工作区取自 NSScreen.visibleFrame（%d/%d 屏）",
                          applied, len(monitors))
-            return
+    else:
+        # 退化：所有屏统一扣除菜单栏高度
+        for m in monitors:
+            m.work_left = m.left
+            m.work_width = m.width
+            m.work_top = m.top + _MENU_BAR_PT
+            m.work_height = max(m.height - _MENU_BAR_PT, 0)
 
-    # 退化：所有屏统一扣除菜单栏高度
+    _apply_dock_avoidance(monitors)
+
+
+# Dock 面板与窗口之间额外留的像素。可见Frame 本身已经比面板顶边低 4pt，
+# 只对齐到 926 仍会与 Dock 的阴影/圆角有一两像素交叠；6pt 能盖住实测偏差。
+DOCK_SAFETY_PT = 6
+
+
+def _intersection_area(a, b):
+    """两个 `(x, y, w, h)` 矩形的交集面积。"""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ow = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    oh = max(0, min(ay + ah, by + bh) - max(ay, by))
+    return ow * oh
+
+
+def _dock_side(mon_rect, panel):
+    """判断 Dock 贴在哪条屏边。
+
+    面板宽大于高说明是底部/顶部横向 Dock；否则是左/右竖向 Dock。不按面板
+    距屏边的像素距离判——macOS 的底部 Dock 左右各有约 25pt 圆角留白，距
+    左右边反而可能比距底边更近。
+    """
+    mx, my, mw, mh = mon_rect
+    px, py, pw, ph = panel
+    if pw >= ph:
+        return "bottom" if py + ph / 2.0 >= my + mh / 2.0 else "top"
+    return "right" if px + pw / 2.0 >= mx + mw / 2.0 else "left"
+
+
+def _trim_work_for_dock(m, panel, safety=DOCK_SAFETY_PT):
+    """按 Dock 实际面板收紧一块屏的工作区。返回是否发生了裁剪。"""
+    full = (m.left, m.top, m.width, m.height)
+    if _intersection_area(full, panel) <= 0:
+        return False
+
+    wl, wt = int(m.work_left), int(m.work_top)
+    wr = wl + int(m.work_width)
+    wb = wt + int(m.work_height)
+    px, py, pw, ph = panel
+    side = _dock_side(full, panel)
+
+    if side == "bottom":
+        # 窗口底边必须停在 Dock 面板顶边再往上 safety 像素处。
+        limit = int(py) - safety
+        if limit < wb:
+            wb = max(wt + 1, limit)
+    elif side == "top":
+        limit = int(py) + int(ph) + safety
+        if limit > wt:
+            wt = min(wb - 1, limit)
+    elif side == "left":
+        limit = int(px) + int(pw) + safety
+        if limit > wl:
+            wl = min(wr - 1, limit)
+    else:  # right
+        limit = int(px) - safety
+        if limit < wr:
+            wr = max(wl + 1, limit)
+
+    changed = (wl, wt, wr - wl, wb - wt) != m.work_rect
+    if changed:
+        m.work_left, m.work_top = wl, wt
+        m.work_width, m.work_height = wr - wl, wb - wt
+    return changed
+
+
+def _trim_work_without_panel(m, safety=DOCK_SAFETY_PT):
+    """读不到 Dock 面板时，从 visibleFrame 的较大侧边距再让出 safety。"""
+    left_inset = int(m.work_left) - int(m.left)
+    right_inset = int(m.left + m.width) - int(m.work_left + m.work_width)
+    bottom_inset = int(m.top + m.height) - int(m.work_top + m.work_height)
+    insets = [(max(0, bottom_inset), "bottom"),
+              (max(0, left_inset), "left"),
+              (max(0, right_inset), "right")]
+    inset, side = max(insets)
+    # 小于 10pt 的边距通常是窗口阴影/AX 取整噪声；再扣一次没有意义。
+    if inset < 10:
+        return False
+    wl, wt = int(m.work_left), int(m.work_top)
+    wr = wl + int(m.work_width)
+    wb = wt + int(m.work_height)
+    if side == "bottom":
+        wb = max(wt + 1, wb - safety)
+    elif side == "left":
+        wl = min(wr - 1, wl + safety)
+    else:
+        wr = max(wl + 1, wr - safety)
+    changed = (wl, wt, wr - wl, wb - wt) != m.work_rect
+    if changed:
+        m.work_left, m.work_top = wl, wt
+        m.work_width, m.work_height = wr - wl, wb - wt
+    return changed
+
+
+def _apply_dock_avoidance(monitors, autohide=None, panel=None):
+    """把固定显示的 Dock 从工作区里扣掉。
+
+    Dock 自动隐藏时不额外预留：用户明确选择让 Dock 只在鼠标触边时出现，
+    此时窗口用完整 visibleFrame 是预期行为。
+
+    autohide / panel 可显式传入，供单测固定输入；None 时读系统。panel 传
+    一个 ``object()`` 以外的假矩形都按矩形处理，无法区分「未传」和「读不到」，
+    所以单独的「面板读取失败」由当前系统路径负责。
+    """
+    if not monitors or _dock is None:
+        return
+    if autohide is None and panel is None:
+        try:
+            autohide = _dock.get_autohide()
+            panel = None if autohide is True else _dock.get_panel_rect()
+        except Exception as e:  # noqa: BLE001  Dock 查询失败不能阻断显示器枚举
+            logger.debug("读取 Dock 面板失败，工作区保持 visibleFrame: %s", e)
+            autohide, panel = None, None
+
+    if autohide is True:
+        return
+    if panel is None:
+        for m in monitors:
+            _trim_work_without_panel(m)
+        return
+
+    # 多屏时 Dock 只占一块屏：按面板与完整屏幕的最大交集归属，别的屏不动。
+    owner = None
+    best = 0
     for m in monitors:
-        m.work_left = m.left
-        m.work_width = m.width
-        m.work_top = m.top + _MENU_BAR_PT
-        m.work_height = max(m.height - _MENU_BAR_PT, 0)
+        area = _intersection_area((m.left, m.top, m.width, m.height), panel)
+        if area > best:
+            owner, best = m, area
+    if owner is not None and _trim_work_for_dock(owner, panel):
+        logger.debug("工作区避开 Dock 面板 %s（%s）",
+                     panel, owner.device_name)
 
 
 # 显示器枚举带缓存：窗口工具会高频调用 enum_monitors()，而 system_profiler
