@@ -62,7 +62,8 @@ AUTO_MON = "自动（按窗口所在屏）"
 # 等分。没有它，用户改 Spinbox 会被上面的预设布局覆盖，「改了没反应」。
 GRID_LAYOUT_CUSTOM = "自定义行列"
 SPREAD_MODE_MAX = "整屏最大化"
-SPREAD_MODE_QUAD = "左上四分之一"
+SPREAD_MODE_FOUR_QUAD = "每屏4窗(2×2)"
+SPREAD_MODE_QUAD = "左上四分之一" 
 # 规则引擎（F5）：目标屏"不换屏"选项 + 位置预设（中文 → 内部键）
 AUTO_RULE_MON = "当前屏（不换屏）"
 _ZONE_BY_LABEL = {
@@ -138,6 +139,8 @@ class App:
         # 拖拽事件在 CGEventTap 原生回调里只记录坐标，真正的 UI/窗口操作延迟到主循环
         self._drag_pending = None
         self._drag_job = None
+        self._drag_down_pos = None
+        self._drag_target_hwnd = None
         # 规则引擎（F5）：记录已知窗口，用于识别"新出现的窗口"
         self._rule_seen = None
         # 幻灯片并入轮换卡后不再有独立开关控件；托盘/旧代码仍读写这个
@@ -705,6 +708,8 @@ class App:
              "把目标窗口按相对位置移到上一块显示器"),
             ("移到下一屏", lambda: b.move_active_to_next_monitor(1, activate=False),
              "把目标窗口按相对位置移到下一块显示器"),
+            ("拉到本屏", lambda: b.pull_window_to_cursor_monitor(activate=False),
+             "把其他屏幕的目标窗口直接拉到当前鼠标所在的显示器（居中且避开Dock）"),
             ("左半", self._snap_btn("left"),
              "目标窗口贴到当前屏幕的左半屏"),
             ("右半", self._snap_btn("right"),
@@ -1082,17 +1087,27 @@ class App:
         self.spread_mode_var = tk.StringVar(value=SPREAD_MODE_MAX)
         self.spread_mode_cb = ttk.Combobox(
             spread, textvariable=self.spread_mode_var, state="readonly",
-            width=9, values=[SPREAD_MODE_MAX, SPREAD_MODE_QUAD])
+            width=11, values=[SPREAD_MODE_MAX, SPREAD_MODE_FOUR_QUAD, SPREAD_MODE_QUAD])
         self.spread_mode_cb.pack(side="left", padx=(4, 2))
         self._tooltip(self.spread_mode_cb,
-                     "铺到每块屏的方式：整屏铺满工作区，或只占左上四分之一。")
+                     "铺到每块屏的方式：整屏最大化、每屏4窗(2×2四宫格)，或只占左上四分之一。")
         spread_btn = ttk.Button(spread, text="铺所选屏",
                                 command=self._fill_all_monitors)
-        spread_btn.pack(side="left", padx=(6, 0))
+        spread_btn.pack(side="left", padx=(4, 2))
         self._tooltip(
             spread_btn,
             "把窗口依次铺到勾选的屏，第 1 个窗口去第 1 块勾选的屏、依此类推。"
             "窗口比勾选的屏少时有几屏铺几屏，多出来的屏不动。")
+
+        quad_spread_btn = ttk.Button(spread, text="一屏4窗",
+                                     command=self._fill_quad_monitors)
+        quad_spread_btn.pack(side="left", padx=(2, 2))
+        self._tooltip(quad_spread_btn, "快捷将所选屏幕按 2×2 四宫格排满4个窗口（自动避让竖屏）")
+
+        manual_btn = ttk.Button(spread, text="手动选择",
+                                command=self._open_spread_manual_dialog)
+        manual_btn.pack(side="left", padx=(2, 0))
+        self._tooltip(manual_btn, "手动为各块屏幕挑选指定窗口，并查看竖屏适配提示")
         # 勾选框按当前屏数生成（屏数为 1 时跨屏铺满等价于最大化，故不显示）
         self._rebuild_spread_checks()
 
@@ -2138,11 +2153,10 @@ class App:
         return name or f"{m.width}x{m.height}"
 
     def _fill_all_monitors(self):
-        """把最前面的若干窗口依次铺到勾选的屏（一个窗口一块屏）。
+        """把若干窗口分别铺满各自勾选的屏。
 
-        窗口比勾选的屏少时有几屏铺几屏、多出来的屏不动——开着 2 个应用
-        却勾了 3 块屏是常见情况，不当作失败，状态栏如实说明铺了几块。
-        竖屏默认不勾，用户想往竖屏铺就自己勾上。
+        支持整屏铺满、一屏4窗(2×2)与左上四分之一。
+        横向宽窗自动避让竖屏（不适合竖屏的窗口绝不发往竖屏）。
         """
         if self.topmost.get():
             try:
@@ -2150,26 +2164,251 @@ class App:
             except Exception:  # noqa: BLE001
                 pass
         indices = self._spread_indices()
-        if not indices:
-            self.status_var.set("铺屏失败：请先勾选至少一块目标屏")
-            return
-        mode = ("quad" if self.spread_mode_var.get() == SPREAD_MODE_QUAD
-                else "max")
+        if not indices and self.monitors:
+            indices = [i for i, m in enumerate(self.monitors) if m.width >= m.height] or [0]
+        total = len(indices)
+        mode_val = self.spread_mode_var.get()
+        if mode_val == SPREAD_MODE_FOUR_QUAD:
+            mode = "four_quad"
+        elif mode_val == SPREAD_MODE_QUAD:
+            mode = "quad"
+        else:
+            mode = "max"
         try:
-            done = b.fill_all_monitors(mode=mode, monitor_indices=indices)
+            done = b.fill_all_monitors(mode=mode, monitor_indices=indices, filter_portrait=True)
         except Exception as e:  # noqa: BLE001
             self.status_var.set(f"逐屏铺满失败：{e}")
             return
-        if not done:
-            self.status_var.set("铺屏失败：没有可操作的窗口")
-            return
-        total = len(indices)
-        if done < total:
-            self.status_var.set(
-                f"已铺 {done} 屏：窗口不足 {total} 个，勾选的屏还剩 %d 块未动"
-                % (total - done))
+        finally:
+            try:
+                self.root.attributes("-topmost", bool(self.topmost.get()))
+            except Exception:  # noqa: BLE001
+                pass
+        if mode == "four_quad":
+            if done:
+                self.status_var.set(f"一屏4窗完成：已排布 {done} 个窗口（已避让不适合竖屏的宽窗）")
+            else:
+                self.status_var.set("未排布窗口：可用窗口不足或屏幕设置限制")
         else:
-            self.status_var.set(f"已铺满勾选的 {done} 块屏")
+            if done < total:
+                self.status_var.set(
+                    f"已铺 {done} 屏：窗口不足或部分竖屏已避让，勾选的屏还剩 %d 块未动"
+                    % (total - done))
+            else:
+                self.status_var.set(f"已铺满勾选的 {done} 块屏（已避让不适合竖屏的宽窗）")
+
+    def _fill_quad_monitors(self):
+        """一屏4窗快捷操作：将4个窗口按 2×2 四宫格排满所选屏幕（支持单屏或多屏）。"""
+        if self.topmost.get():
+            try:
+                self.root.attributes("-topmost", False)
+            except Exception:  # noqa: BLE001
+                pass
+        indices = self._spread_indices()
+        if not indices and self.monitors:
+            indices = [i for i, m in enumerate(self.monitors) if m.width >= m.height] or [0]
+        try:
+            done = b.fill_all_monitors(mode="four_quad", monitor_indices=indices, filter_portrait=True)
+        except Exception as e:  # noqa: BLE001
+            self.status_var.set(f"一屏4窗排布失败：{e}")
+            return
+        finally:
+            try:
+                self.root.attributes("-topmost", bool(self.topmost.get()))
+            except Exception:  # noqa: BLE001
+                pass
+        if done:
+            self.status_var.set(f"一屏4窗完成：已排布 {done} 个窗口（2×2 四宫格，自动避让竖屏）")
+        else:
+            self.status_var.set("未排布窗口：可用窗口不足或屏幕设置限制")
+
+    def _open_spread_manual_dialog(self):
+        """弹出手动选择窗口对话框，为各屏精确指定窗口并实时提示竖屏适应性。"""
+        if getattr(self, "_spread_manual_dlg", None):
+            try:
+                if self._spread_manual_dlg.winfo_exists():
+                    self._spread_manual_dlg.lift()
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+
+        dlg = tk.Toplevel(self.root)
+        self._spread_manual_dlg = dlg
+        dlg.title("跨屏铺满 — 手动分配窗口")
+        dlg.minsize(620, 420)
+        try:
+            dlg.transient(self.root)
+        except Exception:  # noqa: BLE001
+            pass
+
+        top_bar = ttk.Frame(dlg)
+        top_bar.pack(fill="x", padx=10, pady=(10, 6))
+        ttk.Label(top_bar, text="铺满模式:").pack(side="left")
+        mode_var = tk.StringVar(value="整屏铺满")
+        mode_cb = ttk.Combobox(top_bar, textvariable=mode_var, state="readonly",
+                               width=14, values=["整屏铺满", "一屏4窗(2×2)"])
+        mode_cb.pack(side="left", padx=(4, 12))
+
+        filter_port_var = tk.BooleanVar(value=True)
+        port_chk = ttk.Checkbutton(top_bar, text="智能避让竖屏（不将横屏宽窗发到竖屏）",
+                                   variable=filter_port_var)
+        port_chk.pack(side="left")
+
+        content_box = ttk.Frame(dlg)
+        content_box.pack(fill="both", expand=True, padx=10, pady=4)
+
+        bot_bar = ttk.Frame(dlg)
+        bot_bar.pack(fill="x", padx=10, pady=(6, 10))
+
+        state_holder = {}
+
+        def render_rows():
+            for child in content_box.winfo_children():
+                try:
+                    child.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            try:
+                wins = b.list_target_windows()
+            except Exception:  # noqa: BLE001
+                wins = []
+
+            win_choices = ["自动（智能匹配）", "不分配此屏"]
+            win_map = {}
+            for i, w in enumerate(wins):
+                hwnd = w.get("hwnd")
+                owner = w.get("owner", "")
+                name = w.get("name", "")
+                cw = w.get("w", 0)
+                ch = w.get("h", 0)
+                aspect = cw / max(ch, 1) if ch > 0 else 1.0
+                tag = "适竖" if aspect < 1.15 else "横宽"
+                label = f"#{i + 1} {owner}: {name} ({cw}×{ch} · {tag})"
+                win_choices.append(label)
+                win_map[label] = hwnd
+
+            is_four_quad = (mode_var.get() == "一屏4窗(2×2)")
+            mon_vars = {}
+
+            checked_indices = self._spread_indices()
+            target_mons = []
+            for i, m in enumerate(self.monitors):
+                if not checked_indices or i in checked_indices:
+                    target_mons.append((i, m))
+
+            if not target_mons:
+                ttk.Label(content_box, text="暂无勾选的显示器，请在主面板勾选屏幕。").pack(pady=20)
+                return mon_vars, win_map
+
+            for mon_idx, mon in target_mons:
+                wh = getattr(mon, "work_height", mon.height)
+                ww = getattr(mon, "work_width", mon.width)
+                portrait = (mon.height > mon.width) or (wh > ww)
+                lf_title = (f"显示器 {mon_idx + 1}：{self._monitor_display_name(mon)} "
+                            f"({mon.width}x{mon.height} · {竖屏 if portrait else 横屏})")
+                lf = ttk.LabelFrame(content_box, text=lf_title)
+                lf.pack(fill="x", pady=4, padx=2)
+
+                if is_four_quad:
+                    quad_grid = ttk.Frame(lf)
+                    quad_grid.pack(fill="x", padx=4, pady=4)
+                    row_vars = []
+                    for pos1, pos2 in (("左上", "右上"), ("左下", "右下")):
+                        r_f = ttk.Frame(quad_grid)
+                        r_f.pack(fill="x", pady=2)
+                        for pos in (pos1, pos2):
+                            ttk.Label(r_f, text=f"{pos}:").pack(side="left", padx=(4, 2))
+                            v = tk.StringVar(value="自动（智能匹配）")
+                            cb = ttk.Combobox(r_f, textvariable=v, state="readonly",
+                                              width=22, values=win_choices)
+                            cb.pack(side="left", padx=(0, 8))
+                            row_vars.append(v)
+                    if portrait:
+                        ttk.Label(lf, text="⚠️ 提示：竖屏 2×2 四等分较窄，请优先选择纵向窗口",
+                                  foreground="#9a5a00").pack(anchor="w", padx=6, pady=(0, 2))
+                    mon_vars[mon_idx] = row_vars
+                else:
+                    r_f = ttk.Frame(lf)
+                    r_f.pack(fill="x", padx=4, pady=4)
+                    ttk.Label(r_f, text="窗口:").pack(side="left", padx=(4, 2))
+                    v = tk.StringVar(value="自动（智能匹配）")
+                    cb = ttk.Combobox(r_f, textvariable=v, state="readonly",
+                                      width=36, values=win_choices)
+                    cb.pack(side="left", padx=4)
+                    mon_vars[mon_idx] = v
+                    if portrait:
+                        ttk.Label(r_f, text="⚠️ 竖屏：宽窗会被压扁，建议留「自动」或选 [适竖] 窗口",
+                                  foreground="#9a5a00").pack(side="left", padx=4)
+
+            return mon_vars, win_map
+
+        def refresh():
+            mon_vars, win_map = render_rows()
+            state_holder["mon_vars"] = mon_vars
+            state_holder["win_map"] = win_map
+
+        mode_cb.bind("<<ComboboxSelected>>", lambda e: refresh())
+        refresh()
+
+        def apply_manual():
+            mon_vars = state_holder.get("mon_vars", {})
+            win_map = state_holder.get("win_map", {})
+            is_four = (mode_var.get() == "一屏4窗(2×2)")
+            mode = "four_quad" if is_four else "max"
+            assignments = {}
+            for m_idx, v_or_list in mon_vars.items():
+                if is_four:
+                    hwnds_for_m = []
+                    for v in v_or_list:
+                        raw = v.get()
+                        if raw == "不分配此屏":
+                            hwnds_for_m.append("none")
+                        elif raw.startswith("自动"):
+                            hwnds_for_m.append("auto")
+                        else:
+                            hwnds_for_m.append(win_map.get(raw, raw))
+                    assignments[m_idx] = hwnds_for_m
+                else:
+                    raw = v_or_list.get()
+                    if raw == "不分配此屏":
+                        assignments[m_idx] = "none"
+                    elif raw.startswith("自动"):
+                        assignments[m_idx] = "auto"
+                    else:
+                        assignments[m_idx] = win_map.get(raw, raw)
+
+            if self.topmost.get():
+                try:
+                    self.root.attributes("-topmost", False)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                done = b.fill_all_monitors(
+                    mode=mode,
+                    assignments=assignments,
+                    filter_portrait=bool(filter_port_var.get()))
+            except Exception as e:  # noqa: BLE001
+                self.status_var.set(f"手动分配排布失败: {e}")
+                return
+            finally:
+                try:
+                    self.root.attributes("-topmost", bool(self.topmost.get()))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if done:
+                self.status_var.set(f"手动跨屏铺满完成：已排布 {done} 个窗口")
+            else:
+                self.status_var.set("未排布窗口：未选择有效窗口或被筛选避让")
+            try:
+                dlg.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
+        ttk.Button(bot_bar, text="应用铺满", command=apply_manual).pack(side="left", padx=4)
+        ttk.Button(bot_bar, text="刷新窗口", command=refresh).pack(side="left", padx=4)
+        ttk.Button(bot_bar, text="关闭", command=dlg.destroy).pack(side="right", padx=4)
 
 
     def _toggle_topmost_action(self):
@@ -2564,9 +2803,13 @@ class App:
                 self._taskbar.destroy()
                 self._taskbar = None
             self.status_var.set("多屏任务栏已停用")
-            return
-        self._ensure_taskbar()
-        self.status_var.set("多屏任务栏已启用（列出窗口需辅助功能授权）")
+        else:
+            self._ensure_taskbar()
+            self.status_var.set("多屏任务栏已启用（列出窗口需辅助功能授权）")
+        try:
+            self.refresh_monitors()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _ensure_taskbar(self):
         """确保任务栏实例存在并可见。"""
@@ -4019,6 +4262,8 @@ class App:
             self._drag_watcher = None
         if self._snap_preview is not None:
             self._snap_preview.hide()
+        self._drag_down_pos = None
+        self._drag_target_hwnd = None
 
     def _snap_overlay(self):
         if self._snap_preview is None:
@@ -4052,6 +4297,29 @@ class App:
                 return None
         return None
 
+    def _find_window_at(self, x, y, windows=None):
+        """寻找包含指定坐标 (x, y) 的最前非本程序合理尺寸窗口。
+
+        按 z 序从前到后匹配；忽略本程序自身窗口与过小的浮层/通知（w<160 或 h<120）。
+        """
+        if windows is None:
+            try:
+                windows = b.list_target_windows()
+            except Exception:  # noqa: BLE001
+                windows = []
+        for w in windows:
+            if self._is_own_window(w.get("owner")):
+                continue
+            ww = w.get("w", 0) or 0
+            wh = w.get("h", 0) or 0
+            if ww < 160 or wh < 120:
+                continue
+            wx = w.get("x", 0) or 0
+            wy = w.get("y", 0) or 0
+            if wx <= x <= wx + ww and wy <= y <= wy + wh:
+                return w
+        return None
+
     def _on_mouse_event(self, stage, x, y):
         """拖拽监听回调：**运行在 CGEventTap 原生回调上下文中**。
 
@@ -4061,6 +4329,9 @@ class App:
            会触发原生崩溃（Segmentation fault，Python 的 try/except 抓不到）。
         """
         try:
+            if stage == "down":
+                self._drag_down_pos = (int(x), int(y))
+                self._drag_target_hwnd = None
             self._drag_pending = (stage, int(x), int(y))
             if self._drag_job is None:
                 self._drag_job = self.root.after_idle(self._process_drag_event)
@@ -4079,8 +4350,16 @@ class App:
                 self._drag_zone = None
                 if self._snap_preview is not None:
                     self._snap_preview.hide()
+                target = self._find_window_at(x, y)
+                if target:
+                    self._drag_target_hwnd = target.get("hwnd")
                 return
             if stage == "drag":
+                if not self._drag_target_hwnd:
+                    check_pos = self._drag_down_pos or (x, y)
+                    target = self._find_window_at(check_pos[0], check_pos[1])
+                    if target:
+                        self._drag_target_hwnd = target.get("hwnd")
                 now = time.monotonic()
                 if now - self._last_zone_ts < 0.05:  # 节流到约 20fps
                     # 未到节流窗口：稍后重调度，避免吞掉最后一次移动
@@ -4106,13 +4385,33 @@ class App:
                 if self._snap_preview is not None:
                     self._snap_preview.hide()
                 if not zone:
+                    self._drag_down_pos = None
+                    self._drag_target_hwnd = None
                     return
-                # 枚举窗口可能较慢/起子进程：只能在主循环里做，不能在 tap 回调里做
-                wins = [w for w in b.list_target_windows()
-                        if not self._is_own_window(w.get("owner"))]
-                if not wins:
+
+                # 定位真正被拖拽的窗口：优先拖拽起点/过程中捕获的窗口，
+                # 其次降级到释放坐标下的窗口，再次前台合理外部窗口，最后才取列表首项。
+                target_hwnd = self._drag_target_hwnd
+                if not target_hwnd:
+                    target = self._find_window_at(x, y)
+                    if target:
+                        target_hwnd = target.get("hwnd")
+                if not target_hwnd:
+                    fw = b.front_external_window()
+                    if fw:
+                        target_hwnd = b.make_hwnd(fw.get("owner"), fw.get("name") or "")
+                if not target_hwnd:
+                    wins = [w for w in b.list_target_windows()
+                            if not self._is_own_window(w.get("owner"))]
+                    if wins:
+                        target_hwnd = wins[0]["hwnd"]
+
+                self._drag_down_pos = None
+                self._drag_target_hwnd = None
+
+                if not target_hwnd:
                     return
-                b.set_window_rect(wins[0]["hwnd"], zone[0], zone[1], zone[2], zone[3],
+                b.set_window_rect(target_hwnd, zone[0], zone[1], zone[2], zone[3],
                                   activate=False)
                 self.status_var.set("已吸附窗口到预览区域（可用「撤销」还原）")
         except Exception:  # noqa: BLE001
@@ -5057,7 +5356,7 @@ class App:
 
     def _hk_help_text(self, label):
         sym = self._mod_symbol.get(label, label)
-        return (f"{sym}+←/→ : 活动窗口移到上一/下一屏\n"
+        return (f"{sym}+←/→ : 活动窗口移到上一/下一屏 · {sym}+↓ : 拉到当前鼠标屏幕\n"
                 f"{sym}+1/2/3/4 : 左/右/上/下半屏\n"
                 f"{sym}+5/6 : 最大化 / 居中\n"
                 f"{sym}+Z : 撤销上一次移动 · {sym}+B : 回到上次摆放位\n"
@@ -5102,6 +5401,8 @@ class App:
                          lambda: b.move_active_to_next_monitor(1, use_pinned=False))
         self.hk.register(mods, VK_LEFT,
                          lambda: b.move_active_to_next_monitor(-1, use_pinned=False))
+        self.hk.register(mods, VK_DOWN,
+                         lambda: b.pull_window_to_cursor_monitor(use_pinned=False))
         self.hk.register(mods, dk[1],
                          lambda: b.snap_active("left", use_pinned=False))
         self.hk.register(mods, dk[2],

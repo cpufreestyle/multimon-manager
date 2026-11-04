@@ -5,6 +5,16 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass
 
+try:
+    import settings as _settings
+except Exception:  # noqa: BLE001
+    _settings = None
+
+try:
+    import taskbar as _taskbar
+except Exception:  # noqa: BLE001
+    _taskbar = None
+
 user32 = ctypes.windll.user32
 try:
     shcore = ctypes.windll.shcore
@@ -150,9 +160,65 @@ def enum_monitors(force=False):
 
     proc = MonitorEnumProc(callback)
     user32.EnumDisplayMonitors(None, None, proc, None)
+    _apply_taskbar_avoidance(monitors)
     _cache["data"] = list(monitors)
     _cache["ts"] = time.time()
     return copy.deepcopy(_cache["data"])
+
+
+TASKBAR_SAFETY_PT = 4
+
+def _apply_taskbar_avoidance(monitors, enabled=None, position=None,
+                             safety=TASKBAR_SAFETY_PT):
+    """若开启多屏任务栏，从工作区中扣除任务栏占用的垂直空间。"""
+    if not monitors:
+        return
+    if enabled is None or position is None:
+        try:
+            s = _settings.load() if _settings is not None else {}
+            if enabled is None:
+                enabled = bool(s.get("taskbar_enabled", False))
+            if position is None:
+                position = s.get("taskbar_position", "底部")
+        except Exception:  # noqa: BLE001
+            return
+
+    if not enabled:
+        return
+
+    pos = "top" if str(position).lower() in ("top", "顶部") else "bottom"
+
+    for m in monitors:
+        try:
+            if _taskbar is not None:
+                _, ty, _, th = _taskbar.bar_geometry(m, pos)
+            else:
+                if pos == "top":
+                    ty = int(m.top + 8 + 24)
+                else:
+                    ty = int(m.top + m.height - 30 - 8)
+                th = 30
+        except Exception:  # noqa: BLE001
+            if pos == "top":
+                ty = int(m.top + 8 + 24)
+            else:
+                ty = int(m.top + m.height - 30 - 8)
+            th = 30
+
+        wl, wt = int(m.work_left), int(m.work_top)
+        wb = wt + int(m.work_height)
+
+        if pos == "bottom":
+            limit_bottom = int(ty) - safety
+            if wb > limit_bottom:
+                new_bottom = max(wt + 100, limit_bottom)
+                m.work_height = new_bottom - wt
+        else:  # top
+            limit_top = int(ty + th) + safety
+            if wt < limit_top:
+                diff = limit_top - wt
+                m.work_top = limit_top
+                m.work_height = max(100, int(m.work_height) - diff)
 
 
 def get_virtual_screen():
@@ -169,6 +235,24 @@ def get_primary_monitor():
         if m.is_primary:
             return m
     return None
+
+
+def get_cursor_monitor():
+    """获取当前鼠标光标所在的显示器（Windows）。"""
+    ms = enum_monitors()
+    if not ms:
+        return None
+    try:
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+        pt = POINT()
+        if user32.GetCursorPos(ctypes.byref(pt)):
+            for m in ms:
+                if m.left <= pt.x < m.left + m.width and m.top <= pt.y < m.top + m.height:
+                    return m
+    except Exception:
+        pass
+    return get_primary_monitor() or ms[0]
 
 
 def stage_manager_enabled():

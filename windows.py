@@ -599,6 +599,62 @@ def move_active_to_next_monitor(direction=1, use_pinned=True, activate=True):
         get_foreground_window(use_pinned), direction, activate=activate)
 
 
+def raise_window(hwnd):
+    """单窗口精准置顶（Windows）。"""
+    if not hwnd:
+        return False
+    try:
+        user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
+        return True
+    except Exception:
+        return False
+
+
+def pull_window_to_cursor_monitor(hwnd=None, use_pinned=True, activate=True):
+    """将窗口拉取到当前鼠标所在的显示器（Windows）。"""
+    target_mon = getattr(monitors, "get_cursor_monitor", lambda: None)()
+    if not target_mon:
+        ms = monitors.enum_monitors()
+        target_mon = ms[0] if ms else None
+    if not target_mon:
+        return False
+
+    if not hwnd:
+        all_wins = list_windows_front_to_back()
+        candidate = None
+        for w in all_wins:
+            cx = w["x"] + w["w"] / 2
+            cy = w["y"] + w["h"] / 2
+            in_target = (target_mon.left <= cx < target_mon.left + target_mon.width and
+                         target_mon.top <= cy < target_mon.top + target_mon.height)
+            if not in_target:
+                candidate = w["hwnd"]
+                break
+        if not candidate:
+            candidate = get_foreground_window(use_pinned=use_pinned)
+        hwnd = candidate
+
+    if not hwnd:
+        return False
+
+    old_rect = get_window_rect(hwnd)
+    if not old_rect or old_rect == (0, 0, 0, 0):
+        return False
+
+    ox, oy, ow, oh = old_rect
+    wl, wt, ww, wh = target_mon.work_rect
+    nw = min(ow, ww)
+    nh = min(oh, wh)
+    nx = wl + max(0, (ww - nw) // 2)
+    ny = wt + max(0, (wh - nh) // 2)
+
+    set_window_rect(hwnd, nx, ny, nw, nh, activate=activate)
+    if activate:
+        raise_window(hwnd)
+    return True
+
+
 def snap_active(zone, use_pinned=True, activate=True):
     """把活动/目标窗口吸附到所在显示器的某个区域（与 windows_mac 签名一致）。"""
     return snap_window(get_foreground_window(use_pinned), zone, activate=activate)
@@ -1217,66 +1273,263 @@ def _is_portrait(mon):
 _last_quad_splits = (0.5, 0.5)
 
 
+def is_window_portrait_suitable(hwnd_or_win, mon=None):
+    """判断窗口是否适合放在竖屏（height > width）上。"""
+    if not hwnd_or_win:
+        return True
+    w, h = 0, 0
+    if isinstance(hwnd_or_win, dict):
+        w = hwnd_or_win.get("w", 0)
+        h = hwnd_or_win.get("h", 0)
+    elif isinstance(hwnd_or_win, (tuple, list)) and len(hwnd_or_win) >= 4:
+        w, h = hwnd_or_win[2], hwnd_or_win[3]
+    else:
+        fw = _find_window(hwnd_or_win)
+        if fw:
+            w, h = fw.get("w", 0), fw.get("h", 0)
+        else:
+            rect = get_window_rect(hwnd_or_win)
+            if rect:
+                w, h = rect[2], rect[3]
+    if w <= 0 or h <= 0:
+        return True
+    if w / float(h) >= 1.15:
+        return False
+    if mon is not None:
+        ww = getattr(mon, "work_width", getattr(mon, "width", 0))
+        if ww > 0 and w > ww:
+            return False
+    return True
+
+
 def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",
-                      monitor_indices=None):
-    """把若干窗口分别铺满各自的显示器，一个窗口一块屏（整数 HWND）。
-
-   典型场景是四屏环境：四个窗口各占一块屏。已有能力都是「单屏内」排布，
-   缺的是跨屏——要逐屏铺满得先跨屏移动再最大化，点好几次。
-
-    hwnds 为 None 时取最前面的 len(ms) 个窗口（首个优先用界面固定目标）。
-    窗口少于屏幕数时按窗口数铺，多于屏幕数时忽略多余窗口。
-
-    mode: "max" 铺满整块屏工作区；"quad" 每块屏左上角四分之一。
-
-    monitor_indices: 只铺这些下标的屏（按给定顺序）。None 时铺全部屏。
-    竖屏常不适合放全屏窗口（竖屏上的横屏应用会被压成一条），界面默认只勾横屏。
-    """
+                      monitor_indices=None, filter_portrait=True,
+                      assignments=None):
+    """把若干窗口分别铺满各自的显示器，一个窗口一块屏（或每屏 2×2 四宫格）（Windows）。"""
     ms = monitors.enum_monitors()
     if not ms:
+        logger.warning("未检测到显示器")
         return 0
+
+    if assignments is not None:
+        done = 0
+        all_monitors = list(ms)
+        if hwnds is None:
+            try:
+                ws = list_target_windows(use_pinned=use_pinned)
+            except TypeError:
+                ws = list_target_windows()
+            auto_pool = [w["hwnd"] for w in ws] if ws else []
+        else:
+            auto_pool = list(hwnds)
+
+        explicit_hwnds = set()
+        for t in assignments.values():
+            if isinstance(t, (list, tuple)):
+                for item in t:
+                    if item and item not in ("auto", "none", "", None):
+                        explicit_hwnds.add(item)
+            elif t and t not in ("auto", "none", "", None):
+                explicit_hwnds.add(t)
+        auto_pool = [h for h in auto_pool if h not in explicit_hwnds]
+
+        for m_idx, target in assignments.items():
+            try:
+                m_idx = int(m_idx)
+            except (ValueError, TypeError):
+                continue
+            if not (0 <= m_idx < len(all_monitors)):
+                continue
+            mon = all_monitors[m_idx]
+            wl = getattr(mon, "work_left", mon.left)
+            wt = getattr(mon, "work_top", mon.top)
+            ww = getattr(mon, "work_width", mon.width)
+            wh = getattr(mon, "work_height", mon.height)
+            is_portrait = (mon.height > mon.width) or (wh > ww)
+
+            if mode in ("four_quad", "4quad", "quad4", "2x2", "2×2"):
+                target_list = list(target) if isinstance(target, (list, tuple)) else [target]
+                resolved_list = []
+                for item in target_list[:4]:
+                    if item == "auto":
+                        cand = None
+                        for c in auto_pool:
+                            if not (filter_portrait and is_portrait and not is_window_portrait_suitable(c, mon)):
+                                cand = c
+                                break
+                        if cand:
+                            auto_pool.remove(cand)
+                            resolved_list.append(cand)
+                    elif item and item != "none":
+                        resolved_list.append(item)
+
+                w_left = ww // 2
+                w_right = ww - w_left
+                h_top = wh // 2
+                h_bottom = wh - h_top
+                slots = [
+                    (wl, wt, w_left, h_top),
+                    (wl + w_left, wt, w_right, h_top),
+                    (wl, wt + h_top, w_left, h_bottom),
+                    (wl + w_left, wt + h_top, w_right, h_bottom),
+                ]
+                for h, (sx, sy, sw, sh) in zip(resolved_list[:4], slots):
+                    if filter_portrait and is_portrait and not is_window_portrait_suitable(h, mon):
+                        logger.info("跨屏铺满(手动)：跳过不适合竖屏的窗口 %s", h)
+                        continue
+                    try:
+                        _place_window(h, sx, sy, sw, sh)
+                        done += 1
+                    except Exception:
+                        logger.warning("手动四宫格铺满失败: hwnd=%s", h, exc_info=True)
+            else:
+                h = target[0] if isinstance(target, (list, tuple)) and target else target
+                if h == "auto":
+                    cand = None
+                    for c in auto_pool:
+                        if not (filter_portrait and is_portrait and not is_window_portrait_suitable(c, mon)):
+                            cand = c
+                            break
+                    h = cand
+                    if h:
+                        auto_pool.remove(h)
+                if not h or h == "none":
+                    continue
+                if filter_portrait and is_portrait and not is_window_portrait_suitable(h, mon):
+                    logger.info("跨屏铺满(手动)：跳过不适合竖屏的窗口 %s", h)
+                    continue
+                try:
+                    if mode == "quad":
+                        _place_window(h, wl, wt, ww // 2, wh // 2)
+                    else:
+                        _place_window(h, wl, wt, ww, wh)
+                    done += 1
+                except Exception:
+                    logger.warning("手动跨屏铺满失败: hwnd=%s 屏=%s", h, mon.device_name,
+                                   exc_info=True)
+        return done
 
     if monitor_indices is not None:
         keep = []
         for i in monitor_indices:
-            if isinstance(i, int) and 0 <= i < len(ms) and i not in keep:
-                keep.append(i)
+            try:
+                idx = int(i)
+                if 0 <= idx < len(ms) and idx not in keep:
+                    keep.append(idx)
+            except (ValueError, TypeError):
+                continue
         ms = [ms[i] for i in keep]
         if not ms:
             logger.warning("没有可铺的目标屏")
             return 0
 
     if hwnds is None:
-        cands = list_windows_front_to_back()
-        picked, seen = [], set()
-        first = _find_window(_pinned_target) if use_pinned and _pinned_target else None
-        if first is not None:
-            picked.append(first["hwnd"])
-            seen.add(first["hwnd"])
-        for w in cands:
-            if len(picked) >= len(ms):
-                break
+        wins = list_target_windows(use_pinned=use_pinned)
+        picked = []
+        seen = set()
+        for w in wins:
             if w["hwnd"] in seen:
                 continue
             picked.append(w["hwnd"])
             seen.add(w["hwnd"])
         hwnds = picked
+    else:
+        hwnds = list(hwnds)
 
     if not hwnds:
         logger.warning("没有可用于跨屏铺满的窗口")
         return 0
 
     done = 0
-    for hwnd, mon in zip(list(hwnds), ms):
-        if not hwnd:
-            continue
+    rem_hwnds = list(hwnds)
+
+    if mode in ("four_quad", "4quad", "quad4", "2x2", "2×2"):
+        for mon in ms:
+            wl = getattr(mon, "work_left", mon.left)
+            wt = getattr(mon, "work_top", mon.top)
+            ww = getattr(mon, "work_width", mon.width)
+            wh = getattr(mon, "work_height", mon.height)
+            is_portrait = (mon.height > mon.width) or (wh > ww)
+
+            if is_portrait and filter_portrait:
+                suitable = [h for h in rem_hwnds if is_window_portrait_suitable(h, mon)]
+                if len(suitable) < 2:
+                    logger.info("跨屏铺满(四宫格)：跳过竖屏 %s，缺少适合竖屏的窗口", mon.device_name)
+                    continue
+                picked_for_mon = suitable[:4]
+            else:
+                picked_for_mon = rem_hwnds[:4]
+
+            if not picked_for_mon:
+                continue
+
+            for h in picked_for_mon:
+                if h in rem_hwnds:
+                    rem_hwnds.remove(h)
+
+            w_left = ww // 2
+            w_right = ww - w_left
+            h_top = wh // 2
+            h_bottom = wh - h_top
+            slots = [
+                (wl, wt, w_left, h_top),
+                (wl + w_left, wt, w_right, h_top),
+                (wl, wt + h_top, w_left, h_bottom),
+                (wl + w_left, wt + h_top, w_right, h_bottom),
+            ]
+            for h, (sx, sy, sw, sh) in zip(picked_for_mon, slots):
+                try:
+                    _place_window(h, sx, sy, sw, sh)
+                    done += 1
+                except Exception:
+                    logger.warning("跨屏铺满(四宫格)失败: hwnd=%s 屏=%s", h, mon.device_name,
+                                   exc_info=True)
+        logger.info("跨屏铺满(四宫格)完成(Windows): %d 个窗口 -> %d 块屏", done, len(ms))
+        return done
+
+    matched_pairs = []
+    if filter_portrait:
+        has_portrait_later = any((m.height > m.width) or (getattr(m, "work_height", m.height) > getattr(m, "work_width", m.width)) for m in ms)
+        for mon in ms:
+            if not rem_hwnds:
+                break
+            is_portrait = (mon.height > mon.width) or (getattr(mon, "work_height", mon.height) > getattr(mon, "work_width", mon.width))
+            if is_portrait:
+                target_h = None
+                for candidate in rem_hwnds:
+                    if is_window_portrait_suitable(candidate, mon):
+                        target_h = candidate
+                        break
+                if target_h:
+                    rem_hwnds.remove(target_h)
+                    matched_pairs.append((target_h, mon))
+                else:
+                    logger.info("跨屏铺满：跳过竖屏 %s，无适合竖屏的纵向窗口", mon.device_name)
+            else:
+                chosen = None
+                if has_portrait_later:
+                    for candidate in rem_hwnds:
+                        if not is_window_portrait_suitable(candidate, None):
+                            chosen = candidate
+                            break
+                if not chosen:
+                    chosen = rem_hwnds[0]
+                rem_hwnds.remove(chosen)
+                matched_pairs.append((chosen, mon))
+    else:
+        for hwnd, mon in zip(rem_hwnds, ms):
+            matched_pairs.append((hwnd, mon))
+
+    for hwnd, mon in matched_pairs:
+        wl = getattr(mon, "work_left", mon.left)
+        wt = getattr(mon, "work_top", mon.top)
+        ww = getattr(mon, "work_width", mon.width)
+        wh = getattr(mon, "work_height", mon.height)
         try:
             if mode == "quad":
-                wl, wt, ww, wh = mon.work_rect
                 _place_window(hwnd, wl, wt, ww // 2, wh // 2)
             else:
-                _place_window(hwnd, mon.work_left, mon.work_top,
-                              mon.work_width, mon.work_height)
+                _place_window(hwnd, wl, wt, ww, wh)
             done += 1
         except Exception:  # noqa: BLE001
             logger.warning("跨屏铺满失败: hwnd=%s 屏=%s", hwnd, mon.device_name,

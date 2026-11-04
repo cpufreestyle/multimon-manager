@@ -8,7 +8,10 @@
 bar_geometry / short_title），可在不创建 Tk 窗口的情况下单测。
 """
 import logging
-import tkinter as tk
+try:
+    import tkinter as tk
+except Exception:  # noqa: BLE001
+    tk = None
 
 logger = logging.getLogger(__name__)
 

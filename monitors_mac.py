@@ -18,6 +18,16 @@ try:
 except Exception:  # noqa: BLE001  Dock 只影响工作区，模块异常不该拖垮显示器枚举
     _dock = None
 
+try:
+    import settings as _settings
+except Exception:  # noqa: BLE001
+    _settings = None
+
+try:
+    import taskbar as _taskbar
+except Exception:  # noqa: BLE001
+    _taskbar = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,10 +70,32 @@ def _load_cg():
         cg.CGDisplayIsBuiltin.restype = ctypes.c_int32
     except AttributeError:
         pass
+    try:
+        cg.CGEventCreate.argtypes = [ctypes.c_void_p]
+        cg.CGEventCreate.restype = ctypes.c_void_p
+        cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+        cg.CGEventGetLocation.restype = CGPoint
+    except AttributeError:
+        pass
     return cg
 
 
 _cg = _load_cg()
+
+
+def _load_cf():
+    path = ctypes.util.find_library("CoreFoundation")
+    if not path:
+        return None
+    try:
+        cf = ctypes.CDLL(path)
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        return cf
+    except Exception:
+        return None
+
+
+_cf = _load_cf()
 
 
 # ── 显示器名称解析 ────────────────────────────────────────────────────
@@ -355,6 +387,7 @@ def _compute_work_areas(monitors):
             m.work_height = max(m.height - _MENU_BAR_PT, 0)
 
     _apply_dock_avoidance(monitors)
+    _apply_taskbar_avoidance(monitors)
 
 
 # Dock 面板与窗口之间额外留的像素。可见Frame 本身已经比面板顶边低 4pt，
@@ -487,6 +520,68 @@ def _apply_dock_avoidance(monitors, autohide=None, panel=None):
     if owner is not None and _trim_work_for_dock(owner, panel):
         logger.debug("工作区避开 Dock 面板 %s（%s）",
                      panel, owner.device_name)
+
+
+TASKBAR_SAFETY_PT = 4
+
+def _apply_taskbar_avoidance(monitors, enabled=None, position=None,
+                             safety=TASKBAR_SAFETY_PT):
+    """若开启多屏任务栏，从工作区中扣除任务栏占用的垂直空间。
+
+    避免窗口最大化、四宫格或平铺时排到任务栏下方；贴顶时避免压住窗口标题栏。
+    enabled: bool 或 None（None 时从 settings.load() 读取）
+    position: "bottom" / "top" / "底部" / "顶部" 或 None（None 时从 settings.load() 读取）
+    safety: 任务栏与窗口之间的安全距离（像素）
+    """
+    if not monitors:
+        return
+    if enabled is None or position is None:
+        try:
+            s = _settings.load() if _settings is not None else {}
+            if enabled is None:
+                enabled = bool(s.get("taskbar_enabled", False))
+            if position is None:
+                position = s.get("taskbar_position", "底部")
+        except Exception as e:  # noqa: BLE001
+            logger.debug("读取任务栏设置失败，跳过避让: %s", e)
+            return
+
+    if not enabled:
+        return
+
+    pos = "top" if str(position).lower() in ("top", "顶部") else "bottom"
+
+    for m in monitors:
+        try:
+            if _taskbar is not None:
+                _, ty, _, th = _taskbar.bar_geometry(m, pos)
+            else:
+                if pos == "top":
+                    ty = int(m.top + 8 + 24)
+                else:
+                    ty = int(m.top + m.height - 30 - 8)
+                th = 30
+        except Exception:  # noqa: BLE001
+            if pos == "top":
+                ty = int(m.top + 8 + 24)
+            else:
+                ty = int(m.top + m.height - 30 - 8)
+            th = 30
+
+        wl, wt = int(m.work_left), int(m.work_top)
+        wb = wt + int(m.work_height)
+
+        if pos == "bottom":
+            limit_bottom = int(ty) - safety
+            if wb > limit_bottom:
+                new_bottom = max(wt + 100, limit_bottom)
+                m.work_height = new_bottom - wt
+        else:  # top
+            limit_top = int(ty + th) + safety
+            if wt < limit_top:
+                diff = limit_top - wt
+                m.work_top = limit_top
+                m.work_height = max(100, (wb - wt) - diff)
 
 
 # 显示器枚举带缓存：窗口工具会高频调用 enum_monitors()，而 system_profiler
@@ -691,6 +786,33 @@ def get_primary_monitor():
         if m.is_primary:
             return m
     return ms[0] if ms else None
+
+
+def get_cursor_monitor():
+    """获取当前鼠标光标所在的显示器（借鉴 TheRing PullDisplay 特性）。
+
+    通过 CoreGraphics CGEventGetLocation 读取鼠标全局坐标，
+    返回包含该光标坐标的 MonitorInfo；若无法确定则退回主显示器。
+    """
+    ms = enum_monitors()
+    if not ms:
+        return None
+    pt = None
+    if _cg:
+        try:
+            ev = _cg.CGEventCreate(None)
+            if ev:
+                pt = _cg.CGEventGetLocation(ctypes.c_void_p(ev))
+                if _cf:
+                    _cf.CFRelease(ctypes.c_void_p(ev))
+        except Exception:
+            pass
+    if pt is not None:
+        mx, my = float(pt.x), float(pt.y)
+        for m in ms:
+            if m.left <= mx < m.left + m.width and m.top <= my < m.top + m.height:
+                return m
+    return get_primary_monitor() or ms[0]
 
 
 if __name__ == "__main__":

@@ -65,6 +65,9 @@ apply_per_monitor = wallpaper.apply_per_monitor
 enum_monitors = monitors.enum_monitors
 stage_manager_enabled = monitors.stage_manager_enabled
 move_active_to_next_monitor = windows.move_active_to_next_monitor
+pull_window_to_cursor_monitor = getattr(windows, "pull_window_to_cursor_monitor", lambda *a, **k: False)
+get_cursor_monitor = getattr(monitors, "get_cursor_monitor", lambda: None)
+raise_window = getattr(windows, "raise_window", lambda *a, **k: False)
 snap_active = windows.snap_active
 list_target_windows = windows.list_target_windows
 set_target = windows.set_target
@@ -76,6 +79,7 @@ snap_three_stack = getattr(windows, "snap_three_stack", lambda *a, **k: False)
 snap_four_quad = getattr(windows, "snap_four_quad", lambda *a, **k: False)
 # 四宫格排列预演（点排列前的空白/放不下预告；只读，不动任何窗口）
 quad_predict = getattr(windows, "quad_predict", lambda *a, **k: ([], {}))
+is_window_portrait_suitable = getattr(windows, "is_window_portrait_suitable", lambda *a, **k: True)
 fill_all_monitors = getattr(windows, "fill_all_monitors", lambda *a, **k: 0)
 # 虚拟桌面网格：把勾选的多块屏当成一块大桌面，按 m×n 或加权比例网格批排
 fill_grid = getattr(windows, "fill_grid", lambda *a, **k: 0)
