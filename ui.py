@@ -148,6 +148,17 @@ class App:
         self.slideshow_enabled_var = tk.BooleanVar(value=False)
         self._build()
         self.refresh_monitors()
+        # 启动即填充窗口下拉。_refresh_targets 里才创建 self._target_map 与
+        # self._quad_short_map；漏掉这次调用会有两个连在一起的后果：
+        # ① 「目标窗口 / 并排 / 竖排 / 四格」各下拉的 values 全是空列表，
+        #    点开看不到任何程序可选；
+        # ② self._target_map 根本不存在，_on_target_selected / 并排左右 /
+        #    竖排上中下 一执行就 AttributeError，被 Tk 吞掉后表现为
+        #    「排列按钮点了没反应」。
+        # 这条调用在 696a511 里本来就有，9a7b118 重写 __init__ 时丢了。
+        # 注意不要再顺手加 self._apply_topmost()：那个方法早已改成「切换目标
+        # 窗口置顶」的按钮处理器，启动时调一次会真的去动别人的窗口。
+        self._refresh_targets()
         self._start_command_poll()
         self.root.after(1500, self._poll_rules)
         # 壁纸幻灯片：恢复上次的启用状态（若有图片则续跑调度）
