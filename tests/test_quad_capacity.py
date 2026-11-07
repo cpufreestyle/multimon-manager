@@ -87,8 +87,31 @@ class QuadCapacityTest(unittest.TestCase):
         cap = self._cap(list(REAL), [RV200, big], monitor="RV200 Pro")
         self.assertEqual(cap["screen"], "RV200 Pro")
         self.assertEqual(cap["fit"], 2)
+        # 但要把「换哪块能排满」报出来，否则用户得自己挨块屏试
+        self.assertEqual(cap["alt"], {"screen": "Big", "work": (2560, 1440)})
         cap2 = self._cap(list(REAL), [RV200, big], monitor=1)
         self.assertEqual((cap2["screen"], cap2["fit"]), ("Big", 4))
+        self.assertIsNone(cap2["alt"])
+
+    def test_alt_none_when_no_screen_fits_all(self):
+        wm._QUAD_MIN_CACHE.update(REAL)
+        cap = self._cap(list(REAL), [RV200, BUILTIN])
+        self.assertEqual(cap["fit"], 2)
+        self.assertIsNone(cap["alt"])
+
+    def test_alt_none_when_all_fit(self):
+        mins = {h: (400, 300) for h in ("a::", "b::", "c::", "d::")}
+        wm._QUAD_MIN_CACHE.update(mins)
+        cap = self._cap(list(mins), [BUILTIN, _Mon(0, 0, 2560, 1440, "Big")])
+        self.assertEqual(cap["fit"], 4)
+        self.assertIsNone(cap["alt"])
+
+    def test_alt_prefers_landscape(self):
+        wm._QUAD_MIN_CACHE.update(REAL)
+        big = _Mon(0, 0, 2560, 1440, "Big")
+        # 竖屏排前面也不先提它：与自动选屏「横屏优先」同口径
+        cap = self._cap(list(REAL), [DELL_V, RV200, big], monitor="RV200 Pro")
+        self.assertEqual(cap["alt"]["screen"], "Big")
 
     def test_auto_picks_landscape_over_portrait(self):
         wm._QUAD_MIN_CACHE.update(REAL)
@@ -134,19 +157,33 @@ class QuadCapacityTextTest(unittest.TestCase):
         t = ui.App._quad_capacity_text(
             {"fit": 4, "total": 4, "screen": "Big", "work": (2560, 1440),
              "need": (800, 600), "uncached": []})
-        self.assertEqual(t, "4/4 放得下（Big 2560×1440）")
+        self.assertEqual(t, "4/4 放得下（Big）")
 
     def test_partial_text(self):
         t = ui.App._quad_capacity_text(
             {"fit": 2, "total": 4, "screen": "RV200 Pro", "work": (1600, 870),
              "need": (1539, 1266), "uncached": []})
-        self.assertEqual(t, "最多排 2/4：全排需 1539×1266（RV200 Pro 1600×870）")
+        self.assertEqual(t, "最多排 2/4 · 需1539×1266（RV200 Pro）")
+
+    def test_alt_screen_hint_wins_over_need(self):
+        # 别的屏真能排满时，报「换哪块」比报「全排需多大」可操作
+        t = ui.App._quad_capacity_text(
+            {"fit": 2, "total": 4, "screen": "RV200 Pro", "work": (1600, 870),
+             "need": (1539, 1266), "uncached": [],
+             "alt": {"screen": "Big", "work": (2560, 1440)}})
+        self.assertEqual(t, "最多排 2/4 · 换Big可排满（RV200 Pro）")
+
+    def test_alt_screen_absent_falls_back_to_need(self):
+        t = ui.App._quad_capacity_text(
+            {"fit": 2, "total": 4, "screen": "RV200 Pro", "work": (1600, 870),
+             "need": (1539, 1266), "uncached": [], "alt": None})
+        self.assertEqual(t, "最多排 2/4 · 需1539×1266（RV200 Pro）")
 
     def test_partial_without_need_and_uncached(self):
         t = ui.App._quad_capacity_text(
             {"fit": 2, "total": 4, "screen": "RV200 Pro", "work": (1600, 870),
              "need": None, "uncached": ["GameHub::", "Shadowrocket::"]})
-        self.assertEqual(t, "最多排 2/4（RV200 Pro 1600×870），2 个未探测")
+        self.assertEqual(t, "最多排 2/4（RV200 Pro），2 个未探测")
 
     def test_uncached_never_claims_fit(self):
         # fit==total 但有未探测窗口时也不能说「放得下」：未探测按 0 计，
@@ -154,7 +191,7 @@ class QuadCapacityTextTest(unittest.TestCase):
         t = ui.App._quad_capacity_text(
             {"fit": 4, "total": 4, "screen": "RV200 Pro", "work": (1600, 870),
              "need": None, "uncached": ["GameHub::"]})
-        self.assertEqual(t, "最多排 4/4（RV200 Pro 1600×870），1 个未探测")
+        self.assertEqual(t, "最多排 4/4（RV200 Pro），1 个未探测")
 
 
 if __name__ == "__main__":

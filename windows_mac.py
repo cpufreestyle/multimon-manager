@@ -3928,10 +3928,25 @@ def quad_capacity(hwnds, monitor=None):
         for corner, h in enumerate(hwnds[:4]):
             corners[corner] = mins_all[h]
         need = quad_plan.quad_requirements(corners)
+    # 这块屏排不满时，找一块真能排满的屏报给用户。只报「全排需 1902×1360」
+    # 用户还得自己挨块屏试；直接说「换 Mi Monitor 可排满」才是可操作的。
+    # 横屏优先（与自动选屏同口径），横屏都不行才提竖屏——竖屏能不能排满由
+    # _fit 按最小尺寸实算，不是猜的，所以提出来不会把不合适的窗口送过去。
+    fit = _fit(best)
+    alt = None
+    if fit < len(hwnds):
+        others = [m for m in ms if m.device_name != best.device_name]
+        others.sort(key=lambda m: m.height > m.width)
+        for m in others:
+            if _fit(m) >= len(hwnds):
+                alt = {"screen": m.device_name,
+                       "work": (m.work_rect[2], m.work_rect[3])}
+                break
     return {"screen": best.device_name,
             "work": (best.work_rect[2], best.work_rect[3]),
-            "fit": _fit(best), "total": len(hwnds),
+            "fit": fit, "total": len(hwnds),
             "need": need,
+            "alt": alt,
             "uncached": [h.split("::")[0] for h in hwnds if h not in cached]}
 
 

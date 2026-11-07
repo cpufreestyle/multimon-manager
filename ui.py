@@ -1011,7 +1011,6 @@ class App:
         self.quad_cap_var = tk.StringVar(value="")
         cap_lb = ttk.Label(quad_row2, textvariable=self.quad_cap_var,
                            font=("Helvetica", 8), foreground="#777")
-        cap_lb.pack(side="left", padx=(2, 0))
         self._tooltip(cap_lb,
                       "这块屏上，当前选择最多能排几个窗口。放不下四个是 App 最小"
                       "窗口尺寸的硬上限，不是排布算错；没探测过最小尺寸的窗口按"
@@ -1057,14 +1056,12 @@ class App:
         self._refresh_quad_grid()
         self._tooltip(self.quad_grid_canvas,
                       "点格子 = 把最靠前的未占用窗口放进该方位，"
-                      "再点一次 = 清空该方位（与左侧下拉框联动）。")
-        _quad_hint = ttk.Label(
-            quad_row2,
-            text="点格=填/清空 · 拖分割线=改比例",
-            font=("Helvetica", 8))
-        _quad_hint.pack(side="left")
-        self._tooltip(_quad_hint, "拖两条分割线可改左右/上下比例，"
-                      "四等分不总是合适——比例随「2×2 排列」一起生效。")
+                      "再点一次 = 清空该方位（与左侧下拉框联动）。"
+                      "拖两条分割线可改左右/上下比例，四等分不总是合适"
+                      "——比例随「2×2 排列」一起生效。")
+        # 原先这里还有一条「点格=填/清空 · 拖分割线=改比例」的常驻说明标签，
+        # 占 159px。它纯说明、内容已并进上面的画布 tooltip，去掉后这一行把
+        # 宽度让给容量提示——否则「换哪块屏可排满」会被截断读不全。
         # 一键四窗：无视下拉当前选择，直接取最前面四个窗口排 2×2，与
         # ⌘⌥+Q、托盘同项同一动作（force_auto）。放第 2 行末尾而不是挤进
         # 第 1 行：第 1 行实测 720px、窗口可视宽约 765-793px，再加按钮
@@ -1078,6 +1075,11 @@ class App:
             "一键模式：无视下拉选择，直接取前面的四个窗口排 2×2"
             "（等价于快捷键和托盘里的同项）。下拉选了具体窗口时，"
             "「2×2 排列」仍按你的选择排。")
+        # 容量文字长度随选择/屏数变化，必须最后 pack 并吃掉剩余空间：pack 按
+        # 顺序分配宽度，先 pack 的固定控件（下拉、网格、按钮）一定拿到
+        # 自己的宽度，装不下时只截断这段文字。反过来先 pack 它，长出几十像素
+        # 就把行尾按钮顶出可视区——「按钮点了没效果」正是这么来的。
+        cap_lb.pack(side="left", fill="x", expand=True, padx=(6, 0))
 
         # 跨屏铺满：若干窗口分别铺满各自勾选的屏（一个窗口一块屏）。
         # 模式、按钮与屏勾选框同排一行：勾选框按屏数动态重建，宽度实测
@@ -1803,16 +1805,23 @@ class App:
             return ""
         fit, total = cap.get("fit") or 0, cap.get("total") or 0
         scr = cap.get("screen") or ""
-        ww, wh = cap.get("work") or (0, 0)
         need = cap.get("need")
+        alt = cap.get("alt") or {}
+        # 文案只留「能排几个 + 怎么办」：工作区尺寸不再写进来——同一行左边的
+        # 「屏」下拉已经指明是哪块屏，尺寸在上方显示器列表里也有。实测带尺寸
+        # 的旧文案要 362px，整行自然宽 1012px，远超窗口可视宽 765px，会把行尾
+        # 的「自动四窗」按钮挤出映射（用户看到的就是「按钮点了没效果」）。
         # 有窗口没探过最小尺寸时 fit 偏乐观（未探测按 0 计），不能结论成
         # 「放得下」——只能说上限，并把未探测个数报出来
         if fit >= total and not cap.get("uncached"):
-            return "%d/%d 放得下（%s %d×%d）" % (fit, total, scr, ww, wh)
+            return "%d/%d 放得下（%s）" % (fit, total, scr)
         head = "最多排 %d/%d" % (fit, total)
-        if need:
-            head += "：全排需 %d×%d" % (need[0], need[1])
-        head += "（%s %d×%d）" % (scr, ww, wh)
+        # 有别的屏真能排满就直接说换哪块——比只报「全排需 W×H」可操作
+        if alt.get("screen"):
+            head += " · 换%s可排满" % alt["screen"]
+        elif need:
+            head += " · 需%d×%d" % (need[0], need[1])
+        head += "（%s）" % scr
         if cap.get("uncached"):
             head += "，%d 个未探测" % len(cap["uncached"])
         return head
