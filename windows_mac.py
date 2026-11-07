@@ -444,18 +444,42 @@ def last_arranged(hwnd):
 
 # ── AppleScript 执行 ─────────────────────────────────────────────────
 
+# 辅助功能（Accessibility）授权丢失标记。macOS 的 TCC 授权是可撤销的——
+# 用户在系统设置里关掉开关、或 App 升级后签名变化，都会让 osascript 突然
+# 开始返回 "osascript is not allowed assistive access (-1719/-25211)"。
+# 此时所有几何写入静默失败，界面只会显示「需要至少三个可操作窗口」这种
+# 误导性提示，用户以为功能坏了。故在此捕获一次并置位，由界面转成可操作的
+# 授权引导（打开系统设置面板 + 一键重试）。
+_ax_permission_lost = False
+
+
 def _osa(script):
     """执行 AppleScript，失败时记录日志（旧实现静默吞错，导致问题无法定位）。"""
+    global _ax_permission_lost
     try:
         r = subprocess.run(
             ["osascript", "-e", script], capture_output=True, text=True, timeout=10
         )
         if r.returncode != 0 and r.stderr.strip():
-            logger.warning("AppleScript 执行失败: %s", r.stderr.strip()[:200])
+            err = r.stderr.strip()
+            logger.warning("AppleScript 执行失败: %s", err[:200])
+            if "assistive access" in err or "-1719" in err or "-25211" in err:
+                _ax_permission_lost = True
         return r.stdout.strip()
     except Exception as e:  # noqa: BLE001
         logger.warning("AppleScript 调用异常: %s", e)
         return ""
+
+
+def ax_permission_lost():
+    """自上次成功调用以来，辅助功能授权是否被撤销。"""
+    return _ax_permission_lost
+
+
+def reset_ax_permission_lost():
+    """授权恢复后（例如用户在系统设置里重新打开开关）清除标记。"""
+    global _ax_permission_lost
+    _ax_permission_lost = False
 
 
 def _parse_nums(text):
@@ -1239,6 +1263,67 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
         _osa(f'tell application "{app}" to activate')
 
 
+# 贴顶放置时，窗口顶边被系统下压后，格子至少要留这么高，否则宁可保持原高度
+# （窗口太矮用户根本没法用，宁可轻微重叠也不能把格子缩成一条缝）
+_TOP_PUSH_MIN_H = 120
+
+
+def place_tile(hwnd, x, y, w, h, activate=False, pre_cg=None):
+    """把窗口摆进一块格子，并补偿系统对顶边的下压。
+
+    macOS 不让窗口盖住菜单栏：贴着工作区顶边放置时，顶边会被下压
+    「菜单栏高度」。真机实测（Mi 竖屏 1152x2048，work_top=-1066）：要求
+    y=-1066 会被钳到 -1035，下压 31px；主屏 work_top=34 则不压。主屏之外的
+    每块屏都可能被菜单栏/状态栏占掉顶部一条，与窗口本身无关——实测
+    WorkBuddy / Comet / OneNote / ChatGPT / 系统设置 / Marvis 全部被压
+    同样的 31px，是**屏级**限制，不是某个 App 的怪癖。
+
+    不补偿的后果：最上面那块整体下压 31px，与第二块重叠 31px——下层窗口
+    的标题栏被上层的画面盖住，用户看到的现象是「这扇窗拖不动」（拖标题栏
+    抓到的是上面那扇），同时看上去也「不准」。
+
+    补偿方式：把下压的像素数从高度里扣掉，**底边保持不动**。这样格子之间
+    不重叠、窗口间距也不变，只是顶边与菜单栏之间空出一条——那条本来就是
+    菜单栏的位置。
+
+    pre_cg: 可选，写入前的 CG 几何。调用方手上已经有就传进来，省一次枚举。
+
+    返回 (实际 y, 实际高度, 下压像素数)。
+    """
+    if pre_cg is None:
+        pre_cg = _cg_rect(hwnd)
+    set_window_rect(hwnd, x, y, w, h, activate=activate)
+    got = _fresh_rect(hwnd)
+    if not got or got == (0, 0, 0, 0):
+        got = _cg_rect(hwnd)
+    if not got or got == (0, 0, 0, 0):
+        return y, h, 0
+    dy = int(got[1]) - int(y)
+    if dy <= 0:
+        return int(got[1]), h, 0
+    # 读回的宽高必须与请求一致，才说明这次写入真的生效了、读回反映的是
+    # 「我们写的那个矩形」。App 把尺寸钳在别处时读回给的是另一套尺寸，
+    # 拿它推「顶边被压了多少」会得出错误结论——那种窗口宁可不补偿。
+    if abs(int(got[2]) - int(w)) > 1 or abs(int(got[3]) - int(h)) > 1:
+        return int(got[1]), h, 0
+    # 读回不可信就别补偿：AX 读回在 App 钳制尺寸、或写根本没生效时，会给出
+    # 旧几何，凭它削高度会把窗口平白弄矮一截。判据是「这次写入确实动了
+    # 窗口」——CG 几何写前写后完全没变，说明写没生效（或被系统拒了），
+    # 这时的读回不算数。
+    post_cg = _cg_rect(hwnd)
+    if (pre_cg is not None and post_cg is not None
+            and tuple(pre_cg) == tuple(post_cg)):
+        return int(got[1]), h, 0
+    nh = h - dy
+    if nh < _TOP_PUSH_MIN_H:
+        logger.warning("顶边被系统下压 %dpx，格子只剩 %dpx 高，放弃高度补偿",
+                       dy, nh)
+        return int(got[1]), h, dy
+    set_window_rect(hwnd, x, int(got[1]), w, nh, activate=activate)
+    logger.info("顶边被系统下压 %dpx（菜单栏挡住），高度补回 %dpx", dy, dy)
+    return int(got[1]), nh, dy
+
+
 def undo_last_move():
     """撤销最近一次窗口移动/缩放（恢复该窗口移动前的几何）。
 
@@ -1327,7 +1412,10 @@ def snap(hwnd, monitor, zone, activate=True):
     tx, ty, tw, th = targets[zone]
     # 窗口之间留缝（默认 0，行为与以前完全一致）
     tx, ty, tw, th = gap_rect(zone, tx, ty, tw, th, wl, wt, ww, wh)
-    set_window_rect(hwnd, tx, ty, tw, th, activate=activate)
+    # place_tile：贴顶的格子会被系统下压（菜单栏），把下压的像素从高度里
+    # 扣掉、底边不动——不补偿的话「整屏铺满」的窗口会有一条压在屏幕外，
+    # 上下两栏的窗口则互相压盖 31px（下层标题栏被盖 → 拖不动）。
+    place_tile(hwnd, tx, ty, tw, th, activate=activate)
     # App 的最小/固定尺寸会把请求尺寸钳制（真机实测 UU远程固定 921x680、
     # CrossPaste 固定 600x700、Marvis 最小宽 900）。尺寸到不了目标格子时，
     # 「用户要贴的那条边」必须重新钉到工作区边界上——右列贴右缘、下排贴底缘
@@ -1488,15 +1576,18 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, moni
     if mon.height > mon.width:
         # 竖屏：左右并排改为上/下堆叠（上半屏 / 下半屏）
         half_h = wh // 2
-        set_window_rect(left_hwnd, wl, wt, ww, half_h, activate=True)
-        set_window_rect(right_hwnd, wl, wt + half_h, ww, wh - half_h, activate=True)
+        # 上半屏贴顶：place_tile 补偿系统对顶边的下压（菜单栏），高度补回来
+        # 后底边仍落在 wt+half_h，下半屏不会被压住（下层标题栏被盖 → 拖不动）
+        place_tile(left_hwnd, wl, wt, ww, half_h, activate=True)
+        place_tile(right_hwnd, wl, wt + half_h, ww, wh - half_h, activate=True)
         logger.info("竖屏并排(上下堆叠): 上=%s 下=%s（屏幕 %s）",
                     left_hwnd, right_hwnd, mon.device_name)
     else:
         half = ww // 2
         # 并排后激活左右两个窗口，让它们显示到所有窗口最前面（可见、不被遮挡）
-        set_window_rect(left_hwnd, wl, wt, half, wh, activate=True)
-        set_window_rect(right_hwnd, wl + half, wt, ww - half, wh, activate=True)
+        # 左右两栏：两栏都贴顶，都会被系统下压，按同样的规则补回高度
+        place_tile(left_hwnd, wl, wt, half, wh, activate=True)
+        place_tile(right_hwnd, wl + half, wt, ww - half, wh, activate=True)
         logger.info("并排完成: 左=%s 右=%s（屏幕 %s）", left_hwnd, right_hwnd,
                     mon.device_name)
     return True
@@ -1567,24 +1658,25 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
     mon = ms[idx]
 
     wl, wt, ww, wh = mon.work_rect
-    third = wh // 3
-    set_window_rect(top_hwnd, wl, wt, ww, third, activate=False)
-    # 实测闭环：System Events 对窗口几何有系统级钳制（标题栏占住的顶部约 30px
-    # 让窗口永远贴不到 work_top，竖屏大高度变化也常只应用一部分）。若按理想
-    # thirds 继续写中/下两栏，三栏之间会出现缝隙或重叠——表现为「竖排不准」。
-    # 因此上栏写完后读回实测几何，用它推导中/下栏的真实起点。
-    t_rect = get_window_rect(top_hwnd)
-    t_y = t_rect[1] if (t_rect and t_rect != (0, 0, 0, 0)) else wt
-    t_h = t_rect[3] if (t_rect and t_rect[3] > 0) else third
-    used = max(1, (t_y + t_h) - wt)
-    m_y = wt + used + 1
-    m_h = max(1, third - 1)
-    set_window_rect(mid_hwnd, wl, m_y, ww, m_h, activate=False)
-    m_rect = get_window_rect(mid_hwnd)
-    m_h_used = m_rect[3] if (m_rect and m_rect[3] > 0) else m_h
-    b_y = m_y + m_h_used + 1
-    b_h = max(1, (wt + wh) - b_y)
-    set_window_rect(bot_hwnd, wl, b_y, ww, b_h, activate=False)
+    # 理想等分：余数摊到前若干段（每段最多差 1px），而不是只补给末段——
+    # 否则竖屏 2048 这类除不尽的尺寸会让三段高度明显不等，看着就是「不准」。
+    base = wh // 3
+    rem = wh - base * 3
+    heights = [base + (1 if i < rem else 0) for i in range(3)]
+    # 起点一律按上一段「理想」高度累加，不读实测：System Events 会把顶段整体
+    # 下压约 31px（菜单栏占住顶部，窗口永远贴不到 work_top），若拿实测底部作
+    # 下一段起点，这段偏移会被逐级传导、放大成肉眼可见的缝隙。
+    # 单段自身的钳制交给 place_tile 消化：顶段被下压时把高度补回来、底边不动，
+    # 中段与下段的起点因此不会被顶段压住（压住就是中段标题栏被盖、窗口拖不动）。
+    y = wt
+    for i, (hwnd, h) in enumerate(zip((top_hwnd, mid_hwnd, bot_hwnd),
+                                       heights)):
+        if i == 0:
+            # 顶段：按实际能放到的顶边 + 补回的高度摆，底边仍落在 wt+heights[0]
+            place_tile(hwnd, wl, y, ww, h, activate=False)
+        else:
+            set_window_rect(hwnd, wl, y, ww, h, activate=False)
+        y += h
     _osa('tell application "' + top_w['owner'] + '" to activate')
     logger.info("三栏排列完成: 上=%s 中=%s 下=%s（屏幕 %s）", top_hwnd, mid_hwnd,
                 bot_hwnd, mon.device_name)
@@ -1614,6 +1706,11 @@ _last_quad_splits = (0.5, 0.5)
 # 否则用户看到的下拉顺序与实际摆放不一致，就是「不准」。
 _last_quad_order = [None, None, None, None]
 _last_quad_boxes = [None, None, None, None]
+
+# 最近一次四宫格**实际写进去**的目标矩形 {hwnd: (x, y, w, h)}。
+# 贴顶的格子会被系统下压（菜单栏），高度被补过——偏差报告要拿这个比，
+# 拿补之前的格子比会平白报出 31px「不准」。
+_last_quad_written = {}
 
 
 # 最近一次四宫格「角 → hwnd」的实际分配。智能模式会按宽高比重排角的归属，
@@ -3012,8 +3109,13 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
         # 卡死二趟重排（min(old,new) 只收紧不放宽）。CG 枚举不走
         # AppleScript，便宜；detect_unwritable 仍只门「写入无效」判定。
         pre = _cg_rect(h)
-        set_window_rect(h, fx, fy, fw, fh, activate=False)
-        got = _settled_readback(h, (fx, fy, fw, fh))
+        # 贴顶的格子会被系统下压（菜单栏），place_tile 把下压的像素从高度里
+        # 扣掉、底边保持不动——上排因此不会压住下排，下层窗口的标题栏不被
+        # 盖住（「这扇窗拖不动」的成因）。后面所有「实测 vs 目标」的比对都
+        # 要用补偿后的目标 (ay, ah)，否则会把这 31px 误判成 App 尺寸上限。
+        ty, th, _pushed = place_tile(h, fx, fy, fw, fh, pre_cg=pre)
+        _last_quad_written[h] = (fx, ty, fw, th)
+        got = _settled_readback(h, (fx, ty, fw, th))
         post = _cg_rect(h) if detect_unwritable else None
         # 要求了一个有意义的变化、CG 几何却一步没变 = 这个窗口动不了：App 根本
         # 不开放自动化（真机微信、CrossPaste），或被系统钉住（真机 Sidecar 上的
@@ -3026,7 +3128,7 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
         _want_move = (pre is not None
                       and (abs(pre[0] - fx) > 2 or abs(pre[1] - fy) > 2))
         _want_resize = (pre is not None
-                        and (abs(pre[2] - fw) > 2 or abs(pre[3] - fh) > 2))
+                        and (abs(pre[2] - fw) > 2 or abs(pre[3] - th) > 2))
         _moved = (pre is not None and post is not None
                   and (abs(pre[0] - post[0]) > 2
                        or abs(pre[1] - post[1]) > 2))
@@ -3042,7 +3144,7 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
                          "（不开放自动化或被系统钉住）"
                          % h.split("::")[0])
             logger.warning("四宫格：%s 写入无效：要求 %s，CG 几何仍是 %s",
-                           h, (fx, fy, fw, fh), post)
+                           h, (fx, ty, fw, th), post)
         # 要求改尺寸、尺寸却没变 = App 锁定了窗口尺寸（`set size` 被忽略）。
         # 这一类仍能摆到正确的角上，只是没法铺满格子，必须与「完全动不了」
         # 分开报：用户看到的现象是「窗口都挤在角上、大小没变」，说成
@@ -3055,7 +3157,7 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
                          % h.split("::")[0])
             logger.warning("四宫格：%s 尺寸锁定：要求 %dx%d，实测仍是 %dx%d"
                            "（位置已移动）",
-                           h, fw, fh, post[2], post[3])
+                           h, fw, th, post[2], post[3])
         if not got or got == (0, 0, 0, 0):
             continue
         gx, gy, gw, gh = got
@@ -3067,9 +3169,9 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
         # 尺寸上限。缩小请求下读回更小只是宽高比联动（真机 iPhone镜像锁
         # ~0.455，要求 296 读回 242），当上限记会让格子只收紧不放宽。
         _grow_w = pre is not None and pre[2] > 0 and pre[2] < fw - 8
-        _grow_h = pre is not None and pre[3] > 0 and pre[3] < fh - 8
+        _grow_h = pre is not None and pre[3] > 0 and pre[3] < th - 8
         _cap_w = _grow_w and gw < fw - 8
-        _cap_h = _grow_h and gh < fh - 8
+        _cap_h = _grow_h and gh < th - 8
         if (_cap_w or _cap_h) and h not in unwritable:
             # 一次读回可能是收缩中间帧（真机 iPhone镜像 411/234/242 不定）。
             # 用**只读**方式多确认几次（不重写、不多动窗口）：连续两次读数
@@ -3078,7 +3180,7 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
             # 次写入上百毫秒，这里绝不多写。
             cap = (int(gw), int(gh))
             for _retry in range(2):
-                again = _settled_readback(h, (fx, fy, fw, fh))
+                again = _settled_readback(h, (fx, ty, fw, th))
                 if not again or again == (0, 0, 0, 0):
                     break
                 aw, ah = int(again[2]), int(again[3])
@@ -3102,7 +3204,7 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
         # 侧（BTT windowAnchor 同此语义：锚定角永远贴住，其余边听其自然）。
         # 只有尺寸被 App 明显顶小（>8px）时才重排贴边：读回宽度比目标
         # 少 1~2px 是常态（AX 读回噪声），不该触发重排。
-        if abs(gw - fw) <= 8 and abs(gh - fh) <= 8:
+        if abs(gw - fw) <= 8 and abs(gh - th) <= 8:
             continue
         # 反向钳制不需要补写同一目标：上面的只读轮询已经把 gw/gh 收敛到稳定
         # 值，再写一次目标只会让 App 再拒绝一次、窗口再抖一下（真机每个 AX
@@ -3116,7 +3218,7 @@ def _quad_write(finals, cells, wl, wt, ww, wh, smart, unwritable, notes,
         # 贴角基准是 finals 的目标矩形而不是 cells：窗口被 App 顶大/顶小
         # 后，锚定的一侧永远贴住目标边，溢出只发生在远离锚定角的那一侧
         # （语义与边界保护见 _quad_anchor）。
-        ax, ay = _quad_anchor(corner, fx, fy, fw, fh, gw, gh,
+        ax, ay = _quad_anchor(corner, fx, ty, fw, th, gw, gh,
                               wl, wt, ww, wh)
         if (ax, ay) != (gx, gy):
             set_window_rect(h, ax, ay, gw, gh, activate=False)
@@ -3586,7 +3688,10 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # 格子比，间距（默认 12px，每窗让一半）会被记成「被最小尺寸钳制」，间距
     # 开到 20px 以上时状态栏就开始乱报。
     # 只报实际排放的窗口：放不下的窗口根本没动，报出来只会被当成「偏差」
-    targets = {h: (fx, fy, fw, fh) for _idx, h, fx, fy, fw, fh in finals}
+    # 目标用「实际写进去的值」：贴顶的格子被系统下压时高度被补过，
+    # 拿补之前的格子比会平白报出 31px 偏差——那条不是不准，是菜单栏占的。
+    targets = {h: _last_quad_written.get(h, (fx, fy, fw, fh))
+               for _idx, h, fx, fy, fw, fh in finals}
     for idx, h, _w in placed_slots:
         want = targets[h]
         got = _readback_rect(h, want)

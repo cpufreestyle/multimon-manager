@@ -77,6 +77,11 @@ move_to_monitor = getattr(windows, "move_to_monitor", lambda *a, **k: False)
 snap_two_side_by_side = getattr(windows, "snap_two_side_by_side", lambda *a, **k: False)
 snap_three_stack = getattr(windows, "snap_three_stack", lambda *a, **k: False)
 snap_four_quad = getattr(windows, "snap_four_quad", lambda *a, **k: False)
+# 辅助功能授权状态：macOS 撤销授权后所有几何写入静默失败，界面需据此
+# 显示授权引导而不是误导性的「需要至少三个可操作窗口」
+ax_permission_lost = getattr(windows, "ax_permission_lost", lambda: False)
+reset_ax_permission_lost = getattr(windows, "reset_ax_permission_lost",
+                                    lambda: None)
 # 四宫格排列预演（点排列前的空白/放不下预告；只读，不动任何窗口）
 quad_predict = getattr(windows, "quad_predict", lambda *a, **k: ([], {}))
 is_window_portrait_suitable = getattr(windows, "is_window_portrait_suitable", lambda *a, **k: True)

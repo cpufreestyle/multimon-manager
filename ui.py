@@ -1,10 +1,13 @@
 """多屏管理器 GUI（tkinter，零第三方依赖）。"""
 import os
+import os as _os
 import sys
 import time
 import threading
 import re
-import os as _os
+import subprocess
+import logging
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
@@ -27,6 +30,8 @@ import taskbar
 import triggers
 import title_match
 import cmd_channel
+
+logger = logging.getLogger(__name__)
 
 # 多屏任务栏：界面显示值 → 内部位置值
 TASKBAR_POS = {"底部": "bottom", "顶部": "top"}
@@ -1571,7 +1576,33 @@ class App:
             else:
                 self.status_var.set("已并排左右" + (f"（{mon_label}）" if mon_idx is not None else ""))
         else:
-            self.status_var.set("并排失败：需要至少两个可操作窗口")
+            self.status_var.set(self._snap_failed_msg("并排", "两个"))
+
+    def _snap_failed_msg(self, what, need):
+        """排列失败时的状态栏文案。
+
+        辅助功能（Accessibility）授权被撤销时，osascript 会全部返回
+        "not allowed assistive access"，几何写入静默失败——此时不能再说
+        「需要至少 N 个可操作窗口」，那会把用户引向错误的方向（去找窗口，
+        而真正要修的是系统设置里的授权）。故优先按 b.ax_permission_lost()
+        给出授权引导，附一键打开系统设置面板的入口。
+        """
+        try:
+            lost = b.ax_permission_lost()
+        except Exception:  # noqa: BLE001
+            lost = False
+        if lost:
+            return "排列失败：macOS 辅助功能授权已失效，请在「隐私与安全性→辅助功能」中重新勾选本程序"
+        return f"{what}失败：需要至少{need}可操作窗口"
+
+    def _open_ax_settings(self):
+        """打开 macOS 辅助功能设置面板，让用户直接勾选授权。"""
+        try:
+            subprocess.Popen(
+                ["open", "x-apple.systempreferences:com.apple.preference."
+                         "security?Privacy_Accessibility"])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("打开辅助功能设置失败: %s", e)
 
     def _snap_three_stack(self):
         """按选择的上/中/下窗口竖排；选"自动"则由程序取最前面三个窗口。
@@ -1596,7 +1627,7 @@ class App:
         if b.snap_three_stack(top_hwnd=top, mid_hwnd=mid, bot_hwnd=bot, monitor=mon_idx):
             self.status_var.set("已竖排上中下" + (f"（{mon_label}）" if mon_idx is not None else ""))
         else:
-            self.status_var.set("竖排失败：需要至少三个可操作窗口")
+            self.status_var.set(self._snap_failed_msg("竖排", "三个"))
 
     def _snap_four_quad(self, force_auto=False):
         """按选择的左上/右上/左下/右下窗口做 2×2 四宫格排列。
@@ -1736,8 +1767,8 @@ class App:
             if notes:
                 self.status_var.set("；".join(notes[:2]))
             else:
-                self.status_var.set("四宫格失败：至少需要两个可操作窗口"
-                                    "（网格里点掉几格可以只排两三个）")
+                self.status_var.set(self._snap_failed_msg("四宫格", "两个")
+                                    + "（网格里点掉几格可以只排两三个）")
 
     def _update_quad_capacity(self):
         """刷新四宫格容量预检行：只读后端缓存，不动任何窗口。"""
