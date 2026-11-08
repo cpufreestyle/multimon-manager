@@ -48,6 +48,7 @@ RV200 = _Mon(0, -900, 1600, 900, "RV200 Pro")
 RV200.work_rect = (0, -870, 1600, 870)
 BUILTIN = _Mon(0, 0, 1512, 896, "Built-in")
 DELL_V = _Mon(-1080, -1080, 1080, 1920, "DELL")
+PORTRAIT_BIG = _Mon(2000, -2160, 2160, 3840, "Portrait 4K")
 
 
 class QuadCapacityTest(unittest.TestCase):
@@ -112,6 +113,17 @@ class QuadCapacityTest(unittest.TestCase):
         # 竖屏排前面也不先提它：与自动选屏「横屏优先」同口径
         cap = self._cap(list(REAL), [DELL_V, RV200, big], monitor="RV200 Pro")
         self.assertEqual(cap["alt"]["screen"], "Big")
+
+    def test_alt_never_suggests_portrait(self):
+        # 小横屏排不下两个 100x100 的窗口，大竖屏按容量算能排满；也不能
+        # 把竖屏报成「换哪块可排满」——自动排布根本不会主动往竖屏送。
+        small = _Mon(0, 0, 150, 100, "Small")
+        wm._QUAD_MIN_CACHE.update({"a::": (100, 100), "b::": (100, 100)})
+        cap = self._cap(["a::", "b::"], [small, PORTRAIT_BIG],
+                        monitor="Small")
+        self.assertEqual(cap["fit"], 1)
+        self.assertIsNone(cap["alt"])
+        self.assertEqual(cap["need"], (200, 100))
 
     def test_auto_picks_landscape_over_portrait(self):
         wm._QUAD_MIN_CACHE.update(REAL)

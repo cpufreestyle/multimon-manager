@@ -1,8 +1,8 @@
-# 交接 — multimon-manager（2026-11-08：启动下拉修复、授权提示、顶边补偿、四格容量提示）
+# 交接 — multimon-manager（2026-11-08：启动下拉修复、授权提示、顶边补偿、四格容量提示与横屏候选）
 
 > 本文件是**当前**交接入口，读完即可接管。
 > 代码根：`/Users/a1-6/AI Shared/repo/multimon-manager/`
-> 版本 0.3.2 · 全套单测通过 · `master` 与 `origin/master` 已同步（HEAD `ba4d6ac`）
+> 版本 0.3.2 · 全套单测通过 · `master` 与 `origin/master` 已同步（HEAD `6acb970`）
 > 运行形态：`dist/多屏管理器.app`（桌面快捷方式 `~/Desktop/多屏管理器`，Finder alias）
 
 ## 0. 一分钟速览
@@ -17,7 +17,7 @@
 | 修复 C | 固定控件先 `pack`，容量标签最后 `pack` 并 `fill/expand`；说明标签并入画布 tooltip；`quad_capacity()` 新增 `alt` 直接报「换哪块屏可排满」 |
 | 关联修复 | `place_tile()` 对贴顶窗口做顶边下压高度补偿；详见 §2.5 |
 | 测试 | 用 `python@3.14` 跑全套 37 个测试文件通过；`test_single_instance` 因运行中的 App 占锁，需隔离 `TMPDIR` 复跑 |
-| git | `master` 与 `origin/master` **已同步**（HEAD `ba4d6ac`），工作区干净 |
+| git | `master` 与 `origin/master` **已同步**（HEAD `6acb970`），工作区干净 |
 
 ## 1. 环境事实（接手前必读，能省几小时）
 
@@ -192,6 +192,10 @@ App 限制不是程序不准），合计不准 0。
 界面直接报「换 Big 可排满」；没有合适的屏才退回「全排需 W×H」。容量文案不再
 重复工作区尺寸。
 
+`alt` 的候选屏只取横屏：自动选屏与 `_quad_place()` 都不会主动把四宫格窗口
+送到竖屏，容量提示也不该给出一条与正式排布相反的建议。找不到可排满的横屏
+时保持 `alt=None`，界面退回「需 W×H」或「最多排 N/M」。
+
 这一行曾因容量文字过长把行尾「自动四窗」按钮挤出映射：带尺寸的旧文案 362px，
 整行自然宽 1012px，而窗口最小尺寸下可视宽只有 765px。修法是屏下拉、网格、
 按钮先 `pack`，容量标签最后 `pack(fill="x", expand=True)`；纯说明性的
@@ -206,14 +210,17 @@ App 限制不是程序不准），合计不准 0。
 
 ## 4. 未决 / 下一步
 
-1. **本轮改动尚未提交**。`master` 与 `origin/master` 已同步在 `4826d07`，工作区有 3 个改动文件（`windows_mac.py` / `backend.py` / `ui.py`）+ 2 个新测试文件未提交。历史上推送被 Shadowrocket 的 TLS DPI 阻断过（`LibreSSL SSL_connect: SSL_ERROR_SYSCALL`），20:1x 有一次推送成功说明网络会恢复。**推送前若再遇 SSL 失败，让用户把 GitHub 设成 DIRECT 或退出代理**，别在应用层找原因。
-2. **`verify_stack_portrait_real.py` / `verify_portrait_zones_real.py` 两个真机校验脚本写死了「小米屏」**（`"Mi" in m.device_name`）。当前竖屏可能是 DELL U2414H，跑出来必然 FAIL。应改成「自动找 `height > width` 的屏，找不到就 SKIP」。这两个是脚本不是 TestCase（入口有 `if __name__` 保护），`run_tests.sh` 的 discover 不会加载它们，要手动跑：
+1. **竖屏真机脚本已修好**：`verify_stack_portrait_real.py` 与
+   `verify_portrait_zones_real.py` 现在自动找 `height > width` 的屏，找不到就
+   SKIP，不再写死「小米屏」。两者是独立脚本（入口有 `if __name__` 保护），
+   `run_tests.sh` 的 discover 不会加载，换屏后想验几何要手动跑：
 
 ```bash
 python3 tests/verify_stack_portrait_real.py
+python3 tests/verify_portrait_zones_real.py
 ```
-3. **真人鼠标点击未闭环**。本轮我用 `btn.invoke()` 验证了绑定与逻辑（确实重排了窗口），CGEventPost 合成点击送不到 App（macOS 限制）。**「用户双击桌面快捷方式后点按钮」这一环仍待真人确认**。
-4. **四窗 2×2 已存在**，叫 `snap_four_quad`（`windows_mac.py:3214`），不是 `snap_four_grid`。带容量预检（`quad_capacity()`）、最小尺寸缓存（`quad_cache.json`）、智能分配（按宽高比重排四角）、排列预演（`quad_predict`）。改四宫格行为前先读这几个函数，别新写一套数学。
+2. **真人鼠标点击未闭环**。本轮我用 `btn.invoke()` 验证了绑定与逻辑（确实重排了窗口），CGEventPost 合成点击送不到 App（macOS 限制）。**「用户双击桌面快捷方式后点按钮」这一环仍待真人确认**。
+3. **四窗 2×2 已存在**，叫 `snap_four_quad`（`windows_mac.py:3316`），不是 `snap_four_grid`。带容量预检（`quad_capacity()`）、最小尺寸缓存（`quad_cache.json`）、智能分配（按宽高比重排四角）、排列预演（`quad_predict`）。改四宫格行为前先读这几个函数，别新写一套数学。
 
 ## 5. 快速命令
 
