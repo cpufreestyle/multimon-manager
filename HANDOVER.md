@@ -1,20 +1,23 @@
-# 交接 — multimon-manager（2026-11-07 深夜轮：顶边下压补偿——「窗口压住拖不动」的根因修复）
+# 交接 — multimon-manager（2026-11-08：启动下拉修复、授权提示、顶边补偿、四格容量提示）
 
 > 本文件是**当前**交接入口，读完即可接管。
 > 代码根：`/Users/a1-6/AI Shared/repo/multimon-manager/`
-> 版本 0.3.2 · **442** 个单测全绿 · 已推 `origin/master`（HEAD `4826d07`），本轮改动未提交
+> 版本 0.3.2 · 全套单测通过 · `master` 与 `origin/master` 已同步（HEAD `ba4d6ac`）
 > 运行形态：`dist/多屏管理器.app`（桌面快捷方式 `~/Desktop/多屏管理器`，Finder alias）
 
 ## 0. 一分钟速览
 
 | 项 | 值 |
 |---|---|
-| 本轮根因 A | `snap_three_stack` 用「上一段**实测**底部」推下一段起点，把 macOS 标题栏造成的 31px 偏移逐级传导、放大成缝隙 |
-| 本轮根因 B | 辅助功能（Accessibility）授权被撤销后，所有 AppleScript 几何写入静默失败，界面只显示误导性的「需要至少 N 个可操作窗口」 |
-| 修复 A | [windows_mac.py:1594](file:///Users/a1-6/AI%20Shared/repo/multimon-manager/windows_mac.py#L1594) 理想等分（余数摊前若干段）+ 起点按理想高度累加，不再读实测 |
-| 修复 B | [windows_mac.py:456](file:///Users/a1-6/AI%20Shared/repo/multimon-manager/windows_mac.py#L456) `_osa()` 识别授权拒绝并置位；[ui.py:1570](file:///Users/a1-6/AI%20Shared/repo/multimon-manager/ui.py#L1570) 失败文案优先报授权失效 |
-| 测试 | `bash run_tests.sh` → `Ran 436 tests / OK (skipped=1)`；新增 10 个用例 |
-| git | `master` 与 `origin/master` **已同步**（HEAD `4826d07`）；本轮改动尚未提交，见 §4 |
+| 本轮根因 A | `App.__init__` 丢了 `self._refresh_targets()`：启动后窗口下拉全空、排列处理器直读不存在的 `_target_map` 抛 `AttributeError`，被 Tk 吞掉后表现为「按钮点了没反应」 |
+| 本轮根因 B | 辅助功能授权被撤销后几何写入失败，界面只显示误导性的「需要至少 N 个可操作窗口」 |
+| 本轮根因 C | 四格容量文案带工作区尺寸，整行自然宽 1012px > 可视宽 765px，把行尾「自动四窗」按钮挤出映射 |
+| 修复 A | `ui.py:166` 启动即填充窗口下拉；`tests/test_startup_window_lists.py` 4 个反向验证用例 |
+| 修复 B | `windows_mac.py` 记录授权拒绝状态，`ui.py` 排列失败时给授权引导 + 一键打开系统设置 |
+| 修复 C | 固定控件先 `pack`，容量标签最后 `pack` 并 `fill/expand`；说明标签并入画布 tooltip；`quad_capacity()` 新增 `alt` 直接报「换哪块屏可排满」 |
+| 关联修复 | `place_tile()` 对贴顶窗口做顶边下压高度补偿；详见 §2.5 |
+| 测试 | 用 `python@3.14` 跑全套 37 个测试文件通过；`test_single_instance` 因运行中的 App 占锁，需隔离 `TMPDIR` 复跑 |
+| git | `master` 与 `origin/master` **已同步**（HEAD `ba4d6ac`），工作区干净 |
 
 ## 1. 环境事实（接手前必读，能省几小时）
 
@@ -81,10 +84,12 @@ open ~/Desktop/多屏管理器
 
 顶段那 31px 是 macOS 的物理限制，**不要再试图用坐标消掉它**——历史上试过反向补偿，反而引入了更严重的漂移。
 
-### 2.2 辅助功能授权失效可见化（用户报「按钮没反应 + 下拉选不到程序」）
+### 2.2 一次误判的纠正 + 授权失效可见化
 
-这两个表象是**同一个根因**：macOS 的 TCC 授权被撤销后，`osascript` 全部返回
-`osascript is not allowed assistive access (-1719/-25211)`，而窗口枚举和几何写入**都**走 AppleScript。
+**先纠正旧结论**：§2.2 早期把「按钮没反应 + 下拉选不到程序」归因于 TCC 授权被撤销，这个判断**不成立**。日志里的授权错误确实存在（1183 次），但窗口枚举失败时界面还能显示启动前的旧列表，真正让新会话按钮全哑的是下面 §2.3 的 `_refresh_targets()` 丢失。授权失效可见化本身仍保留——它是另一条真实故障路径，别再把它当作「下拉空 + 按钮哑」的首选解释。
+
+**授权失效路径**：macOS 的 TCC 授权被撤销后，`osascript` 全部返回
+`osascript is not allowed assistive access (-1719/-25211)`，几何写入静默失败。
 
 日志里的铁证（1183 次）：
 ```
@@ -103,8 +108,7 @@ open ~/Desktop/多屏管理器
 
 ### 2.2.1 更正：§2.2 的根因判断对不上用户报的那次故障
 
-**§2.2 说「按钮没反应 + 下拉选不到程序」是辅助功能授权被撤销导致的。这个结论对用户
- 2026-11-07 深夜报的那次不成立**，此处显式更正，不去改上面的原文。
+**§2.2 早期把同一次故障归因于授权撤销，这个结论不成立**；上面 §2.2 已就地更正并保留证据链。
 
 本轮复测拿到的反证：
 
@@ -181,6 +185,18 @@ WorkBuddy / Comet / OneNote / ChatGPT / 系统设置 / Marvis 全部一样——
 重写）。`tests/verify_portrait_zones_real.py` 把「App 自身尺寸钳制」单独
 归类不计入几何偏差（真机 Marvis 最小 900 宽、系统设置 754，塞不进窄格是
 App 限制不是程序不准），合计不准 0。
+
+## 2.6 四格容量提示与 packer 行宽（2026-11-08 追加）
+
+`quad_capacity()` 新增 `alt`：点名屏排不满时，实算别的屏能否排满（横屏优先），
+界面直接报「换 Big 可排满」；没有合适的屏才退回「全排需 W×H」。容量文案不再
+重复工作区尺寸。
+
+这一行曾因容量文字过长把行尾「自动四窗」按钮挤出映射：带尺寸的旧文案 362px，
+整行自然宽 1012px，而窗口最小尺寸下可视宽只有 765px。修法是屏下拉、网格、
+按钮先 `pack`，容量标签最后 `pack(fill="x", expand=True)`；纯说明性的
+「点格=填/清空 · 拖分割线=改比例」标签并进画布 tooltip。实测本机三组真实
+选择文案 145~220px，容量标签可用 317px，全部完整可读，按钮 `mapped=True`。
 
 ## 3. 已知平台限制（不要「修」，已文档化）
 
