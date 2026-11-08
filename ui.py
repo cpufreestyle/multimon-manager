@@ -569,6 +569,30 @@ class App:
         else:
             self.status_var.set("该窗口没有被程序摆放过，没有可回的位置")
 
+    def _release_window(self):
+        """释放程序对目标窗口的位置记忆，不再把它自动拉回。"""
+        target_map = getattr(self, "_target_map", None) or {}
+        label = self.target_var.get()
+        hwnd = target_map.get(label)
+        if not hwnd:
+            try:
+                hwnd = b.get_foreground_window(False)
+            except Exception:  # noqa: BLE001
+                hwnd = None
+        if not hwnd:
+            self.root.after(0, lambda: self.status_var.set("没有可释放的目标窗口"))
+            return
+        if getattr(b, "release_window", None) is None:
+            self.root.after(0, lambda: self.status_var.set("当前平台暂不支持释放窗口"))
+            return
+        try:
+            ok = b.release_window(hwnd)
+        except Exception as e:  # noqa: BLE001
+            self.root.after(0, lambda: self.status_var.set(f"释放窗口失败：{e}"))
+            return
+        msg = "已释放窗口记忆，不会再自动把它拉回" if ok else "该窗口未被程序记录位置"
+        self.root.after(0, lambda m=msg: self.status_var.set(m))
+
     def _current_target_hwnd(self):
         """当前界面选中的目标窗口 hwnd；「自动」时返回 None。"""
         target_map = getattr(self, "_target_map", None) or {}
@@ -785,6 +809,13 @@ class App:
         self._tooltip(back_btn,
                       "把目标窗口送回上次被本程序摆好的位置"
                       "（窗口被拖乱后一键归位）")
+        release_btn = ttk.Button(snap_rows[1], text="释放窗口",
+                                 command=self._release_window)
+        release_btn.pack(side="left", padx=(8, 1))
+        self._tooltip(release_btn,
+                      "清除程序对该窗口的位置记忆，以后不会自动把它拉回"
+                      "（窗口拖不动或排完后弹回时使用）")
+
         # 暂存 / 取回（复刻 Rectangle Pro 的 Stash）：把不用的窗口收到屏幕顶边，
         # 再按一次取回最早那个，位置尺寸原样恢复。
         stash_btn = ttk.Button(snap_rows[1], text="暂存",

@@ -154,6 +154,8 @@ stash_active = getattr(windows, "stash_active", lambda *a, **k: False)
 unstash_first = getattr(windows, "unstash_first", lambda *a, **k: (None, False))
 # 回到上次被程序摆好的位置（第二层撤销；Moom 的 snap back 思路）
 return_to_last_arranged = getattr(windows, "return_to_last_arranged", None)
+release_window = getattr(windows, "release_window", None)
+# 释放程序对窗口的位置记忆，用户手动拖动后不再被拉回
 # snap() 最近一次实测报告：[(hwnd, want, got)]，UI 据此提示「被应用钳制」
 last_snap_report = getattr(windows, "_last_snap_report", None)
 # 当前活动窗口标识（快捷键路径使用）

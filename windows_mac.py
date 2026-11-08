@@ -444,6 +444,27 @@ def last_arranged(hwnd):
 
 # ── AppleScript 执行 ─────────────────────────────────────────────────
 
+def release_window(hwnd):
+    """释放程序对窗口的位置记忆：以后不会自动把它拉回。
+
+    用户手动拖动窗口后，若担心程序再把它拉回，点此清除
+    `_last_arranged` 与 `_undo_stack` 里该窗口的记录。不影响当前几何，
+    只不再把窗口绑定到「程序上次摆放位」。
+    """
+    released = False
+    with _last_arranged_lock:
+        if hwnd in _last_arranged:
+            del _last_arranged[hwnd]
+            released = True
+    with _undo_lock:
+        before = len(_undo_stack)
+        _undo_stack[:] = [(h, r) for h, r in _undo_stack if h != hwnd]
+        if len(_undo_stack) != before:
+            released = True
+    return released
+
+
+
 # 辅助功能（Accessibility）授权丢失标记。macOS 的 TCC 授权是可撤销的——
 # 用户在系统设置里关掉开关、或 App 升级后签名变化，都会让 osascript 突然
 # 开始返回 "osascript is not allowed assistive access (-1719/-25211)"。
