@@ -108,7 +108,8 @@ class App:
         self.root.title("多屏管理器 · michaelqiu 出品")
         # 默认宽度取 820：窗口工具里有「并排」「竖排」两组下拉，120 DPI 下
         # 760 宽会把最右侧的按钮挤出可视区（横向没有滚动条）。
-        self.root.geometry("820x740")
+        # 竖屏友好：默认 820x680，内容超出时靠垂直滚动
+        self.root.geometry("820x680")
         self.monitors = []
         self.mon_rows = []
         self.fit_var = tk.StringVar(value="fill")
@@ -175,7 +176,8 @@ class App:
         # 窗口大小变化时防抖重绘布局图，并设最小尺寸避免控件被压坏
         # 最小宽度按 body 的自然宽度（120 DPI 下约 773）取齐，缩到这一步即停，
         # 再窄就会把窗口工具里的下拉/按钮挤出可视区。
-        self.root.minsize(810, 560)
+        # 竖屏友好：最小高度降到 480，内容多时靠垂直滚动
+        self.root.minsize(810, 480)
         self._resize_job = None
         self.root.bind("<Configure>", self._on_window_resize)
 
@@ -187,7 +189,7 @@ class App:
         self.content.pack(fill="both", expand=True)
 
         top = ttk.Frame(self.content)
-        top.pack(fill="x", padx=8, pady=(6, 2))
+        top.pack(fill="x", padx=6, pady=(4, 1))
         rm_btn = ttk.Button(top, text="刷新显示器", command=self.refresh_monitors)
         rm_btn.pack(side="left")
         self._tooltip(rm_btn, "重新检测当前连接的显示器（插拔屏幕后点这里）")
@@ -323,7 +325,7 @@ class App:
             if frame is None:
                 continue
             if advanced:
-                frame.pack(fill="x", padx=8, pady=6)
+                frame.pack(fill="x", padx=6, pady=3)
             else:
                 frame.pack_forget()
         # 布局与壁纸 / 设置 两页在极简模式下没有可见内容，标签一并隐藏
@@ -419,7 +421,7 @@ class App:
 
     def _build_wallpaper(self, parent):
         f = ttk.LabelFrame(parent, text="壁纸")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
 
         mode = ttk.Frame(f)
         mode.pack(fill="x", pady=4)
@@ -716,7 +718,7 @@ class App:
 
     def _build_window_tools(self, parent):
         f = ttk.LabelFrame(parent, text="窗口工具")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
 
         # 目标窗口显式选择：自动判断（"最前面的非本程序窗口"）常猜错，
         # 例如停在 IDE 聊天窗口时点按钮会把 IDE 分屏，故改为可手动指定。
@@ -781,11 +783,13 @@ class App:
         if getattr(b, "toggle_topmost", None) is not None:
             btns.append(("置顶切换", lambda: self._toggle_topmost_action(),
                          "切换目标窗口是否置顶显示"))
-        # 吸附按钮两行（8 + 7），间距收到 1px；「撤销移动」并到第二行末尾。
-        # 撤销原先独占一行、白占一行高；第二行 7 个按钮加撤销实测 592px，
-        # 在窗口工具框的 775px 可视宽内仍有余量（缩到最小尺寸 810 也放得下）。
+        # 吸附按钮分三行：8 个整/半屏 + 8 个三分之一/四角 + 5 个记忆/暂存。
+        # 曾把后两组挤在同一行，自然宽 1005px，而最小尺寸下窗口工具只有约
+        # 775px 可视宽——packer 装不下就不映射末尾控件，「释放窗口 / 暂存 /
+        # 取回」三个按钮直接消失（对象还在、command 还绑着，用户点不到）。
+        # 分行后实测每行都在可视宽内，见 tests/test_snap_rows_mapped.py。
         snap_rows = []
-        for _ in range(2):
+        for _ in range(3):
             r = ttk.Frame(f)
             r.pack(fill="x", pady=1)
             snap_rows.append(r)
@@ -799,17 +803,17 @@ class App:
                              command=self._keep_front_after(cmd))
             btn.pack(side="left", padx=1)
             self._tooltip(btn, tip)
-        undo_btn = ttk.Button(snap_rows[1], text="撤销移动",
+        undo_btn = ttk.Button(snap_rows[2], text="撤销移动",
                               command=self._undo_move)
-        undo_btn.pack(side="left", padx=(8, 1))
+        undo_btn.pack(side="left", padx=(1, 1))
         self._tooltip(undo_btn, "回退上一次窗口的移动/缩放（快捷键 F7）")
-        back_btn = ttk.Button(snap_rows[1], text="回摆放位",
+        back_btn = ttk.Button(snap_rows[2], text="回摆放位",
                               command=self._back_to_arranged)
         back_btn.pack(side="left", padx=(8, 1))
         self._tooltip(back_btn,
                       "把目标窗口送回上次被本程序摆好的位置"
                       "（窗口被拖乱后一键归位）")
-        release_btn = ttk.Button(snap_rows[1], text="释放窗口",
+        release_btn = ttk.Button(snap_rows[2], text="释放窗口",
                                  command=self._release_window)
         release_btn.pack(side="left", padx=(8, 1))
         self._tooltip(release_btn,
@@ -818,13 +822,13 @@ class App:
 
         # 暂存 / 取回（复刻 Rectangle Pro 的 Stash）：把不用的窗口收到屏幕顶边，
         # 再按一次取回最早那个，位置尺寸原样恢复。
-        stash_btn = ttk.Button(snap_rows[1], text="暂存",
+        stash_btn = ttk.Button(snap_rows[2], text="暂存",
                                command=self._stash_action)
         stash_btn.pack(side="left", padx=(8, 1))
         self._tooltip(stash_btn,
                       "把目标窗口收到当前屏幕顶边（只露一小条），"
                       "位置尺寸会记住，之后用「取回」还原（快捷键 ⌘⌥+S）")
-        unstash_btn = ttk.Button(snap_rows[1], text="取回",
+        unstash_btn = ttk.Button(snap_rows[2], text="取回",
                                  command=self._unstash_action)
         unstash_btn.pack(side="left", padx=1)
         self._tooltip(unstash_btn,
@@ -833,7 +837,7 @@ class App:
         # 借鉴 Rectangle Pro 的 GapCalculation：间距一是让四格清清楚楚分开，
         # 二是吸收 App 最小尺寸把窗口顶大时的溢出，避免立刻越界被搬屏。
         gap_row = ttk.Frame(f)
-        gap_row.pack(fill="x", padx=6, pady=(1, 1))
+        gap_row.pack(fill="x", padx=6, pady=(0, 0))
         ttk.Label(gap_row, text="间距:").pack(side="left")
         self.window_gap_var = tk.IntVar(
             value=int(settings.load().get("window_gap", 0) or 0))
@@ -870,7 +874,7 @@ class App:
         # 移到指定屏：只有"上一屏/下一屏"时，三屏以上要连点好几次才能到位，
         # 这里直接选目标屏一次跳过去（下拉与并排/竖排共用同一份显示器列表）。
         mon_row = ttk.Frame(f)
-        mon_row.pack(fill="x", padx=6, pady=(2, 1))
+        mon_row.pack(fill="x", padx=6, pady=(1, 0))
         ttk.Label(mon_row, text="指定屏:").pack(side="left")
         self.move_mon_var = tk.StringVar(value=AUTO_MON)
         self.move_mon_cb = ttk.Combobox(mon_row, textvariable=self.move_mon_var,
@@ -888,7 +892,7 @@ class App:
 
         # 并排左右：可选目标显示器 + 可指定左右两个窗口（留"自动"则由程序取最前面两个）
         sbs = ttk.Frame(f)
-        sbs.pack(fill="x", padx=6, pady=(1, 1))
+        sbs.pack(fill="x", padx=6, pady=(0, 0))
         ttk.Label(sbs, text="并排:").pack(side="left")
         self.sbs_mon_var = tk.StringVar(value=AUTO_MON)
         # 下拉宽度按 120 DPI 下的实际像素收窄：原先并排/竖排整行会超出窗口，
@@ -919,7 +923,7 @@ class App:
 
         # 竖排上中下：可选目标显示器 + 可指定上/中/下三个窗口（留"自动"则由程序取最前面三个）
         stack = ttk.Frame(f)
-        stack.pack(fill="x", padx=6, pady=(1, 1))
+        stack.pack(fill="x", padx=6, pady=(0, 0))
         ttk.Label(stack, text="竖排:").pack(side="left")
         self.stack_mon_var = tk.StringVar(value=AUTO_MON)
         self.stack_mon_cb = ttk.Combobox(stack, textvariable=self.stack_mon_var,
@@ -963,7 +967,7 @@ class App:
         # 这正是「4 格模式只能选三个窗口」且「智能 / 非智能都不准」的主因。
         # 改成按自然宽度分两行后，行宽实测 720px / 583px，都在 793px 可视宽内。
         quad = ttk.Frame(f)
-        quad.pack(fill="x", padx=6, pady=(1, 1))
+        quad.pack(fill="x", padx=6, pady=(0, 0))
 
         quad_row = ttk.Frame(quad)
         quad_row.pack(fill="x")
@@ -1123,7 +1127,7 @@ class App:
         # refresh_monitors() 都把这一行整行删掉，界面上只剩勾选框，这才是
         # 「跨屏铺满的选项没有出现」的真因（与四宫格那次的 packer 不映射不同）。
         spread = ttk.Frame(f)
-        spread.pack(fill="x", padx=6, pady=(1, 1))
+        spread.pack(fill="x", padx=6, pady=(0, 0))
         ttk.Label(spread, text="跨屏铺满:").pack(side="left")
         self._spread_checks_parent = spread
         self._last_monitors = list(self.monitors)
@@ -1171,7 +1175,7 @@ class App:
         # Spinbox 必须 pack 并给足宽度：容器装不下时 Tk packer 不映射后面的
         # 子控件——「很多按钮点了没效果」多半是这个（控件根本没映射）。
         grid = ttk.Frame(f)
-        grid.pack(fill="x", padx=6, pady=(1, 1))
+        grid.pack(fill="x", padx=6, pady=(0, 0))
         grid_row = ttk.Frame(grid)
         grid_row.pack(fill="x")
         ttk.Label(grid_row, text="虚拟网格:").pack(side="left")
@@ -3050,7 +3054,7 @@ class App:
 
     def _build_profiles(self, parent):
         f = ttk.LabelFrame(parent, text="壁纸方案")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
         top = ttk.Frame(f)
         top.pack(fill="x", pady=4)
         self.profile_name = tk.StringVar()
@@ -3067,7 +3071,7 @@ class App:
     # ---------- 窗口布局方案 ----------
     def _build_layouts(self, parent):
         f = ttk.LabelFrame(parent, text="窗口布局方案")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
         ttk.Label(
             f,
             text="保存当前所有窗口的位置/大小，之后一键还原（按「应用::窗口」匹配，"
@@ -3307,7 +3311,7 @@ class App:
 
     def _build_hotkeys(self, parent):
         f = ttk.LabelFrame(parent, text="全局快捷键")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
         # 修饰键按平台可选：macOS 习惯 ⌘⌥，Windows 习惯 Ctrl+Alt
         is_mac = sys.platform.startswith("darwin")
         self._mod_options = (
@@ -3344,7 +3348,7 @@ class App:
 
     def _build_autostart(self, parent):
         f = ttk.LabelFrame(parent, text="启动选项")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
         ttk.Checkbutton(f, text="开机自动启动", variable=self.autostart_var,
                         command=self._toggle_autostart).pack(anchor="w", padx=4, pady=2)
         # 静默启动：自启命令带 --minimized，开机后只进托盘不弹主窗口
@@ -3415,7 +3419,7 @@ class App:
     def _build_keep_awake(self, parent):
         """防休眠（复刻 LayoutKeeper 的 KeepAwake）：合盖/拔电/锁屏时继续干活。"""
         f = ttk.LabelFrame(parent, text="防休眠")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
         ttk.Label(
             f,
             text="让 Mac 在合盖、拔电源、锁屏时也不睡眠，挂下载 / 跑长任务 / 当看板时有用。"
@@ -3529,7 +3533,7 @@ class App:
     # ---------- 配置备份 ----------
     def _build_backup(self, parent):
         f = ttk.LabelFrame(parent, text="配置备份")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
         ttk.Label(
             f,
             text="导出 / 恢复窗口布局、壁纸方案和偏好；换机或重装后导入即可"
@@ -3663,7 +3667,7 @@ class App:
 
     def _build_display_watch(self, parent):
         f = ttk.LabelFrame(parent, text="显示器热插拔")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
         self.watch_enabled = tk.BooleanVar(
             value=bool(settings.load().get("watch_displays", True)))
         self.auto_apply_watch = tk.BooleanVar(
@@ -4052,7 +4056,7 @@ class App:
 
     def _build_scenarios(self, parent):
         f = ttk.LabelFrame(parent, text="情景模式（按显示器组合自动套用）")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
         ttk.Label(
             f,
             text="把「壁纸方案 + 窗口布局」绑定到一组显示器；插拔或重排后自动套用对应情景。",
@@ -4298,7 +4302,7 @@ class App:
 
     def _build_drag_snap(self, parent):
         f = ttk.LabelFrame(parent, text="拖拽吸附预览")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
         ttk.Label(
             f,
             text="开启后，把窗口拖到屏幕左/右/上/下边缘时，半透明高亮将吸附的区域；"
@@ -4502,7 +4506,7 @@ class App:
     # ---------- 窗口规则引擎（F5）----------
     def _build_rules(self, parent):
         f = ttk.LabelFrame(parent, text="窗口规则")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
         ttk.Label(
             f,
             text="按应用名/标题把窗口自动放到指定屏与位置；规则自上而下匹配，先命中先执行。",
@@ -5222,7 +5226,7 @@ class App:
     # ---------- 壁纸轮换（幻灯片） ----------
     def _build_rotate(self, parent):
         f = ttk.LabelFrame(parent, text="壁纸轮换（幻灯片）")
-        f.pack(fill="x", padx=8, pady=6)
+        f.pack(fill="x", padx=6, pady=3)
         s = settings.load()
         self.rotate_dir_var = tk.StringVar(value=s.get("rotate_dir", "") or "")
         try:

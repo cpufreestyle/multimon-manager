@@ -171,6 +171,77 @@ class TestAxWindowByGeometry(unittest.TestCase):
         self.assertEqual(wm._ax_window_selector("App::Win#3"), "window 3")
 
 
+class TestMainWindowFallback(unittest.TestCase):
+    """主窗口兜底只对「没有显式序号」的 hwnd 生效。
+
+    Electron 应用（ChatGPT）的 window 1 可能是 84x77 的输入法小面板，
+    几何与名字都匹配不上时退到 window 1 会把几何写到小面板上，所以要按
+    subrole/AXMain 找真正的主窗口。
+
+    但 hwnd 带 #n 时用户在界面上明确选了「第 n 个同名窗口」（UU远程 6 个
+    空名窗口就是这种），那份显式意图必须优先：兜底改成主窗口会把 #3 的
+    几何写到 #1 上，正是「多个独立窗口无法分开」的老毛病。
+    """
+
+    AX_GEOM = "0,0,84,77;0,0,1200,800"
+    AX_MAIN = "1,AXDialog,false,84,77;2,AXStandardWindow,true,1200,800;"
+
+    def setUp(self):
+        self._osa = wm._osa
+
+        def _osa(script):
+            if "AXMain" in script:
+                return self.AX_MAIN
+            if "position of w" in script:
+                return self.AX_GEOM
+            if "name of w" in script:
+                return ";"          # UU远程：所有窗口空名
+            return ""
+
+        wm._osa = _osa
+
+    def tearDown(self):
+        wm._osa = self._osa
+
+    def test_seq_hwnd_is_not_hijacked_by_main_window(self):
+        """带 #3 的 hwnd：几何对不上也不能改用主窗口，最终仍写 window 3。"""
+        hwnd = "UU远程::#3"
+        _app, name, seq = wm.parse_hwnd(hwnd)
+        sel = (wm._ax_window_by_geometry("UU远程", (900, 900, 100, 100),
+                                        name, seq=seq)
+               or wm._ax_window_selector(hwnd))
+        self.assertEqual(sel, "window 3")
+
+    def test_no_seq_still_benefits_from_main_window(self):
+        """不带序号的 hwnd：几何/名字都匹配不上时挑真正的主窗口。"""
+        sel = wm._ax_window_by_geometry("ChatGPT", (900, 900, 100, 100), "")
+        self.assertEqual(sel, "window 2")
+
+    def test_name_fallback_respects_seq(self):
+        """按名字兜底同样不能越过显式序号去挑主窗口。"""
+        self.assertIsNone(
+            wm._ax_window_by_name("UU远程", "对不上的名字", seq=3))
+
+    def test_confident_geometry_match_still_wins_with_seq(self):
+        """几何匹配可信（偏差 <= 64）时照旧优先，序号只在兜底阶段说话。"""
+        sel = wm._ax_window_by_geometry("UU远程", (0, 0, 1200, 800),
+                                       "", seq=3)
+        self.assertEqual(sel, "window 2")
+
+    def test_main_window_prefers_standard_subrole(self):
+        self.assertEqual(wm._ax_main_window("ChatGPT"), "window 2")
+
+    def test_main_window_falls_back_to_axmain(self):
+        """没有 AXStandardWindow 时按 AXMain=true 挑，且排除小面板。"""
+        wm._osa = lambda s: ("1,AXDialog,true,84,77;2,AXUnknown,true,1200,800;"
+                             if "AXMain" in s else "")
+        self.assertEqual(wm._ax_main_window("App"), "window 2")
+
+    def test_main_window_returns_none_when_ax_silent(self):
+        wm._osa = lambda s: ""
+        self.assertIsNone(wm._ax_main_window("App"))
+
+
 def _fake_wins():
     """模拟 UU远程：同一进程 3 个同名（空名）窗口 + 1 个有别名的窗口。"""
     return [

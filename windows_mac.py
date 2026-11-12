@@ -464,7 +464,6 @@ def release_window(hwnd):
     return released
 
 
-
 # 辅助功能（Accessibility）授权丢失标记。macOS 的 TCC 授权是可撤销的——
 # 用户在系统设置里关掉开关、或 App 升级后签名变化，都会让 osascript 突然
 # 开始返回 "osascript is not allowed assistive access (-1719/-25211)"。
@@ -1024,7 +1023,7 @@ def _ax_window_selector(hwnd):
     return f"window {seq}"
 
 
-def _ax_window_by_geometry(app, rect, name=None):
+def _ax_window_by_geometry(app, rect, name=None, seq=None):
     """按几何在 AX 窗口列表里找出对应的 window N 选择子。
 
     CG 的窗口枚举（list_windows_front_to_back）与 AppleScript 的 AX 窗口
@@ -1035,6 +1034,9 @@ def _ax_window_by_geometry(app, rect, name=None):
 
     做法：枚举该应用所有 AX 窗口的位置/尺寸，取与目标矩形最接近的那个，
     返回 "window N"。找不到时返回 None，让调用方回退到按序号。
+
+    seq: hwnd 里的显式序号。带序号说明用户在界面上点名了「第 seq 个同名
+    窗口」，兜底阶段不能改用主窗口，否则 #3 的几何会写到 #1 上。
     """
     if not rect or rect == (0, 0, 0, 0):
         return None
@@ -1077,17 +1079,23 @@ def _ax_window_by_geometry(app, rect, name=None):
         return None
     # 偏差过大（超过 64px 总和）说明几何已变（窗口被移动过），匹配不可信
     if best_dev > 64:
-        by_name = _ax_window_by_name(app, name)
+        by_name = _ax_window_by_name(app, name, seq=seq)
         if by_name:
             logger.info("AX 几何匹配偏差过大 (%d)，改用窗口名匹配 -> %s",
                         best_dev, by_name)
             return by_name
+        if not seq:
+            main = _ax_main_window(app)
+            if main:
+                logger.info("AX 几何匹配偏差过大 (%d)，改用主窗口匹配 -> %s",
+                            best_dev, main)
+                return main
         logger.info("AX 几何匹配偏差过大 (%d)，回退按序号", best_dev)
         return None
     return f"window {best}"
 
 
-def _ax_window_by_name(app, name):
+def _ax_window_by_name(app, name, seq=None):
     """按窗口名在 AX 窗口列表里找 window N（几何匹配失效时的兜底）。
 
     几何匹配失效时不能直接回退 window 1：真机 Chrome 的 EchoID 主窗口在
@@ -1126,7 +1134,82 @@ def _ax_window_by_name(app, name):
                 best, best_len = i, len(n)
     if best is None and len(names) == 1:
         return "window 1"
-    return f"window {best}" if best else None
+    if best:
+        return f"window {best}"
+    if not seq:
+        main = _ax_main_window(app)
+        if main:
+            logger.info("AX 名字匹配不到 %r，改用主窗口匹配 -> %s", want, main)
+            return main
+    return None
+
+
+def _ax_main_window(app):
+    """按 subrole/AXMain 找应用的主窗口选择子。
+
+    Electron 应用常在 window 1 位置放一个输入法/悬浮小面板（ChatGPT 实测
+    window 1 是 84x77 的输入法切换面板、subrole=AXDialog），真正的主窗口
+    反而是 window 2。几何与名字都匹配不上时，如果直接退化成 window 1，
+    几何就会被写到那个小面板上——用户看到的就是「这扇窗完全推不动」。
+    这里按 AX 语义挑主窗：优先 subrole=AXStandardWindow，其次 AXMain=true，
+    最后才退 window 1。
+    """
+    script = (
+        'tell application "System Events"\n'
+        '  tell process "' + app + '"\n'
+        '    set out to ""\n'
+        '    repeat with i from 1 to (count of windows)\n'
+        '      set w to window i\n'
+        '      set sr to ""\n'
+        '      try\n'
+        '        set sr to subrole of w\n'
+        '      end try\n'
+        '      set mn to ""\n'
+        '      try\n'
+        '        set mn to (value of attribute "AXMain" of w) as text\n'
+        '      end try\n'
+        '      set sz to size of w\n'
+        '      set out to out & i & "," & sr & "," & mn & "," & '
+        '(item 1 of sz) & "," & (item 2 of sz) & ";"\n'
+        '    end repeat\n'
+        '  end tell\n'
+        'end tell\n'
+        'return out'
+    )
+    raw = _osa(script)
+    if not raw:
+        return None
+    standard_idx, main_idx, fallback_idx = None, None, None
+    for item in raw.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(",")
+        if len(parts) < 5:
+            continue
+        try:
+            idx = int(parts[0])
+        except ValueError:
+            continue
+        subrole, is_main = parts[1], parts[2]
+        try:
+            width, height = int(parts[3]), int(parts[4])
+        except ValueError:
+            width, height = 0, 0
+        if fallback_idx is None:
+            fallback_idx = idx
+        if standard_idx is None and subrole == "AXStandardWindow":
+            standard_idx = idx
+        if (main_idx is None and is_main in ("1", "true")
+                and (width >= 160 and height >= 120)):
+            main_idx = idx
+    if standard_idx is not None:
+        return f"window {standard_idx}"
+    if main_idx is not None:
+        return f"window {main_idx}"
+    if fallback_idx is not None:
+        return f"window {fallback_idx}"
+    return None
 
 
 def _wait_rect_stable(hwnd, timeout=1.5, interval=0.08, need=3):
@@ -1204,7 +1287,7 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
             pass
     app2, nm, _sq = parse_hwnd(hwnd)
     known = _fresh if (_fresh and _fresh != (0, 0, 0, 0)) else _last_rect.get(hwnd)
-    win_sel = (_ax_window_by_geometry(app2, known, nm)
+    win_sel = (_ax_window_by_geometry(app2, known, nm, seq=_sq)
                or _ax_window_selector(hwnd))
     # 优先按几何在 AX 窗口列表里定位：CG 枚举顺序与 AX 顺序未必一致，
     # 只按 hwnd 序号选窗口会把几何写到别的窗口上（见 _ax_window_by_geometry）
@@ -2568,7 +2651,7 @@ def _readback_rect(hwnd, target):
     # CG 没有该窗口（可能在别的 Space / 刚被系统隐藏）：走 AX 直读，
     # 选择子与 set_window_rect 相同——按已知几何匹配，读的就是写的那个。
     known = _last_rect.get(hwnd) or target
-    sel = (_ax_window_by_geometry(app, known, name)
+    sel = (_ax_window_by_geometry(app, known, name, seq=seq)
            or _ax_window_selector(hwnd) or "window 1")
     rect = _ax_read_rect(app, sel)
     if rect:
@@ -2636,7 +2719,7 @@ def _probe_min_size(hwnd, at_x, at_y):
     # 探测用的选择子在探测前算好：探测会把窗口缩得很小，之后任何按几何
     # 匹配都会因偏差过大而失效（真机实测偏差 2939），序号选择又会落到别的
     # 同名窗口上——这正是「四宫格把窗口送到 Sidecar」的根因。
-    sel = (_ax_window_by_geometry(app, _last_rect.get(hwnd), name)
+    sel = (_ax_window_by_geometry(app, _last_rect.get(hwnd), name, seq=_seq)
            or _ax_window_selector(hwnd) or "window 1")
     # 第一次必须读到一个明显大于目标的值；没到说明这条路探不出真实下限。
     first = _probe_resize(hwnd, app, sel, at_x, at_y,
@@ -4233,7 +4316,7 @@ def raise_window(hwnd):
         return False
     app, nm, _sq = parse_hwnd(hwnd)
     known = _last_rect.get(hwnd)
-    win_sel = (_ax_window_by_geometry(app, known, nm)
+    win_sel = (_ax_window_by_geometry(app, known, nm, seq=_sq)
                or _ax_window_selector(hwnd))
     try:
         _osa(
