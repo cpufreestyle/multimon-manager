@@ -86,14 +86,64 @@ class TestFixedDockWorkArea(unittest.TestCase):
         self.assertLessEqual(mons[1].work_top + mons[1].work_height,
                              750 - mm.DOCK_SAFETY_PT)
 
-    def test_autohide_does_not_reserve_space(self):
-        m = _mon()
+    def test_autohide_reclaims_stale_dock_inset(self):
+        """Dock 自动隐藏后，visibleFrame 里残留的 Dock 边距必须收回。
+
+        这是 Rectangle 在 #467 里记过的同款问题：AppKit 的 visibleFrame 在
+        Dock 切到自动隐藏后可能仍是旧值。不收回的话，窗口与屏幕底边之间永远
+        留一条 52pt 的缝，用户看到的是「排完没铺满」。
+        """
+        m = _mon()          # work 底边 930，屏幕底边 982 -> 残留 52pt
         with mock.patch.object(da, "get_autohide", return_value=True), \
                 mock.patch.object(da, "get_panel_rect",
                                   return_value=(25, 926, 1462, 46)) as panel:
             mm._apply_dock_avoidance([m])
-        self.assertEqual(m.work_rect, (0, 34, 1512, 896))
+        self.assertEqual(m.work_rect, (0, 34, 1512, 948))
+        self.assertEqual(m.work_top, 34, "菜单栏那条不能被收回")
         panel.assert_not_called()
+
+    def test_autohide_preserves_small_reveal_inset(self):
+        """小于 8pt 的边距是「触边唤出 Dock」的感应条，必须保留。"""
+        m = _mon(work_height=944)   # 底边 978 -> 只差 4pt
+        with mock.patch.object(da, "get_autohide", return_value=True):
+            mm._apply_dock_avoidance([m])
+        self.assertEqual(m.work_rect, (0, 34, 1512, 944))
+
+    def test_autohide_reclaims_side_insets_too(self):
+        """左/右 Dock 自动隐藏后，两侧的过期边距同样要收回。"""
+        m = _mon(work_left=82, work_width=1430, work_height=948)
+        with mock.patch.object(da, "get_autohide", return_value=True):
+            mm._apply_dock_avoidance([m])
+        self.assertEqual(m.work_rect, (0, 34, 1512, 948))
+
+    def test_panel_must_cover_half_of_a_screen(self):
+        """面板大半悬在屏外时不是 Dock 本体（多半是浮层），不许拿它裁工作区。"""
+        m = _mon()
+        panel = (1400, 900, 400, 40)    # 只有 112x40 落在屏内
+        with mock.patch.object(da, "get_autohide", return_value=False), \
+                mock.patch.object(da, "get_panel_rect", return_value=panel):
+            mm._apply_dock_avoidance([m])
+        self.assertEqual(m.work_rect, (0, 34, 1512, 896))
+
+    def test_ambiguous_panel_across_two_screens_is_skipped(self):
+        """面板同时压住两块屏（交集打平）时归属不可靠，整轮跳过。"""
+        a = _mon()
+        b = _mon(name="Mirror")
+        panel = (500, 900, 500, 50)
+        with mock.patch.object(da, "get_autohide", return_value=False), \
+                mock.patch.object(da, "get_panel_rect", return_value=panel):
+            mm._apply_dock_avoidance([a, b])
+        self.assertEqual(a.work_rect, (0, 34, 1512, 896))
+        self.assertEqual(b.work_rect, (0, 34, 1512, 896))
+
+    def test_oversized_panel_inset_is_ignored(self):
+        """厚度超过屏幕 1/3 的「面板」不是 Dock，宁可不动工作区。"""
+        m = _mon()
+        panel = (0, 480, 1512, 500)
+        with mock.patch.object(da, "get_autohide", return_value=False), \
+                mock.patch.object(da, "get_panel_rect", return_value=panel):
+            mm._apply_dock_avoidance([m])
+        self.assertEqual(m.work_rect, (0, 34, 1512, 896))
 
     def test_panel_failure_falls_back_to_visible_frame_inset(self):
         m = _mon()

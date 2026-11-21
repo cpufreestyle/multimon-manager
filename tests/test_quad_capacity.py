@@ -77,6 +77,9 @@ class QuadCapacityTest(unittest.TestCase):
         cap = self._cap(list(REAL), [RV200, BUILTIN, DELL_V])
         self.assertEqual((cap["fit"], cap["total"]), (2, 4))
         self.assertEqual(cap["need"], (1539, 1266))
+        # 宽 1539 <= 1600 装得下；高 1266 > 870 差 396px —— 这才是「为什么
+        # 排不满」的可操作答案，不用用户自己拿工作区去减。
+        self.assertEqual(cap["deficit"], {"w": 0, "h": 396})
         self.assertEqual(cap["uncached"], [])
         self.assertEqual(cap["screen"], "RV200 Pro")
         self.assertEqual(cap["work"], (1600, 870))
@@ -175,6 +178,27 @@ class QuadCapacityTextTest(unittest.TestCase):
         t = ui.App._quad_capacity_text(
             {"fit": 2, "total": 4, "screen": "RV200 Pro", "work": (1600, 870),
              "need": (1539, 1266), "uncached": []})
+        self.assertEqual(t, "最多排 2/4 · 需1539×1266（RV200 Pro）")
+
+    def test_deficit_replaces_raw_need(self):
+        """有缺口明细时直接说差在哪一轴、差多少像素。"""
+        t = ui.App._quad_capacity_text(
+            {"fit": 2, "total": 4, "screen": "RV200 Pro", "work": (1600, 870),
+             "need": (1539, 1266), "deficit": {"w": 0, "h": 396},
+             "uncached": []})
+        self.assertEqual(t, "最多排 2/4 · 高差396（RV200 Pro）")
+
+    def test_deficit_both_axes(self):
+        t = ui.App._quad_capacity_text(
+            {"fit": 1, "total": 4, "screen": "Small", "work": (800, 600),
+             "need": (900, 700), "deficit": {"w": 100, "h": 100},
+             "uncached": []})
+        self.assertEqual(t, "最多排 1/4 · 宽差100/高差100（Small）")
+
+    def test_no_deficit_falls_back_to_need(self):
+        t = ui.App._quad_capacity_text(
+            {"fit": 2, "total": 4, "screen": "RV200 Pro", "work": (1600, 870),
+             "need": (1539, 1266), "deficit": None, "uncached": []})
         self.assertEqual(t, "最多排 2/4 · 需1539×1266（RV200 Pro）")
 
     def test_alt_screen_hint_wins_over_need(self):

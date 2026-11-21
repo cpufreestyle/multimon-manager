@@ -14,6 +14,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import ui_harness as harness  # noqa: E402 - 抑制构造期真机热键/轮询
 
 try:
     import tkinter as tk
@@ -78,7 +79,7 @@ class TestRehomeUi(unittest.TestCase):
     def setUp(self):
         self.root = tk.Tk()
         self.root.withdraw()
-        self.app = ui.App(self.root)
+        self.app = harness.build_app(ui, self.root)
         self.mons = [_Mon(0, 33, 1512, 887, "Built-in", "test-builtin"),
                      _Mon(-1080, -1050, 1080, 1920, "DELL", "test-dell")]
         self.app.monitors = list(self.mons)
@@ -136,10 +137,7 @@ class TestRehomeUi(unittest.TestCase):
             os.remove(self._tmp)
         except OSError:
             pass
-        try:
-            self.root.destroy()
-        except Exception:  # noqa: BLE001
-            pass
+        harness.close_app(self.root, self.app)
 
     def _packed(self, widget):
         """packer 是否真的给这个控件排了位置。

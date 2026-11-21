@@ -19,6 +19,7 @@ import quad_plan
 import grid_plan
 import rehome
 import keep_awake
+import power_guard
 import settings
 import layouts
 import screen_math
@@ -294,6 +295,7 @@ class App:
         self._build_hotkeys(self._tab_settings)
         self._build_autostart(self._tab_settings)
         self._build_keep_awake(self._tab_settings)
+        self._build_power_guard(self._tab_settings)
         self._build_backup(self._tab_settings)
         self._build_display_watch(self._tab_settings)
 
@@ -833,6 +835,14 @@ class App:
         unstash_btn.pack(side="left", padx=1)
         self._tooltip(unstash_btn,
                       "取回最早暂存的窗口到它原来的位置（快捷键 ⌘⌥+D）")
+        probe_btn = ttk.Button(snap_rows[2], text="测最小尺寸",
+                               command=self._probe_min_sizes)
+        probe_btn.pack(side="left", padx=(8, 1))
+        self._tooltip(
+            probe_btn,
+            "把下面点名过的窗口逐个缩到最小再读回，然后放回原位置——"
+            "这样并排/竖排/网格的容量提示第一次就有依据。"
+            "每个窗口约 0.6~1.2 秒，会看到窗口短暂缩小。")
         # 窗口间距：吸附/排列时窗口之间、窗口与屏幕边之间留出缝隙。
         # 借鉴 Rectangle Pro 的 GapCalculation：间距一是让四格清清楚楚分开，
         # 二是吸收 App 最小尺寸把窗口顶大时的溢出，避免立刻越界被搬屏。
@@ -1184,6 +1194,10 @@ class App:
             grid_row, textvariable=self.grid_layout_var, state="readonly",
             width=13, values=list(grid_plan.layout_labels()))
         self.grid_layout_cb.pack(side="left", padx=(4, 2))
+        # 换布局/换行列数/勾选屏都要立刻刷新容量预检：否则用户看到的还是
+        # 上一个布局的结论，比不显示更糟。
+        self.grid_layout_cb.bind("<<ComboboxSelected>>",
+                                 lambda e: self._update_grid_capacity())
         self._tooltip(
             self.grid_layout_cb,
             "网格形状。等分（2×2 / 3×2 / 3×3）= 每格一样大；"
@@ -1235,6 +1249,16 @@ class App:
         self._grid_checks = []
         self._grid_check_widgets = []
         self._rebuild_grid_checks()
+        # 容量预检：与四格同一套路——只读缓存的最小尺寸，在点「网格批排」
+        # 之前就说清最多排几个、差多少像素。必须最后 pack 并 fill/expand：
+        # 固定控件（屏勾选框）先拿到自己的宽度，长文案只截断自己，不会把
+        # 勾选框挤出可视区（「按钮点了没效果」的老坑）。
+        self.grid_cap_var = tk.StringVar(value="")
+        self._grid_cap_lb = ttk.Label(
+            grid_row2, textvariable=self.grid_cap_var,
+            font=("Helvetica", 8), foreground="#777")
+        self._grid_cap_lb.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self._update_grid_capacity()
 
     def _on_gap_change(self):
         """窗口间距改动即存盘：吸附/排列函数每次都会重新读设置。"""
@@ -1354,6 +1378,8 @@ class App:
                 var.set(AUTO_MON)
         # 跨屏铺满的勾选框按 device_path 保留勾选（显示器增减后仍对得上）
         self._rebuild_spread_checks()
+        # 屏变了，网格的虚拟桌面与容量都变了
+        self._update_grid_capacity()
 
     def _rebuild_spread_checks(self):
         """重建跨屏铺满的屏勾选框，尽量保留原有勾选。
@@ -1494,6 +1520,9 @@ class App:
             target = spread_by_path.get(m.device_path)
             if var is not None and target is not None:
                 target.set(bool(var.get()))
+        _upd = getattr(self, "_update_grid_capacity", None)
+        if _upd is not None:
+            _upd()
         if not idx:
             self.status_var.set("未选择任何屏（至少勾一块才能排网格）")
             return
@@ -1507,6 +1536,47 @@ class App:
         """改自定义行列数时把布局切到「自定义」：否则预设会把这两个数盖掉。"""
         if self.grid_layout_var.get() != GRID_LAYOUT_CUSTOM:
             self.grid_layout_var.set(GRID_LAYOUT_CUSTOM)
+        _upd = getattr(self, "_update_grid_capacity", None)
+        if _upd is not None:
+            _upd()
+
+    def _update_grid_capacity(self):
+        """刷新网格容量预检：只读后端缓存，不动任何窗口。"""
+        var = getattr(self, "grid_cap_var", None)
+        if var is None:
+            return
+        try:
+            cols, rows, label = self._grid_layout_args()
+            cap = b.grid_capacity(cols=cols, rows=rows, layout=label,
+                                  monitor_indices=self._grid_indices())
+        except Exception:  # noqa: BLE001 预检失败不该影响界面
+            cap = None
+        try:
+            var.set(self._grid_capacity_text(cap))
+        except Exception:  # noqa: BLE001
+            var.set("")
+
+    @staticmethod
+    def _grid_capacity_text(cap):
+        """grid_capacity 的返回值 → 一行小字；None 时返回空串。"""
+        if not cap:
+            return ""
+        fit, total = cap.get("fit") or 0, cap.get("total") or 0
+        if not total:
+            return ""
+        head = "%d/%d 可排" % (fit, total)
+        dw = (cap.get("deficit") or {}).get("w") or 0
+        dh = (cap.get("deficit") or {}).get("h") or 0
+        bits = []
+        if dw:
+            bits.append("宽差%d" % dw)
+        if dh:
+            bits.append("高差%d" % dh)
+        if bits:
+            head += " · " + "/".join(bits)
+        if cap.get("uncached"):
+            head += "，%d 个未探测" % len(cap["uncached"])
+        return head
 
     def _on_grid_smart_toggle(self):
         self.status_var.set(
@@ -1564,6 +1634,11 @@ class App:
         if notes:
             head += "｜ " + "；".join(notes[:3])
         self.status_var.set(head)
+        # 这次刚探测过最小尺寸（缓存已更新），容量预检跟着刷新：用户接着换
+        # 布局时看到的是最新事实，不是排布前的旧值。
+        _upd = getattr(self, "_update_grid_capacity", None)
+        if _upd is not None:
+            _upd()
 
     def _move_to_selected_monitor(self):
         """把目标/活动窗口一次移动到下拉框选中的显示器。"""
@@ -1609,11 +1684,107 @@ class App:
             mon = (self.monitors[mon_idx]
                    if mon_idx is not None and mon_idx < len(self.monitors) else None)
             if mon is not None and mon.height > mon.width:
-                self.status_var.set(f"竖屏已上下堆叠（{mon_label}）")
+                msg = f"竖屏已上下堆叠（{mon_label}）"
             else:
-                self.status_var.set("已并排左右" + (f"（{mon_label}）" if mon_idx is not None else ""))
+                msg = ("已并排左右"
+                       + (f"（{mon_label}）" if mon_idx is not None else ""))
+            note = ""
+            try:
+                note = self._line_capacity_note([left, right], "auto", mon_idx)
+            except Exception:  # noqa: BLE001  预检失败不影响排布结果
+                note = ""
+            self.status_var.set(msg + note)
         else:
             self.status_var.set(self._snap_failed_msg("并排", "两个"))
+
+    def _capacity_probe_targets(self):
+        """要探测最小尺寸的窗口：界面上点名过的优先，一个都没点名取最前 4 个。"""
+        out = []
+
+        def add(h):
+            if h and h not in out:
+                out.append(h)
+
+        smap = getattr(self, "_quad_short_map", {}) or {}
+        for v in (getattr(self, "quad_tl_var", None),
+                  getattr(self, "quad_tr_var", None),
+                  getattr(self, "quad_bl_var", None),
+                  getattr(self, "quad_br_var", None)):
+            if v is not None:
+                add(smap.get(v.get()))
+        tmap = getattr(self, "_target_map", {}) or {}
+        for v in (getattr(self, "sbs_left_var", None),
+                  getattr(self, "sbs_right_var", None),
+                  getattr(self, "stack_top_var", None),
+                  getattr(self, "stack_mid_var", None),
+                  getattr(self, "stack_bot_var", None),
+                  getattr(self, "target_var", None)):
+            if v is not None:
+                add(tmap.get(v.get()))
+        if out:
+            return out[:8]
+        try:
+            wins = b.list_target_windows()
+        except Exception:  # noqa: BLE001
+            return []
+        for w in wins[:4]:
+            add(w.get("hwnd"))
+        return out[:8]
+
+    def _probe_min_sizes(self):
+        """主动实测并缓存最小尺寸，让容量提示在首次使用时也有依据。"""
+        fn = getattr(b, "probe_min_sizes", None)
+        if fn is None:
+            self.status_var.set("当前平台暂不支持最小尺寸探测")
+            return
+        hwnds = self._capacity_probe_targets()
+        if not hwnds:
+            self.status_var.set(
+                "没有可探测的窗口：先在并排/竖排/四格里点名，或打开几个应用")
+            return
+        self.status_var.set(
+            "正在探测 %d 个窗口的最小尺寸（会短暂缩小后复位）…" % len(hwnds))
+        # 先把状态栏刷出来再进阻塞探测：否则界面看起来像卡死。
+        try:
+            self.root.update_idletasks()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            res = fn(hwnds) or {}
+        except Exception as e:  # noqa: BLE001
+            self.status_var.set(f"最小尺寸探测失败：{e}")
+            return
+        probed = int(res.get("probed") or 0)
+        failed = int(res.get("failed") or 0)
+        missing = int(res.get("missing") or 0)
+        parts = ["已探测 %d 个窗口的最小尺寸" % probed]
+        if failed:
+            parts.append("%d 个读不到" % failed)
+        if missing:
+            parts.append("%d 个已关闭" % missing)
+        parts.append("容量提示已更新")
+        self.status_var.set("，".join(parts))
+        # 缓存刚更新：四格与网格的预检跟着刷新
+        self._update_quad_capacity()
+        self._update_grid_capacity()
+
+    def _line_capacity_note(self, hwnds, axis, mon_idx):
+        """并排/竖排完成后，如果两个/三个窗口的最小尺寸本就装不下，补一句实话。
+
+        这类「排完互相压着」的根因是 App 的最小窗口尺寸（真机 ChatGPT 高
+        600、Qoder CN 540，三段合计已超 900 高的副屏），不是坐标算错。
+        状态栏直接报出「最小高合计 X > 屏 Y」，用户才知道该少放一个。
+        依赖上次排布缓存的最小尺寸；没缓存时返回空串，行为与以前一致。
+        """
+        try:
+            cap = b.line_capacity(hwnds, axis=axis, monitor=mon_idx)
+        except Exception:  # noqa: BLE001  预检失败不能影响排布结果
+            return ""
+        if not cap or not cap.get("deficit"):
+            return ""
+        unit = "宽" if cap.get("axis") == "row" else "高"
+        return ("｜ 最小%s合计 %dpx > 屏 %dpx，窗口会被各自下限顶开"
+                % (unit, cap.get("need") or 0, cap.get("available") or 0))
 
     def _snap_failed_msg(self, what, need):
         """排列失败时的状态栏文案。
@@ -1662,7 +1833,14 @@ class App:
         mon_idx = self._monitor_map.get(self.stack_mon_var.get())
         mon_label = self.stack_mon_var.get()
         if b.snap_three_stack(top_hwnd=top, mid_hwnd=mid, bot_hwnd=bot, monitor=mon_idx):
-            self.status_var.set("已竖排上中下" + (f"（{mon_label}）" if mon_idx is not None else ""))
+            msg = ("已竖排上中下"
+                   + (f"（{mon_label}）" if mon_idx is not None else ""))
+            note = ""
+            try:
+                note = self._line_capacity_note([top, mid, bot], "col", mon_idx)
+            except Exception:  # noqa: BLE001
+                note = ""
+            self.status_var.set(msg + note)
         else:
             self.status_var.set(self._snap_failed_msg("竖排", "三个"))
 
@@ -1855,7 +2033,19 @@ class App:
         if alt.get("screen"):
             head += " · 换%s可排满" % alt["screen"]
         elif need:
-            head += " · 需%d×%d" % (need[0], need[1])
+            # 差在哪一轴、差多少像素：比「需 1539×1266」直接——用户不用自己
+            # 拿工作区去减。两轴都差时并排写，文案长度仍在容量标签的余量内。
+            dw = (cap.get("deficit") or {}).get("w") or 0
+            dh = (cap.get("deficit") or {}).get("h") or 0
+            gaps = []
+            if dw:
+                gaps.append("宽差%d" % dw)
+            if dh:
+                gaps.append("高差%d" % dh)
+            if gaps:
+                head += " · " + "/".join(gaps)
+            else:
+                head += " · 需%d×%d" % (need[0], need[1])
         head += "（%s）" % scr
         if cap.get("uncached"):
             head += "，%d 个未探测" % len(cap["uncached"])
@@ -3416,6 +3606,132 @@ class App:
         self.status_var.set(text)
         messagebox.showerror("隐藏 Dock 栏失败", text)
 
+    def _build_power_guard(self, parent):
+        """省电守护 + Dock 弹出速度。两者都会改变系统/用户行为，默认全关。"""
+        f = ttk.LabelFrame(parent, text="省电守护 / Dock 速度")
+        f.pack(fill="x", padx=6, pady=3)
+        s = settings.load()
+        self._power_throttle = False
+        self._power_last_check = 0.0
+        self._power_decision = None
+        self._power_status_var = tk.StringVar(value="省电守护：关闭")
+        self._power_enabled = tk.BooleanVar(
+            value=bool(s.get("power_guard_enabled", False)))
+
+        row = ttk.Frame(f)
+        row.pack(fill="x", padx=4, pady=2)
+        ttk.Checkbutton(
+            row, text="低电量 / 过热时暂停壁纸轮换、降低窗口轮询频率",
+            variable=self._power_enabled,
+            command=self._on_power_guard_toggle).pack(side="left")
+        ttk.Label(f, textvariable=self._power_status_var, foreground="#555",
+                  wraplength=620, justify="left").pack(anchor="w", padx=4)
+        ttk.Label(
+            f,
+            text="判据：电量 ≤ 20% 且未接电，或系统热状态达到「严重」。读不到数据时"
+                 "显示「状态未知」，不会误停功能；不动防休眠档位。",
+            wraplength=620, justify="left").pack(anchor="w", padx=4, pady=(0, 4))
+
+        drow = ttk.Frame(f)
+        drow.pack(fill="x", padx=4, pady=2)
+        ttk.Label(drow, text="Dock 弹出速度:").pack(side="left")
+        labels = [power_guard.DOCK_PRESET_LABELS[n]
+                  for n in power_guard.DOCK_PRESETS]
+        current = s.get("dock_speed_preset", power_guard.DEFAULT_PRESET)
+        if current not in power_guard.DOCK_PRESETS:
+            current = power_guard.DEFAULT_PRESET
+        self._dock_preset_var = tk.StringVar(
+            value=power_guard.DOCK_PRESET_LABELS[current])
+        self._dock_preset_cb = ttk.Combobox(
+            drow, textvariable=self._dock_preset_var, state="readonly",
+            width=28, values=labels)
+        self._dock_preset_cb.pack(side="left", padx=4)
+        ttk.Button(drow, text="应用",
+                   command=self._on_dock_speed_apply).pack(side="left", padx=2)
+        ttk.Button(drow, text="恢复系统默认",
+                   command=self._on_dock_speed_restore).pack(side="left", padx=2)
+        self._dock_status_var = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self._dock_status_var, foreground="#555",
+                  wraplength=620, justify="left").pack(anchor="w", padx=4, pady=(0, 2))
+        ttk.Label(
+            f,
+            text="修改的是 macOS 全局 Dock 偏好并会重启 Dock（图标会闪一下）。"
+                 "应用前自动备份原值；「恢复系统默认」按备份还原。",
+            wraplength=620, justify="left").pack(anchor="w", padx=4, pady=(0, 2))
+        if self._power_enabled.get():
+            self._power_guard_tick()
+
+    def _on_power_guard_toggle(self):
+        s = settings.load()
+        s["power_guard_enabled"] = bool(self._power_enabled.get())
+        settings.save(s)
+        if not s["power_guard_enabled"]:
+            self._power_throttle = False
+            self._power_decision = None
+            self._power_status_var.set("省电守护：已关闭")
+        else:
+            self._power_last_check = 0.0
+            self._power_guard_tick()
+
+    def _power_guard_tick(self):
+        """低频（30s）读系统状态；返回是否收手。关闭时零系统调用。"""
+        if not getattr(self, "_power_enabled", None) or not self._power_enabled.get():
+            return False
+        now = time.monotonic()
+        if self._power_decision is not None and now - self._power_last_check < 30.0:
+            return self._power_throttle
+        self._power_last_check = now
+        snap = power_guard.collect_snapshot()
+        decision = power_guard.evaluate(snap)
+        previous = self._power_throttle
+        self._power_decision = decision
+        self._power_throttle = decision.throttle
+        self._power_status_var.set(decision.summary())
+        if decision.throttle != previous:
+            logger.info("省电守护状态变化: %s", decision.summary())
+        return decision.throttle
+
+    def _dock_preset_name(self):
+        for name, label in power_guard.DOCK_PRESET_LABELS.items():
+            if label == self._dock_preset_var.get():
+                return name
+        return power_guard.DEFAULT_PRESET
+
+    def _on_dock_speed_apply(self):
+        name = self._dock_preset_name()
+        if name == power_guard.DEFAULT_PRESET:
+            self._on_dock_speed_restore()
+            return
+        if not messagebox.askyesno(
+                "修改 Dock 偏好",
+                "这会写入 macOS 全局 Dock 设置并重启 Dock（图标会闪一下）。\n\n"
+                "应用前会保存原值，随时可用「恢复系统默认」还原。继续吗？"):
+            return
+        ok, detail, backup = power_guard.apply_preset(name)
+        if ok and isinstance(backup, dict):
+            s = settings.load()
+            s["dock_speed_backup"] = backup
+            s["dock_speed_preset"] = name
+            settings.save(s)
+        self._dock_status_var.set(detail)
+        if not ok:
+            messagebox.showwarning("未能应用 Dock 速度", detail)
+
+    def _on_dock_speed_restore(self):
+        s = settings.load()
+        backup = s.get("dock_speed_backup")
+        if not isinstance(backup, dict):
+            self._dock_status_var.set("没有本程序保存的原值备份，未改动系统")
+            return
+        ok, detail = power_guard.restore(backup)
+        if ok:
+            s["dock_speed_backup"] = None
+            s["dock_speed_preset"] = power_guard.DEFAULT_PRESET
+            settings.save(s)
+            self._dock_preset_var.set(
+                power_guard.DOCK_PRESET_LABELS[power_guard.DEFAULT_PRESET])
+        self._dock_status_var.set(detail)
+
     def _build_keep_awake(self, parent):
         """防休眠（复刻 LayoutKeeper 的 KeepAwake）：合盖/拔电/锁屏时继续干活。"""
         f = ttk.LabelFrame(parent, text="防休眠")
@@ -4699,6 +5015,10 @@ class App:
             return
         if not cfg["enabled"] or not cfg["items"]:
             return
+        if getattr(self, "_power_throttle", False):
+            # 省电守护：跳过本轮壁纸切换，但保持调度，恢复后自动继续。
+            self._slideshow_schedule(cfg["interval"])
+            return
         p = slideshow.next_path()
         position = cfg["position"]
         interval = cfg["interval"]
@@ -4877,6 +5197,16 @@ class App:
         Tk 主循环并发容易踩原生崩溃，这里第一版先保留轮询兜底，
         后续版本再做事件驱动。
         """
+        # 省电守护：收手时跳过本轮全量 AX 窗口枚举与情景定时（最耗电的一块），
+        # 改成 5s 低频轮询；供电恢复 / 降温后自动回到 1.5s，功能不丢。
+        throttle = False
+        try:
+            throttle = self._power_guard_tick()
+        except Exception:  # noqa: BLE001 - 守护失败不能拖垮主轮询
+            logger.debug("省电守护检查失败", exc_info=True)
+        if throttle:
+            self.root.after(5000, self._poll_rules)
+            return
         try:
             auto = (getattr(self, "rules_auto", None) is not None
                     and self.rules_auto.get())

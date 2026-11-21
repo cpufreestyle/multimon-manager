@@ -73,6 +73,122 @@ def equal_fracs(n):
     return tuple(1.0 / n for _ in range(n))
 
 
+def balanced_band_lengths(total_pixels, constraints, weights=None):
+    """把总长切成 n 段：每段尽量等长，同时落在各自的 [最少, 最多] 内。
+
+    与 Rectangle 的 `GridTiling.balancedBandLengths` 同算法（MIT）：
+    先二分出「每段至少能拿到的基准长度」，再把取整余量补给还没到上限的段。
+    这样各段之和**恰好**等于 `total_pixels`，不会因为逐段取整少 1px 或多 1px。
+
+    constraints: [(最少, 最多), ...]，长度即段数。最多 <= 0 表示不限。
+    weights: 可选的列宽/行高比例（会自动归一化）。不传时各段等长——与
+        Rectangle 原版一致；传了则先按比例分，某段低于下限时优先满足下限，
+        其余段按比例吃剩余。这样「2/3+1/3」这类布局在撑大窄列时不会丢掉
+        用户选的比例。
+
+    返回 (lengths, feasible)：
+      - feasible=True  每段都在自己的区间内，且和恰好等于总长；
+      - feasible=False 整体装不下（某段下限超过上限、下限之和超总长、
+        或上限之和不够分），退回**全等分**并让调用方如实报告——
+        硬给一个越界的解，窗口摆出来只会互相压盖。
+    """
+    total = int(total_pixels)
+    items = list(constraints or [])
+    n = len(items)
+    if n <= 0 or total <= 0:
+        return ([], False)
+    lo, hi = [], []
+    for item in items:
+        try:
+            a, b = item
+        except (TypeError, ValueError):
+            return ([], False)
+        a = max(0, int(a))
+        b = int(b)
+        if b <= 0:
+            b = total
+        lo.append(a)
+        hi.append(max(a, min(b, total)))
+    equal = [total // n + (1 if i < total % n else 0) for i in range(n)]
+    if any(a > b for a, b in zip(lo, hi)) or sum(lo) > total or sum(hi) < total:
+        return (equal, False)
+
+    share = None
+    if weights is not None:
+        try:
+            vals = [max(0.0, float(x)) for x in weights]
+        except (TypeError, ValueError):
+            vals = []
+        if len(vals) == n and sum(vals) > 0:
+            total_w = sum(vals)
+            share = [v / total_w for v in vals]
+    if share is not None:
+        # 二分「单位比例对应多少像素」：k 越大各段越长，单调可二分。
+        low, high = 0, total
+        while low < high:
+            middle = low + (high - low + 1) // 2
+            required = sum(min(b, max(a, int(middle * w)))
+                           for a, b, w in zip(lo, hi, share))
+            if required <= total:
+                low = middle
+            else:
+                high = middle - 1
+        lengths = [min(b, max(a, int(low * w)))
+                   for a, b, w in zip(lo, hi, share)]
+        remainder = total - sum(lengths)
+        while remainder > 0:
+            progressed = False
+            for i in range(n):
+                if remainder <= 0:
+                    break
+                room = hi[i] - lengths[i]
+                if room <= 0:
+                    continue
+                add = min(room, remainder)
+                lengths[i] += add
+                remainder -= add
+                progressed = True
+            if not progressed:
+                break
+        return (lengths, True)
+
+    # 二分：最大的 base，使「每段 clamp 到 [lo, hi]」之和仍不超过总长。
+    low, high = 0, total
+    while low < high:
+        middle = low + (high - low + 1) // 2
+        required = sum(min(b, max(a, middle)) for a, b in zip(lo, hi))
+        if required <= total:
+            low = middle
+        else:
+            high = middle - 1
+    lengths = [min(b, max(a, low)) for a, b in zip(lo, hi)]
+
+    # 余量补给还低于上限的段（与 Rectangle 的 +1 循环同语义，按段宽一次补足）。
+    remainder = total - sum(lengths)
+    while remainder > 0:
+        progressed = False
+        for i in range(n):
+            if remainder <= 0:
+                break
+            room = hi[i] - lengths[i]
+            if room <= 0:
+                continue
+            add = min(room, remainder)
+            lengths[i] += add
+            remainder -= add
+            progressed = True
+        if not progressed:
+            break
+    return (lengths, True)
+
+
+def bands_shortfall(total_pixels, minimums):
+    """这个方向按各段最小尺寸还差多少像素才装得下（0 表示装得下）。"""
+    total = max(0, int(total_pixels))
+    need = sum(max(0, int(v or 0)) for v in (minimums or []))
+    return max(0, need - total)
+
+
 def layout_by_label(label):
     """按显示名取预设的 (列宽比例, 行高比例)；找不到返回 None。"""
     for name, cols, rows in LAYOUTS:
@@ -148,6 +264,45 @@ def grid_cells(vx, vy, vw, vh, col_fracs, row_fracs):
                           cx - prev_x, cy - prev_y))
             prev_x = cx
         prev_y = cy
+    return cells
+
+
+def balanced_grid_cells(vx, vy, vw, vh, col_fracs, row_fracs,
+                        col_mins=None, row_mins=None):
+    """按比例切格，但把低于窗口最小尺寸的列/排撑到下限。
+
+    与 `grid_cells` 的分工：那个严格按比例切，最小尺寸只用于事后判「装不下」；
+    这个在保持比例的前提下，先把某列/某排撑到它能装下的下限，再把剩下的空间
+    按比例分给其它列/排（`balanced_band_lengths(..., weights=...)`）。
+
+    只在「确实有列/排低于下限」时才有意义——没有下限时它与 `grid_cells`
+    可能在 1px 取整上不同，调用方应先用比例切法，确认有列卡住再换这条。
+
+    返回与 `grid_cells` 同构的 [(row, col, x, y, w, h), ...]（行优先，
+    相邻格子严丝合缝：长度由带长算法给出，和恰好等于 vw/vh）。
+    """
+    cols = _norm_fracs(col_fracs, 2)
+    rows = _norm_fracs(row_fracs, 2)
+    if vw <= 0 or vh <= 0:
+        return []
+    cm = [max(0, int(v or 0)) for v in list(col_mins or [])]
+    rm = [max(0, int(v or 0)) for v in list(row_mins or [])]
+    cm += [0] * (len(cols) - len(cm))
+    rm += [0] * (len(rows) - len(rm))
+    xs, _okx = balanced_band_lengths(
+        vw, [(v, 0) for v in cm[:len(cols)]], weights=cols)
+    ys, _oky = balanced_band_lengths(
+        vh, [(v, 0) for v in rm[:len(rows)]], weights=rows)
+    if len(xs) != len(cols) or len(ys) != len(rows):
+        return []
+    cells = []
+    cy = 0
+    for r, rh in enumerate(ys):
+        cx = 0
+        for c, cw in enumerate(xs):
+            cells.append((r, c, vx + cx, vy + cy, cw, rh))
+            cx += cw
+        cy += rh
     return cells
 
 

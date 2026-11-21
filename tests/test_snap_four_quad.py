@@ -1532,12 +1532,49 @@ class TestFillGrid(unittest.TestCase):
     def test_too_small_window_left_in_place(self):
         """最小尺寸放不进格子：该窗口保持原位，说明里点名它。"""
         wins = [_win("A::1"), _win("B::1"), _win("C::1"), _win("D::1")]
-        done, placed, notes = self._run(wins, layout="2×2 四等分",
+        done, placed, notes = self._run(wins, mons=[_Mon(0, 0, 1920, 1080, "S")],
+                                 layout="2×2 四等分",
                                  min_sizes={"A::1": (2000, 2000)})
         self.assertEqual(done, 3)
         self.assertNotIn("A::1", [p[0] for p in placed])
         self.assertTrue(any("A" in n and "放不下" in n for n in notes),
                         "装不下的窗口必须点名：%s" % notes)
+        # 除了点名，还要报整张网格缺多少：A 的最小宽 2000 已超过整屏 1920，
+        # 「宽差」必须出现，用户才知道换更大的屏或减少窗口才有用。
+        self.assertTrue(any("整张网格" in n and "宽差" in n for n in notes),
+                        "缺口要按全部选中窗口算：%s" % notes)
+
+    def test_min_size_widens_its_column(self):
+        """最小宽超过该列比例份额：撑宽那一列，而不是把窗口剔除留空格子。"""
+        wins = [_win("A::1", w=1200, h=600), _win("B::1", w=400, h=600)]
+        done, placed, notes = self._run(
+            wins, mons=[_Mon(0, 0, 1920, 1080, "S")], cols=2, rows=1,
+            min_sizes={"A::1": (1200, 400), "B::1": (300, 300)})
+        self.assertEqual(done, 2, "撑宽列后两个窗口都该排上：%s" % notes)
+        a = next(p for p in placed if p[0] == "A::1")
+        b = next(p for p in placed if p[0] == "B::1")
+        self.assertGreaterEqual(a[3], 1200, "A 的列必须撑到它的最小宽")
+        # 两列仍严丝合缝：A 右缘 + 一个可见 gap == B 左缘，B 右缘贴屏边
+        self.assertEqual(a[1] + a[3] + 12, b[1])
+        self.assertEqual(b[1] + b[3], 1920)
+
+    def test_overlap_after_write_drops_largest(self):
+        """写入后实测仍互相压着：剔除最小面积最大的一扇并如实报告。
+
+        真机四格踩过同款（探测值偏小 -> App 顶大 -> 压住邻居）。网格这里
+        以前只写「装不下」的说明，窗口照样叠着；现在宁可空一格。
+        """
+        wins = [_win("A::1"), _win("B::1"), _win("C::1"), _win("D::1")]
+        done, placed, notes = self._run(
+            wins, mons=[_Mon(0, 0, 1920, 1080, "S")],
+            layout="2×2 四等分",
+            # C 是左下格（0,546,954,534），读回却被撑到 1400 宽 -> 压住右下 D
+            readback={"C::1": (0, 546, 1400, 534)},
+            min_sizes={"A::1": (100, 100), "B::1": (100, 100),
+                       "C::1": (900, 500), "D::1": (100, 100)})
+        self.assertEqual(done, 3, "重叠的那一扇应被剔除：%s" % notes)
+        self.assertTrue(any("C" in n and "重叠" in n for n in notes),
+                        "剔除必须如实说明：%s" % notes)
 
     def test_no_windows(self):
         done, _placed, notes = self._run([])

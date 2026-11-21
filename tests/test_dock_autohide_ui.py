@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import ui_harness as harness  # noqa: E402 - 抑制构造期真机热键/轮询
 
 try:
     import tkinter as tk
@@ -49,7 +50,7 @@ class TestDockAutohideUi(unittest.TestCase):
         self.root.withdraw()
         self.get_patch = mock.patch.object(b, "dock_autohide_get", return_value=False)
         self.get_patch.start()
-        self.app = ui.App(self.root)
+        self.app = harness.build_app(ui, self.root)
         self.app._show_tab("settings")
         self.root.update()
         self.msg = []
@@ -59,10 +60,7 @@ class TestDockAutohideUi(unittest.TestCase):
     def tearDown(self):
         ui.messagebox = self._orig_mb
         self.get_patch.stop()
-        try:
-            self.root.destroy()
-        except Exception:  # noqa: BLE001
-            pass
+        harness.close_app(self.root, self.app)
 
     def test_control_visible_and_initial_value_from_system(self):
         self.assertTrue(self.app.dock_autohide_cb.winfo_ismapped(),

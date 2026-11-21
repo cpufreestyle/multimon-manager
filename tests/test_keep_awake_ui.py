@@ -12,6 +12,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import ui_harness as harness  # noqa: E402 - 抑制构造期真机热键/轮询
 
 try:
     import tkinter as tk
@@ -57,7 +58,7 @@ class TestKeepAwakeUi(unittest.TestCase):
     def setUp(self):
         self.root = tk.Tk()
         self.root.withdraw()
-        self.app = ui.App(self.root)
+        self.app = harness.build_app(ui, self.root)
         self.root.update()
         # 备份 settings，隔离用例之间的写入
         self._set_file = os.path.join(settings.data_dir(), "settings.json")
@@ -85,10 +86,7 @@ class TestKeepAwakeUi(unittest.TestCase):
             pass
         settings._cache["stat"] = None
         settings._cache["data"] = None
-        try:
-            self.root.destroy()
-        except Exception:  # noqa: BLE001
-            pass
+        harness.close_app(self.root, self.app)
 
     def _packed(self, w):
         if w is None:

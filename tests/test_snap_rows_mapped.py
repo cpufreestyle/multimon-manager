@@ -16,6 +16,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import ui_harness as harness  # noqa: E402 - 抑制构造期真机热键/轮询
 
 os.environ.setdefault("MMM_ADVANCED_UI", "1")
 
@@ -31,7 +32,7 @@ SNAP_BUTTONS = (
     "移到上一屏", "移到下一屏", "拉到本屏", "左半", "右半", "上半", "下半",
     "最大化", "居中", "左1/3", "中1/3", "右1/3",
     "左上", "右上", "左下", "右下",
-    "撤销移动", "回摆放位", "释放窗口", "暂存", "取回",
+    "撤销移动", "回摆放位", "释放窗口", "暂存", "取回", "测最小尺寸",
 )
 
 
@@ -54,7 +55,7 @@ class SnapRowsMappedTest(unittest.TestCase):
         # 也不能 withdraw()：窗口未映射时 packer 不受窗口宽度约束，
         # 所有按钮都「放得下」，映射与越界判定全部失真。
         cls.root = tk.Tk()
-        cls.app = ui.App(cls.root)
+        cls.app = harness.build_app(ui, cls.root)
         cls.app.monitors = [_Mon(0, 33, 1512, 891, "Built-in", True),
                             _Mon(1512, -1066, 1152, 2048, "Mi Monitor"),
                             _Mon(-1920, 0, 1920, 1080, "DELL U2414H")]
@@ -64,14 +65,15 @@ class SnapRowsMappedTest(unittest.TestCase):
         w, h = cls.root.minsize()
         cls.root.geometry("%dx%d" % (w, h))
         cls.root.update_idletasks()
-        cls.root.update()
+        # 这里绝不能调 cls.root.update()：本类刻意不 withdraw（窗口未映射时
+        # packer 不受宽度约束，映射/越界判定会失真），而 macOS Tk 对已映射
+        # root 的 update() 会持续处理 Expose/Configure 事件、永不返回。
+        # 2026-11-13 faulthandler 实测栈停在 tkinter/__init__.py:1314。
+        # update_idletasks() 足以完成几何与 packer 映射，实测 0.1s 返回。
 
     @classmethod
     def tearDownClass(cls):
-        try:
-            cls.root.destroy()
-        except Exception:  # noqa: BLE001
-            pass
+        harness.close_app(cls.root, cls.app)
 
     def _buttons(self):
         hits = {}

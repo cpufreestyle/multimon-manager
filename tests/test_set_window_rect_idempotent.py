@@ -54,14 +54,17 @@ class TestIdempotentSetWindowRect(unittest.TestCase):
         self._get = wm.get_window_rect
         self._sleep = time.sleep
         self._push_undo = wm.push_undo
+        self._remember = wm.remember_arranged
         time.sleep = lambda _s: None          # 去掉等待，单测要快
         wm.push_undo = lambda *a, **k: None
+        wm.remember_arranged = lambda *a, **k: None
 
     def tearDown(self):
         wm._osa = self._osa
         wm.get_window_rect = self._get
         time.sleep = self._sleep
         wm.push_undo = self._push_undo
+        wm.remember_arranged = self._remember
 
     def _run(self, start, target, ratio):
         se = _FakeSystemEvents(start, ratio)
@@ -92,6 +95,27 @@ class TestIdempotentSetWindowRect(unittest.TestCase):
         """推进不动（触达可达边界）时应停止，不能无限重试。"""
         se = self._run((0, 0, 800, 600), (1000, 800, 1200, 1000), ratio=0.0)
         self.assertLessEqual(len(se.writes), 4, "无进展时应很快停止，不能空转")
+
+    def test_skips_write_when_already_at_target(self):
+        """已经在目标位置：一次都不该写。
+
+        四格二趟重排会对同一批窗口再写一遍；对没变的窗口重复写既慢，又会
+        在动画中间帧上读回错误尺寸（Rectangle GridTiling.apply 同样只在
+        目标变化时才写）。
+        """
+        se = self._run((100, 200, 800, 600), (100, 200, 800, 600), ratio=1.0)
+        self.assertEqual(se.writes, [], "已在目标位置不应再写")
+
+    def test_one_pixel_shortfall_does_not_rewrite(self):
+        """差 1px 不算没到位：macOS 放大到 Dock 边时会少给 1pt，再写只会把
+        看不见的缝挪到看得见的那一侧。"""
+        se = self._run((101, 199, 799, 601), (100, 200, 800, 600), ratio=1.0)
+        self.assertEqual(se.writes, [])
+
+    def test_three_pixels_off_still_writes(self):
+        """超过 2px 容差仍然要写：这不是取整噪声，是真的没到位。"""
+        se = self._run((103, 200, 800, 600), (100, 200, 800, 600), ratio=1.0)
+        self.assertTrue(se.writes)
 
 
 if __name__ == "__main__":

@@ -339,5 +339,131 @@ class TestLayoutTable(unittest.TestCase):
         self.assertAlmostEqual(sum(got), 1.0, places=6)
 
 
+class TestBalancedBandLengths(unittest.TestCase):
+    """Rectangle `GridTiling.balancedBandLengths` 的移植版。
+
+    契约只有三条，但每条都是真机会踩的：各段之和必须**恰好**等于总长
+    （否则最后一列/行会多一条缝或少一像素）；每段要落在自己的 [最少, 最多]
+    内；整体装不下时必须返回 feasible=False 并退回全等分，而不是给一个
+    越界的解让窗口互相压盖。
+    """
+
+    def test_equal_split_when_no_limits(self):
+        got, ok = gp.balanced_band_lengths(1000, [(0, 0)] * 3)
+        self.assertTrue(ok)
+        self.assertEqual(sum(got), 1000)
+        self.assertEqual(got, [334, 333, 333])
+
+    def test_minimum_is_respected_and_rest_split(self):
+        got, ok = gp.balanced_band_lengths(1000, [(600, 0), (0, 0)])
+        self.assertTrue(ok)
+        self.assertEqual(got, [600, 400])
+
+    def test_three_bands_with_a_big_minimum(self):
+        got, ok = gp.balanced_band_lengths(1000, [(100, 0), (100, 0), (600, 0)])
+        self.assertTrue(ok)
+        self.assertEqual(got, [200, 200, 600])
+        self.assertEqual(sum(got), 1000)
+
+    def test_remainder_goes_to_a_band_with_room(self):
+        got, ok = gp.balanced_band_lengths(1001, [(100, 0), (100, 0), (600, 0)])
+        self.assertTrue(ok)
+        self.assertEqual(sum(got), 1001)
+        self.assertEqual(got[2], 600)
+        self.assertEqual(got[:2], [201, 200])
+
+    def test_maximum_caps_a_band(self):
+        got, ok = gp.balanced_band_lengths(1000, [(0, 300), (0, 0)])
+        self.assertTrue(ok)
+        self.assertEqual(got, [300, 700])
+
+    def test_infeasible_by_minimum_returns_equal_and_flag(self):
+        got, ok = gp.balanced_band_lengths(1000, [(600, 0), (600, 0)])
+        self.assertFalse(ok)
+        self.assertEqual(got, [500, 500])
+        self.assertEqual(sum(got), 1000, "不可行也要保持总长一致")
+
+    def test_infeasible_by_maximum_returns_equal_and_flag(self):
+        got, ok = gp.balanced_band_lengths(1000, [(0, 100), (0, 100)])
+        self.assertFalse(ok)
+        self.assertEqual(got, [500, 500])
+
+    def test_single_band_takes_everything(self):
+        got, ok = gp.balanced_band_lengths(777, [(100, 0)])
+        self.assertTrue(ok)
+        self.assertEqual(got, [777])
+
+    def test_degenerate_inputs(self):
+        self.assertEqual(gp.balanced_band_lengths(0, [(0, 0)]), ([], False))
+        self.assertEqual(gp.balanced_band_lengths(100, []), ([], False))
+        self.assertEqual(gp.balanced_band_lengths(100, [(5,)]), ([], False))
+
+    def test_weights_preserve_ratio(self):
+        got, ok = gp.balanced_band_lengths(1000, [(0, 0), (0, 0)],
+                                          weights=(2, 1))
+        self.assertTrue(ok)
+        self.assertEqual(sum(got), 1000)
+        self.assertEqual(got, [667, 333])
+
+    def test_weights_yield_to_minimum(self):
+        # 2/3 那一列按比例只有 666，但窗口下限 800：先满足下限，余量给另一列。
+        got, ok = gp.balanced_band_lengths(1000, [(800, 0), (0, 0)],
+                                          weights=(2, 1))
+        self.assertTrue(ok)
+        self.assertEqual(got, [800, 200])
+        self.assertEqual(sum(got), 1000)
+
+
+class TestBalancedGridCells(unittest.TestCase):
+    """按最小尺寸反哺切格：列/排撑到下限，其它列按比例吃剩余。"""
+
+    def test_cells_are_contiguous_and_exact(self):
+        cells = gp.balanced_grid_cells(0, 0, 1920, 1080,
+                                       gp.equal_fracs(2), gp.equal_fracs(2),
+                                       [1200, 0], [0, 0])
+        self.assertEqual(len(cells), 4)
+        # 第一列至少 1200，两列加起来正好 1920；两排各 540
+        first = [c for c in cells if c[1] == 0]
+        second = [c for c in cells if c[1] == 1]
+        self.assertGreaterEqual(first[0][4], 1200)
+        self.assertEqual(first[0][4] + second[0][4], 1920)
+        self.assertEqual(first[0][2] + first[0][4], second[0][2])
+        # 上排底边 == 下排顶边（无缝）
+        top = [c for c in cells if c[0] == 0][0]
+        bottom = [c for c in cells if c[0] == 1][0]
+        self.assertEqual(top[3] + top[5], bottom[3])
+        self.assertEqual(top[5] + bottom[5], 1080)
+
+    def test_no_mins_still_exact(self):
+        cells = gp.balanced_grid_cells(10, 20, 1001, 999,
+                                       gp.equal_fracs(3), gp.equal_fracs(2))
+        self.assertEqual(len(cells), 6)
+        right = max(c[2] + c[4] for c in cells)
+        bottom = max(c[3] + c[5] for c in cells)
+        self.assertEqual((right, bottom), (1011, 1019))
+        # 行优先 + 连续
+        for c in cells:
+            self.assertGreaterEqual(c[4], 1)
+            self.assertGreaterEqual(c[5], 1)
+
+    def test_zero_area_returns_empty(self):
+        self.assertEqual(gp.balanced_grid_cells(0, 0, 0, 100,
+                                               gp.equal_fracs(2),
+                                               gp.equal_fracs(2)), [])
+
+
+class TestBandsShortfall(unittest.TestCase):
+    def test_zero_when_fits(self):
+        self.assertEqual(gp.bands_shortfall(1600, [515, 1024]), 0)
+
+    def test_reports_missing_pixels(self):
+        self.assertEqual(gp.bands_shortfall(870, [600, 666]), 396)
+
+    def test_empty_and_negative(self):
+        self.assertEqual(gp.bands_shortfall(0, []), 0)
+        self.assertEqual(gp.bands_shortfall(-5, [10, 20]), 30)
+        self.assertEqual(gp.bands_shortfall(100, [0, None]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

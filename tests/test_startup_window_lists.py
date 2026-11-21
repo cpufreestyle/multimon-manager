@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import backend as b  # noqa: E402
 import settings  # noqa: E402
+import ui_harness as harness  # noqa: E402 - 抑制构造期真机热键/轮询
 
 try:  # ui 依赖 tkinter；无显示环境下降级跳过
     import tkinter as tk  # noqa: E402
@@ -59,10 +60,10 @@ class TestStartupWindowLists(unittest.TestCase):
         self.root.withdraw()
         with mock.patch.object(b, "list_target_windows",
                                return_value=list(FAKE_WINDOWS)):
-            self.app = ui.App(self.root)
+            self.app = harness.build_app(ui, self.root)
 
     def tearDown(self):
-        self.root.destroy()
+        harness.close_app(self.root, self.app)
         if self._had is not None:
             with open(self._set_file, "wb") as f:
                 f.write(self._had)

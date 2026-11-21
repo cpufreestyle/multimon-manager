@@ -23,4 +23,8 @@ pick_python() {
 
 PY="$(pick_python)"
 echo "使用解释器: $PY ($("$PY" -V 2>&1))"
-exec "$PY" -m unittest discover -s tests -q
+# 走带看门狗的入口：界面单测曾因构造期 after 定时器在真机上挂死，外层只能
+# SIGTERM。超时现在是明确的 TEST_SUITE_TIMEOUT + 全线程栈，不是无限等待。
+# 超时上限可用 MMM_TEST_TIMEOUT 覆盖；`"$PY" run_tests_guarded.py --selfcheck`
+# 可反向验证看门狗没被人删掉。
+exec "$PY" run_tests_guarded.py

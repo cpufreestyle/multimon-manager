@@ -11,6 +11,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import ui_harness as harness  # noqa: E402 - 抑制构造期真机热键/轮询
 
 try:
     import tkinter as tk
@@ -53,10 +54,10 @@ class TestUiMode(unittest.TestCase):
 
         self.root = tk.Tk()
         self.root.withdraw()
-        self.app = ui.App(self.root)
+        self.app = harness.build_app(ui, self.root)
 
     def tearDown(self):
-        self.root.destroy()
+        harness.close_app(self.root, self.app)
         if self._had is not None:
             with open(self._set_file, "wb") as f:
                 f.write(self._had)

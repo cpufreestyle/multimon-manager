@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("MMM_ADVANCED_UI", "1")
+import ui_harness as harness  # noqa: E402 - 抑制构造期真机热键/轮询
 
 try:
     import tkinter as tk
@@ -32,17 +33,14 @@ class TestDragTargetWindow(unittest.TestCase):
     def setUp(self):
         self.root = tk.Tk()
         self.root.withdraw()
-        self.app = ui.App(self.root)
+        self.app = harness.build_app(ui, self.root)
 
     def tearDown(self):
         try:
             self.app._stop_drag_snap()
         except Exception:  # noqa: BLE001
             pass
-        try:
-            self.root.destroy()
-        except Exception:  # noqa: BLE001
-            pass
+        harness.close_app(self.root, self.app)
 
     def test_find_window_at_point(self):
         """精准定位点击坐标所在的窗口。"""

@@ -232,6 +232,32 @@ def _exit_fullscreen_for_layout(hwnd, notes):
     return False
 
 
+def _prepare_for_layout(hwnds):
+    """排布前把全屏窗口退回普通窗口；返回 {hwnd: 说明}。
+
+    全屏窗口的尺寸由系统接管，`set position/size` 会返回成功但被静默忽略
+    （真机实测 ChatGPT 全屏：写 1080x640 读回仍是 1600x870，位置一步不动）。
+    四格路径早已逐窗退出全屏，并排/竖排/单窗吸附/网格以前没有——表现就是
+    「点了没反应，但状态栏说已排列」。这里统一收口，退出后刷新缓存的实几何，
+    后续按窗口当前位置算目标才准。
+    """
+    notes = {}
+    for h in hwnds or ():
+        if not h:
+            continue
+        try:
+            n = []
+            if _exit_fullscreen_for_layout(h, n):
+                fresh = _fresh_rect(h)
+                if fresh and fresh != (0, 0, 0, 0):
+                    _last_rect[h] = fresh
+                if n:
+                    notes[h] = n[0]
+        except Exception:  # noqa: BLE001  退出全屏失败不该挡住排布
+            pass
+    return notes
+
+
 class _AppAnimationOff:
     """写入期间临时关掉目标 App 的窗口动画；退出时恢复原值。
 
@@ -1287,13 +1313,30 @@ def set_window_rect(hwnd, x, y, w, h, activate=True):
             pass
     app2, nm, _sq = parse_hwnd(hwnd)
     known = _fresh if (_fresh and _fresh != (0, 0, 0, 0)) else _last_rect.get(hwnd)
+    # 原始目标（content 坐标），闭环全程以此为基准。
+    tx, ty, tw, th = (int(round(v)) for v in (x, y, w, h))
+    # 已经在目标位置就不要再写一遍。Rectangle 的 GridTiling.apply 同样只在
+    # 目标变化时才写窗口：AX 写入是异步动画，重复写同一个值既慢，又会读到
+    # 中间帧（四格二趟重排会把没变的窗口再写一遍，正好踩这个坑）。
+    # 2px 容差与下面的收敛判据一致；_internal（撤销/回位）不读实时几何，
+    # _fresh 为 None 时走原路径。
+    if (_fresh and _fresh != (0, 0, 0, 0)
+            and max(abs(a - b) for a, b
+                    in zip(_fresh, (tx, ty, tw, th))) <= 2):
+        try:
+            remember_arranged(hwnd, (tx, ty, tw, th))
+        except Exception:  # noqa: BLE001
+            pass
+        if activate:
+            _osa(f'tell application "{app2}" to activate')
+        logger.info("移动窗口: %s 已在目标 %s，跳过写入", app2, (tx, ty, tw, th))
+        return
     win_sel = (_ax_window_by_geometry(app2, known, nm, seq=_sq)
                or _ax_window_selector(hwnd))
     # 优先按几何在 AX 窗口列表里定位：CG 枚举顺序与 AX 顺序未必一致，
     # 只按 hwnd 序号选窗口会把几何写到别的窗口上（见 _ax_window_by_geometry）
     app = app2
-    # 原始目标（content 坐标），闭环全程以此为基准，偏差按「实测 - 原始目标」累计
-    tx, ty, tw, th = (int(round(v)) for v in (x, y, w, h))
+    # tx/ty/tw/th 在上面算好（早退判据要用），偏差按「实测 - 原始目标」累计
     # 幂等重设次数上限：下半屏约 3 次命中；整屏高度类（变化量最大）需更多次才触顶
     max_retry = 16
     prev = None
@@ -1488,6 +1531,8 @@ def move_to_monitor(hwnd, monitor, activate=True):
 
 
 def snap(hwnd, monitor, zone, activate=True):
+    # 全屏窗口写不动：先退回普通窗口，再按退回来的几何算目标
+    _prepare_for_layout([hwnd])
     wl, wt, ww, wh = monitor.work_rect
     _x, _y, w, h = get_window_rect(hwnd)
     # 竖屏自动旋转方位（Rectangle Pro 的 OrientationAware）
@@ -1666,6 +1711,9 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, moni
         return False
     right_hwnd = right_w.get("hwnd") or make_hwnd(right_w["owner"], right_w["name"] or "")
 
+    # 全屏窗口写不动（AX 返回成功但几何不变）：先退回普通窗口再算目标。
+    _prepare_for_layout([left_hwnd, right_hwnd])
+
     # 以左侧窗口当前所在的屏幕为准；若显式指定了显示器则用指定的
     idx = _resolve_monitor_index(ms, monitor)
     if idx is None:
@@ -1677,21 +1725,47 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, moni
     _last_rect[right_hwnd] = (right_w["x"], right_w["y"], right_w["w"], right_w["h"])
 
     wl, wt, ww, wh = mon.work_rect
+    # 两扇窗的最小尺寸：竖屏比高、横屏比宽。缓存来自四格/网格排布或
+    # 界面「测最小尺寸」，没有时按 0 计（对半切，与以前完全一致）。
+    try:
+        m2 = [(int((_QUAD_MIN_CACHE.get(h) or (0, 0))[0] or 0),
+               int((_QUAD_MIN_CACHE.get(h) or (0, 0))[1] or 0))
+              for h in (left_hwnd, right_hwnd)]
+    except Exception:  # noqa: BLE001
+        m2 = [(0, 0), (0, 0)]
     if mon.height > mon.width:
-        # 竖屏：左右并排改为上/下堆叠（上半屏 / 下半屏）
-        half_h = wh // 2
-        # 上半屏贴顶：place_tile 补偿系统对顶边的下压（菜单栏），高度补回来
-        # 后底边仍落在 wt+half_h，下半屏不会被压住（下层标题栏被盖 → 拖不动）
-        place_tile(left_hwnd, wl, wt, ww, half_h, activate=True)
-        place_tile(right_hwnd, wl, wt + half_h, ww, wh - half_h, activate=True)
+        # 竖屏：左右并排改为上/下堆叠（上半屏 / 下半屏）。
+        # 与三栏同一套：先满足各自最小高，再扣掉顶边不可达条带（菜单栏），
+        # 否则上半屏被最小高顶大就会压住下半屏的标题栏（拖不动）。
+        key = _top_strip_key(mon)
+        strip = max(0, int(_TOP_STRIP_CACHE.get(key, 0)))
+        for _attempt in range(2):
+            heights = _two_band_lengths(max(1, wh - strip),
+                                        [m2[0][1], m2[1][1]])
+            place_tile(left_hwnd, wl, wt + strip, ww, heights[0],
+                       activate=True)
+            place_tile(right_hwnd, wl, wt + strip + heights[0], ww,
+                       heights[1], activate=True)
+            got = _fresh_rect(left_hwnd)
+            if not got or got == (0, 0, 0, 0):
+                break
+            learned = int(got[1]) - int(wt)
+            if (learned <= strip or learned > 120
+                    or abs(int(got[3]) - int(heights[0])) > 8):
+                break
+            strip = learned
+            _TOP_STRIP_CACHE[key] = strip
+            logger.info("上下堆叠：顶边不可达 %dpx（菜单栏），按剩余高度重排",
+                        strip)
         logger.info("竖屏并排(上下堆叠): 上=%s 下=%s（屏幕 %s）",
                     left_hwnd, right_hwnd, mon.device_name)
     else:
-        half = ww // 2
+        widths = _two_band_lengths(ww, [m2[0][0], m2[1][0]])
         # 并排后激活左右两个窗口，让它们显示到所有窗口最前面（可见、不被遮挡）
         # 左右两栏：两栏都贴顶，都会被系统下压，按同样的规则补回高度
-        place_tile(left_hwnd, wl, wt, half, wh, activate=True)
-        place_tile(right_hwnd, wl + half, wt, ww - half, wh, activate=True)
+        place_tile(left_hwnd, wl, wt, widths[0], wh, activate=True)
+        place_tile(right_hwnd, wl + widths[0], wt, widths[1], wh,
+                   activate=True)
         logger.info("并排完成: 左=%s 右=%s（屏幕 %s）", left_hwnd, right_hwnd,
                     mon.device_name)
     return True
@@ -1755,6 +1829,9 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
         return False
     bot_hwnd = bot_w.get("hwnd") or make_hwnd(bot_w["owner"], bot_w["name"] or "")
 
+    # 全屏窗口写不动（AX 返回成功但几何不变）：先退回普通窗口再算目标。
+    _prepare_for_layout([top_hwnd, mid_hwnd, bot_hwnd])
+
     # 以顶部窗口当前所在的屏幕为准；若显式指定了显示器则用指定的
     idx = _resolve_monitor_index(ms, monitor)
     if idx is None:
@@ -1762,29 +1839,96 @@ def snap_three_stack(top_hwnd=None, mid_hwnd=None, bot_hwnd=None, use_pinned=Tru
     mon = ms[idx]
 
     wl, wt, ww, wh = mon.work_rect
-    # 理想等分：余数摊到前若干段（每段最多差 1px），而不是只补给末段——
-    # 否则竖屏 2048 这类除不尽的尺寸会让三段高度明显不等，看着就是「不准」。
-    base = wh // 3
-    rem = wh - base * 3
-    heights = [base + (1 if i < rem else 0) for i in range(3)]
-    # 起点一律按上一段「理想」高度累加，不读实测：System Events 会把顶段整体
-    # 下压约 31px（菜单栏占住顶部，窗口永远贴不到 work_top），若拿实测底部作
-    # 下一段起点，这段偏移会被逐级传导、放大成肉眼可见的缝隙。
-    # 单段自身的钳制交给 place_tile 消化：顶段被下压时把高度补回来、底边不动，
-    # 中段与下段的起点因此不会被顶段压住（压住就是中段标题栏被盖、窗口拖不动）。
-    y = wt
-    for i, (hwnd, h) in enumerate(zip((top_hwnd, mid_hwnd, bot_hwnd),
-                                       heights)):
-        if i == 0:
-            # 顶段：按实际能放到的顶边 + 补回的高度摆，底边仍落在 wt+heights[0]
-            place_tile(hwnd, wl, y, ww, h, activate=False)
-        else:
-            set_window_rect(hwnd, wl, y, ww, h, activate=False)
-        y += h
+    # 三段高度：先满足三扇窗各自的最小高度，再按三等分吃剩余
+    # （Rectangle balancedBandLengths）。真机实测：zenclean 最小高 752 > 640，
+    # 旧实现写 640 被 App 顶到 752，压住中段 143px；按带长分三段后刚好相接。
+    try:
+        mins = [int((_QUAD_MIN_CACHE.get(h) or (0, 0))[1] or 0)
+                for h in (top_hwnd, mid_hwnd, bot_hwnd)]
+    except Exception:  # noqa: BLE001  缓存异常退回理想等分
+        mins = [0, 0, 0]
+
+    # 顶边不可达条带（菜单栏）必须先从可用高度里扣掉：macOS 不接受窗口盖住
+    # 菜单栏，贴顶写入会被整体下压 31px。不扣就会让顶段压住中段 31px（中段
+    # 标题栏被盖 → 用户觉得「这扇窗拖不动」）。条带按屏缓存，首次靠实测学习。
+    key = _top_strip_key(mon)
+    strip = max(0, int(_TOP_STRIP_CACHE.get(key, 0)))
+    # 两趟：第一趟若发现顶段实际起点比预期低（学到新的条带），按新条带重分一次。
+    # 第二趟起条带已缓存，后续排列一次到位。
+    for _attempt in range(2):
+        avail = max(1, wh - strip)
+        heights = _three_stack_heights(avail, mins)
+        y = wt + strip
+        for i, (hwnd, h) in enumerate(zip((top_hwnd, mid_hwnd, bot_hwnd),
+                                           heights)):
+            if i == 0:
+                place_tile(hwnd, wl, y, ww, h, activate=False)
+            else:
+                set_window_rect(hwnd, wl, y, ww, h, activate=False)
+            y += h
+        got_top = _fresh_rect(top_hwnd)
+        if not got_top or got_top == (0, 0, 0, 0):
+            break
+        learned = int(got_top[1]) - int(wt)
+        # 只接受「合理的下压量」：窗口没写动时读回的是旧位置，不能拿它当条带。
+        if (learned <= strip or learned > 120
+                or abs(int(got_top[3]) - int(heights[0])) > 8):
+            break
+        strip = learned
+        _TOP_STRIP_CACHE[key] = strip
+        logger.info("三栏：顶边不可达 %dpx（菜单栏），按剩余高度重排", strip)
     _osa('tell application "' + top_w['owner'] + '" to activate')
     logger.info("三栏排列完成: 上=%s 中=%s 下=%s（屏幕 %s）", top_hwnd, mid_hwnd,
                 bot_hwnd, mon.device_name)
     return True
+
+
+# 顶边不可达条带（菜单栏占住的那 31px）按「屏 + 工作区高」缓存：
+# macOS 不让窗口盖住菜单栏，贴顶写入会被下压；把这条带从可用高度里扣掉再分
+# 三段，三段才能首尾相接。实测一次就够，同一块屏后续直接复用。
+_TOP_STRIP_CACHE = {}
+
+
+def _top_strip_key(mon):
+    try:
+        height = int(getattr(mon, "work_height", 0) or 0)
+    except (TypeError, ValueError):
+        height = 0
+    return (getattr(mon, "device_path", None) or getattr(mon, "device_name", ""),
+            height)
+
+
+def _three_stack_heights(total, mins):
+    """三段高度：有下限就先用带长算法满足下限，否则理想等分（余数摊前）。"""
+    total = max(1, int(total))
+    try:
+        vals = [int(m or 0) for m in (mins or [])]
+    except (TypeError, ValueError):
+        vals = []
+    if len(vals) == 3 and any(v > 0 for v in vals):
+        got, _ok = grid_plan.balanced_band_lengths(
+            total, [(v, 0) for v in vals])
+        if len(got) == 3 and sum(got) == total:
+            return got
+    base = total // 3
+    rem = total - base * 3
+    return [base + (1 if i < rem else 0) for i in range(3)]
+
+
+def _two_band_lengths(total, mins):
+    """两段长度：有下限就先用带长算法满足下限，否则对半（余数给前一段）。"""
+    total = max(1, int(total))
+    try:
+        vals = [int(m or 0) for m in (mins or [])]
+    except (TypeError, ValueError):
+        vals = []
+    if len(vals) == 2 and any(v > 0 for v in vals):
+        got, _ok = grid_plan.balanced_band_lengths(
+            total, [(v, 0) for v in vals])
+        if len(got) == 2 and sum(got) == total:
+            return got
+    half = total // 2
+    return [half, total - half]
 
 
 def _is_portrait(mon):
@@ -2273,6 +2417,70 @@ _last_grid_notes = []
 _last_grid_report = []
 
 
+def _grid_band_needs(wins, asg, mins, n_cols, n_rows):
+    """每列/每排的最小需求：取该列/该排所有窗口里最大的下限。
+
+    窗口与格子按行主序号对齐（第 k 个窗口去第 k 格），与 fit_report 同一契约。
+    多出格子的窗口没有格子可去，不参与列/排需求。
+    """
+    col_need = [0] * n_cols
+    row_need = [0] * n_rows
+    for i, w in enumerate(wins or []):
+        if i >= len(asg):
+            break
+        row, col = asg[i][0], asg[i][1]
+        mw, mh = mins.get(w.get("hwnd"), (0, 0))
+        if 0 <= col < n_cols:
+            col_need[col] = max(col_need[col], int(mw or 0))
+        if 0 <= row < n_rows:
+            row_need[row] = max(row_need[row], int(mh or 0))
+    return col_need, row_need
+
+
+def _grid_band_binds(need, total, fracs):
+    """有没有哪一列/排的下限超过它按比例分到的那一份。
+
+    1px 容差：取整噪声不该触发重切（重切会让几何与比例预览差 1px）。
+    """
+    for n, f in zip(need or [], fracs or []):
+        if int(n or 0) > int(total * float(f)) + 1:
+            return True
+    return False
+
+
+def _grid_reslice(asg, cells, wins, mins, vr, col_fracs, row_fracs,
+                  n_cols, n_rows, ms, gap, edge_gap):
+    """按窗口最小尺寸重切网格；不采用时返回 None。
+
+    判定顺序（每一步都要求「确实更好」，否则一律保留原几何）：
+      1. 有列/排的下限超过按比例分到的那一份；
+      2. 重切后格子数与原来一致（少一格就说明有格子被挤出屏，别动）；
+      3. 重切后**能多排至少一个窗口**。
+
+    第 3 条是硬门槛：只因为「更贴合」就重排，会把用户已经习惯的布局挪动，
+    而收益看不见。`fill_grid` 与 `grid_capacity` 共用这一份判定，预检说
+    能排几个，正式排布就必须真能排几个。
+    """
+    col_need, row_need = _grid_band_needs(wins, asg, mins, n_cols, n_rows)
+    if not (_grid_band_binds(col_need, vr[2], col_fracs)
+            or _grid_band_binds(row_need, vr[3], row_fracs)):
+        return None
+    pad = gap if gap > 0 else 0
+    cells2 = grid_plan.balanced_grid_cells(
+        vr[0], vr[1], vr[2], vr[3], col_fracs, row_fracs,
+        [v + pad for v in col_need], [v + pad for v in row_need])
+    if not cells2:
+        return None
+    asg2 = grid_plan.assign_cells(cells2, ms)
+    if len(asg2) != len(asg):
+        return None
+    before, _t1 = grid_plan.fit_report(asg, wins, mins, gap, edge_gap, ms)
+    after, _t2 = grid_plan.fit_report(asg2, wins, mins, gap, edge_gap, ms)
+    if len(after) <= len(before):
+        return None
+    return asg2, cells2
+
+
 def fill_grid(hwnds=None, cols=None, rows=None, layout=None, smart=False,
               monitor_indices=None, use_pinned=True):
     """把若干窗口排进跨屏虚拟桌面的 m×n（或加权比例）网格。
@@ -2379,6 +2587,17 @@ def fill_grid(hwnds=None, cols=None, rows=None, layout=None, smart=False,
         logger.warning("虚拟网格：没有可操作的窗口")
         return 0
 
+    # 全屏窗口的尺寸由系统接管，探测会得到「全屏尺寸」这种假下限，正式排布
+    # 也写不动。先统一退回普通窗口，再刷新窗口几何给后面的探测用。
+    prepared = _prepare_for_layout([w.get("hwnd") for w in wins])
+    if prepared:
+        for w in wins:
+            h = w.get("hwnd")
+            if h in prepared:
+                fresh = _fresh_rect(h)
+                if fresh and fresh != (0, 0, 0, 0):
+                    w["x"], w["y"], w["w"], w["h"] = fresh
+
     # 4) 实测每个窗口的最小尺寸。格子装不下 App 的最小尺寸时窗口会被顶出格
     #    子、压住邻居，甚至被 macOS 判给别的屏。探测前记下当前几何，探测完放回
     #    原状——带着探测后的残局排，窗口会停在探测位置（真机 UU远程 就这么被
@@ -2417,10 +2636,20 @@ def fill_grid(hwnds=None, cols=None, rows=None, layout=None, smart=False,
             except Exception:  # noqa: BLE001
                 pass
 
+    # 4.5) 最小尺寸反哺切格：某列/排的下限比按比例分到的那一份还大时，旧行为
+    #      是把那一列的窗口剔除、留一个空格子。这里在保持比例的前提下把那一列
+    #      撑到下限（Rectangle balancedBandLengths 的加权版），只有确实能多排
+    #      一个窗口时才采用——绝不因为重切把本来排得上的挤掉。
+    gap, edge_gap = _gap_settings()
+    resliced = _grid_reslice(asg, cells, wins, mins, vr, col_fracs, row_fracs,
+                             n_cols, n_rows, ms, gap, edge_gap)
+    if resliced is not None:
+        logger.info("虚拟网格：按最小尺寸重切（%d列×%d行）", n_cols, n_rows)
+        asg, cells = resliced
+
     # 5) 装不下的窗口退出排列：fit_report 按最小尺寸逐格判。格子与窗口都按
     #    「格子的行主序号」对齐——第 k 个窗口去第 k 个格子，用户才可预期。
     #    窗口多于格子时，多出的窗口没有格子可去（保持原位，如实报告）。
-    gap, edge_gap = _gap_settings()
     slots, too_small = grid_plan.fit_report(asg, wins, mins, gap, edge_gap, ms)
     if not slots:
         _last_grid_notes.append(
@@ -2510,12 +2739,69 @@ def fill_grid(hwnds=None, cols=None, rows=None, layout=None, smart=False,
             logger.warning("虚拟网格：写入 %s 失败", hwnd, exc_info=True)
             unwritable.append(hwnd)
 
+    # 7.5) 写入后实测仍互相压着：剔除「最小面积最大」的一扇并复原，宁可空一格。
+    #      四格踩过同款（探测值偏小 -> App 顶大 -> 压住邻居），网格这边以前
+    #      只报不修，用户看到的就是「排完还是叠着」。剔除一个不会让剩下的
+    #      重新重叠（它们还在各自格子里），所以不必再切一次格。
+    def _pair_overlap(a, b):
+        return (min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]) > 8
+                and min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]) > 8)
+
+    while len(report) >= 3:
+        live = [(h, r) for h, _w, r in report if r]
+        victim = None
+        for i in range(len(live)):
+            for j in range(i + 1, len(live)):
+                if not _pair_overlap(live[i][1], live[j][1]):
+                    continue
+                a, b = live[i][0], live[j][0]
+                ma = mins.get(a, (0, 0))
+                mb = mins.get(b, (0, 0))
+                victim = (a if int(ma[0] or 0) * int(ma[1] or 0)
+                          >= int(mb[0] or 0) * int(mb[1] or 0) else b)
+                break
+            if victim:
+                break
+        if victim is None:
+            break
+        o = orig_rect.get(victim)
+        if o and o != (0, 0, 0, 0):
+            try:
+                set_window_rect(victim, o[0], o[1], o[2], o[3],
+                                activate=False)
+                _last_rect[victim] = o
+            except Exception:  # noqa: BLE001
+                pass
+        report = [x for x in report if x[0] != victim]
+        _last_grid_notes.append(
+            "%s 与邻居实测重叠，已放回原位（宁可空一格）"
+            % victim.split("::")[0])
+        logger.info("虚拟网格：重叠兜底剔除 %s", victim)
+
     # 8) 装不下的逐个说明：排了几个、谁没排、为什么。用户才知道该关谁、换谁。
     for h, _w, r in too_small:
         mw, mh = mins.get(h, (0, 0))
         _last_grid_notes.append(
             "%s(最小%dx%d) 放不下它那一格（%dx%d），已保持原位"
             % (h.split("::")[0], mw, mh, r[2], r[3]))
+    if too_small:
+        # 把「谁放不下」升级成「这个方向到底差多少像素」：逐格报四十条
+        # 也回答不了「再加一块屏能不能排下」。两列/两排各取较宽/较高的
+        # 下限，用 Rectangle balancedBandLengths 移植的缺口算法算总账。
+        # 需求按**全部选中窗口**算（含被剔除的）：它们才是装不下的原因；
+        # 只算已排上的那几个，缺口会算成 0，等于什么都没说。
+        col_need, row_need = _grid_band_needs(wins, asg, mins, n_cols, n_rows)
+        dw = grid_plan.bands_shortfall(vr[2], col_need)
+        dh = grid_plan.bands_shortfall(vr[3], row_need)
+        if dw or dh:
+            bits = []
+            if dw:
+                bits.append("宽差%d" % dw)
+            if dh:
+                bits.append("高差%d" % dh)
+            _last_grid_notes.append(
+                "整张网格按窗口最小尺寸还差 " + "/".join(bits)
+                + "px；少放几个窗口或换更大的屏")
     _last_grid_report = report
     logger.info("虚拟网格完成: %d/%d 个窗口 -> %d 格（%d列×%d行，%d 块屏）",
                 len(report), len(wins), len(asg), n_cols, n_rows, len(ms))
@@ -3859,6 +4145,19 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     # 标题栏占位都会让窗口实际比格子大，只有实测才反映用户看到的重叠。
     # 上排 = 顶边较小的两格、下排 = 其余两格（摆放时就是按这个顺序写的）。
     live = [r for _h, _w, r in report if r]
+
+    def _pairwise_overlap(rows):
+        """任意两个窗口同时在这两轴上压盖 >8px 就算重叠。"""
+        for i in range(len(rows)):
+            for j in range(i + 1, len(rows)):
+                a, b = rows[i], rows[j]
+                ov_w = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+                ov_h = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+                if ov_w > 8 and ov_h > 8:
+                    return True
+        return False
+
+    overlap = _pairwise_overlap(live)
     if len(live) == 4:
         rows = sorted(live, key=lambda r: r[1])
         cols = sorted(live, key=lambda r: r[0])
@@ -3870,25 +4169,60 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
             notes.append("四格没完全排开：实测上下重叠 %dpx、左右重叠 %dpx"
                          % (real_ov_y, real_ov_x))
             logger.warning("四宫格：%s", notes[-1])
-    elif len(live) >= 2:
+    elif len(live) >= 2 and overlap:
         # 两个窗口也可能互相压住：真机实测 ChatGPT（最小宽 480）与 Cua Driver
         # （尺寸完全锁死 1600x900）并排时，前者被撑宽、后者纹丝不动，两个窗口
         # 叠在一起。旧实现只检查 4 个窗口的重叠，这类「2 个窗压住」会返回
         # 成功——用户看到的就是「点完了还是叠着」。
-        overlap = False
-        for i in range(len(live)):
-            for j in range(i + 1, len(live)):
-                a, b = live[i], live[j]
-                ov_w = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
-                ov_h = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
-                if ov_w > 8 and ov_h > 8:
-                    overlap = True
-                    break
-            if overlap:
-                break
-        if overlap:
-            notes.append("窗口实测互相重叠，没能真正排开")
-            logger.warning("四宫格：实测有窗口互相重叠")
+        notes.append("窗口实测互相重叠，没能真正排开")
+        logger.warning("四宫格：实测有窗口互相重叠")
+
+    # 兜底：实测仍互相压着时，剔除「最小面积最大」的那一扇，用剩下的重切一次。
+    # 真机实测 Messages 的最小高被探测成 320、实际 502：T 形下排那一格只有
+    # 450 高，窗口被顶大 52px 压住上排。只写一条「没能真正排开」，用户看到
+    # 的还是叠着——这里直接把它放回原位并重排剩下的，宁可少排一个。
+    if overlap and len(placed_slots) >= 3:
+        def _min_area(slot):
+            mw, mh = mins.get(slot[1], (0, 0))
+            return int(mw or 0) * int(mh or 0)
+        victim = max(placed_slots, key=_min_area)
+        keep = [s for s in placed_slots if s[1] != victim[1]]
+        try:
+            cells2, finals2, splits2 = _quad_cells(
+                keep, mins, wl, wt, ww, wh, gap, edge_gap, sx, sy,
+                maxes=maxes,
+                manual_split=(split_x != 0.5 or split_y != 0.5))
+            _quad_write(finals2, cells2, wl, wt, ww, wh, smart, unwritable,
+                        notes, detect_unwritable=False,
+                        resize_locked=resize_locked)
+        except Exception:  # noqa: BLE001  兜底失败就保留原状与说明
+            logger.warning("四宫格：消除重叠的重排失败", exc_info=True)
+        else:
+            orig = orig_rect.get(victim[1])
+            if orig and orig != (0, 0, 0, 0):
+                set_window_rect(victim[1], orig[0], orig[1], orig[2], orig[3],
+                                activate=False)
+                _last_rect[victim[1]] = orig
+            placed_slots = keep
+            unplaced = list(unplaced) + [(victim[1], victim[2])]
+            _last_quad_splits = splits2
+            _last_quad_slots[:] = [(c, h) for c, h, _w in keep]
+            _last_quad_order = [h for _c, h, _w in keep]
+            _last_quad_boxes = cells2
+            # report 只留还在格位上的窗口，后面的「被钳制/被搬屏」说明才不会
+            # 指着一个已经放回原位的窗口。
+            keep_set = {h for _c, h, _w in keep}
+            report = [(h, w, r) for (h, w, r) in report if h in keep_set]
+            # 已经把它放回原位了，就别再留着「它被顶大 / 窗口互相重叠」的
+            # 说明——那会让状态栏读起来像「还在叠着」。
+            vname = victim[1].split("::")[0]
+            notes[:] = [n for n in notes
+                        if n != "窗口实测互相重叠，没能真正排开"
+                        and not n.startswith(vname + " ")]
+            notes.append("为消除重叠，%s 已放回原位（%d/%d 个排上）"
+                         % (victim[1].split("::")[0], len(keep), len(picked)))
+            logger.info("四宫格：重叠兜底剔除 %s，重排 %d 个",
+                        victim[1], len(keep))
     # 放不下的窗口逐个说明：排了多少、谁没排、为什么。这块屏的四宫格容量是
     # 硬上限（App 的最小尺寸改不了），说清楚用户才知道该关谁、换谁。
     pos = 1 if _missing_windows else 0
@@ -4027,11 +4361,23 @@ def quad_capacity(hwnds, monitor=None):
     # 全排需求按用户角标算（与 snap_four_quad 里记日志的口径一致）：点掉几格
     # 的空格按 0 计入。有窗口没探过最小尺寸时需求会偏小，宁可不报。
     need = None
+    deficit = None
     if len(cached) == len(hwnds):
         corners = [(0, 0)] * 4
         for corner, h in enumerate(hwnds[:4]):
             corners[corner] = mins_all[h]
         need = quad_plan.quad_requirements(corners)
+        # 差在哪一轴、差多少像素：只报「需 1539x1266」用户还得自己减工作区。
+        # 两列/两排各自取较宽/较高的下限，与 quad_requirements 完全同源，
+        # 用 grid_plan 的带长算法（Rectangle balancedBandLengths 移植）算缺口。
+        col_need = [max(corners[0][0], corners[2][0]),
+                    max(corners[1][0], corners[3][0])]
+        row_need = [max(corners[0][1], corners[1][1]),
+                    max(corners[2][1], corners[3][1])]
+        deficit = {
+            "w": grid_plan.bands_shortfall(best.work_rect[2], col_need),
+            "h": grid_plan.bands_shortfall(best.work_rect[3], row_need),
+        }
     # 这块屏排不满时，找一块真能排满的横屏报给用户。只报「全排需 1902×1360」
     # 用户还得自己挨块屏试；直接说「换 Big 可排满」才是可操作的。候选只取
     # 横屏，和自动选屏、_quad_place 的换屏口径一致：竖屏上即使按最小尺寸算
@@ -4050,8 +4396,213 @@ def quad_capacity(hwnds, monitor=None):
             "work": (best.work_rect[2], best.work_rect[3]),
             "fit": fit, "total": len(hwnds),
             "need": need,
+            "deficit": deficit,
             "alt": alt,
             "uncached": [h.split("::")[0] for h in hwnds if h not in cached]}
+
+
+def grid_capacity(cols=None, rows=None, layout=None, monitor_indices=None):
+    """预检：按缓存的最小尺寸，当前网格最多排得下几个窗口（不动任何窗口）。
+
+    与 quad_capacity 同一职责：容量是 App 最小尺寸的硬上限，不该等点完
+    「网格批排」才发现有两个窗口没动。只读 `_QUAD_MIN_CACHE`（上次排布实测
+    并落盘），**不现场探测**——探测要先把窗口缩小再读回，不能挂在预检里。
+    一个窗口都没有缓存时返回 None，界面据此不显示。
+
+    判定与正式排布共用 `_grid_reslice` + `fit_report`，所以「预检说能排 N 个」
+    与「点下去真排 N 个」是同一套数学。
+
+    返回 dict：cols / rows / cells / fit / total / deficit / uncached。
+    """
+    ms = monitors.enum_monitors()
+    if not ms:
+        return None
+    if monitor_indices is not None:
+        keep = [i for i in monitor_indices
+                if isinstance(i, int) and 0 <= i < len(ms)]
+        if not keep:
+            return None
+        ms = [ms[i] for i in keep]
+    if layout:
+        got = grid_plan.layout_by_label(layout)
+        if got is None:
+            got = (grid_plan.equal_fracs(cols or 2),
+                   grid_plan.equal_fracs(rows or 2))
+    else:
+        got = (grid_plan.equal_fracs(cols or 2),
+               grid_plan.equal_fracs(rows or 2))
+    col_fracs, row_fracs = got
+    n_cols, n_rows = len(col_fracs), len(row_fracs)
+    if n_cols > grid_plan.MAX_COLS or n_rows > grid_plan.MAX_ROWS:
+        return None
+    vr = grid_plan.virtual_rect(ms)
+    if vr is None:
+        return None
+    cells = grid_plan.grid_cells(vr[0], vr[1], vr[2], vr[3],
+                                 col_fracs, row_fracs)
+    asg = grid_plan.assign_cells(cells, ms)
+    if not asg:
+        return None
+    cands = [w for w in list_target_windows()
+             if w.get("pid") not in _OWN_PIDS and w.get("owner")]
+    cands = [w for w in cands if w.get("owner") not in _QUAD_SKIP_OWNERS]
+    wins = grid_plan.pick_windows(cands, len(asg),
+                                  skip_owners=_QUAD_SKIP_OWNERS,
+                                  own_pids=_OWN_PIDS)
+    if not wins:
+        return None
+    mins = {w["hwnd"]: _QUAD_MIN_CACHE[w["hwnd"]]
+            for w in wins if w.get("hwnd") in _QUAD_MIN_CACHE}
+    if not mins:
+        return None
+    gap, edge_gap = _gap_settings()
+    resliced = _grid_reslice(asg, cells, wins, mins, vr, col_fracs, row_fracs,
+                             n_cols, n_rows, ms, gap, edge_gap)
+    if resliced is not None:
+        asg, cells = resliced
+    slots, _too = grid_plan.fit_report(asg, wins, mins, gap, edge_gap, ms)
+    col_need, row_need = _grid_band_needs(wins, asg, mins, n_cols, n_rows)
+    return {
+        "cols": n_cols, "rows": n_rows, "cells": len(asg),
+        "fit": len(slots), "total": len(wins),
+        "deficit": {"w": grid_plan.bands_shortfall(vr[2], col_need),
+                    "h": grid_plan.bands_shortfall(vr[3], row_need)},
+        "uncached": [w["hwnd"] for w in wins
+                     if w.get("hwnd") not in mins],
+    }
+
+
+def probe_min_sizes(hwnds=None):
+    """主动实测一批窗口的最小尺寸并写缓存（供预检首次就有依据）。
+
+    并排/竖排/网格的容量提示都读 `_QUAD_MIN_CACHE`，而这个缓存原来只在
+    四格/网格排布时由现场探测写入——没排过就一个字都提示不了。这里给界面
+    一个显式入口：点一下就把当前点名过的窗口逐个缩到最小再读回，然后
+    **放回原几何**，之后容量提示立刻有据可依，且跨会话（写 quad_cache.json）。
+
+    代价是每个窗口约 0.6~1.2s（探测要等动画稳定），所以只在用户主动点击时
+    执行，绝不挂在勾选/切布局这类高频动作上。
+
+    返回 dict：probed / failed / missing / items（[(hwnd, (mw, mh))]）。
+    """
+    out = {"probed": 0, "failed": 0, "missing": 0, "items": []}
+    for want in (hwnds or []):
+        if not want:
+            continue
+        w = _find_window(want)
+        if w is None:
+            out["missing"] += 1
+            continue
+        # 全屏时任何尺寸写入都被系统忽略，探到的只会是「全屏尺寸」（真机
+        # ChatGPT 被记成 1600x870，容量预检从此永远说排不下）。先退出全屏；
+        # 退不出来的直接按失败计，绝不把假下限写进缓存。
+        exited = _exit_fullscreen_for_layout(want, [])
+        if _ax_is_fullscreen(want) is True:
+            logger.info("最小尺寸探测：%s 仍处于全屏，跳过（避免记入假下限）",
+                        want.split("::")[0])
+            out["failed"] += 1
+            continue
+        if exited:
+            # 退出全屏后窗口会回到原来的 Space/位置，锚点必须用新几何
+            fresh = _fresh_rect(want)
+            if fresh and fresh != (0, 0, 0, 0):
+                w = dict(w, x=fresh[0], y=fresh[1], w=fresh[2], h=fresh[3])
+        orig = None
+        try:
+            orig = _readback_rect(want, (w["x"], w["y"], w["w"], w["h"]))
+        except Exception:  # noqa: BLE001  读不到就只探测、不复位
+            orig = None
+        try:
+            # 锚点取窗口当前左上角：探测只关心「能缩多小」，位置只要在
+            # 可视区内（AX 对屏外写入会拒绝）。
+            size = _probe_min_size(want, int(w["x"]) + 1, int(w["y"]) + 1)
+        except Exception:  # noqa: BLE001
+            size = (0, 0)
+        if size and size[0] > 0 and size[1] > 0:
+            _quad_min_remember(want, size)
+            out["probed"] += 1
+            out["items"].append((want, (int(size[0]), int(size[1]))))
+        else:
+            out["failed"] += 1
+        if orig and orig != (0, 0, 0, 0):
+            try:
+                set_window_rect(want, orig[0], orig[1], orig[2], orig[3],
+                                activate=False)
+                _last_rect[want] = orig
+            except Exception:  # noqa: BLE001
+                pass
+    if out["probed"]:
+        _quad_cache_save()
+    return out
+
+
+def line_capacity(hwnds, axis="auto", monitor=None):
+    """预检：一行/一列排下来，按缓存的最小尺寸够不够（不动任何窗口）。
+
+    并排失败与竖排失败是同一类物理上限：两个窗口的最小宽相加超过屏宽、
+    或者三个窗口的最小高相加超过屏高，硬排只会互相压盖或把窗口顶出屏外。
+    点按钮之前先说清，用户才知道该少放一个、换个屏，还是接受被钳制。
+
+    axis: "row" 横向并排（宽相加）/ "col" 纵向竖排（高相加）/
+        "auto" 按目标屏朝向（横屏并排、竖屏上下堆叠，与 snap 的
+        portrait_zone 同语义）。
+
+    只读 `_QUAD_MIN_CACHE`（上次排布实测并落盘），不现场探测；一扇窗都没
+    缓存时返回 None，界面据此不显示。
+
+    返回 dict：screen / axis / fit / total / need / available / deficit /
+    uncached。fit 是「按顺序能完整放进几个」，deficit 是全排还差多少像素。
+    """
+    hs = [h for h in (hwnds or []) if h]
+    if not hs:
+        return None
+    cached = {h: _QUAD_MIN_CACHE[h] for h in hs if h in _QUAD_MIN_CACHE}
+    if not cached:
+        return None
+    ms = monitors.enum_monitors()
+    if not ms:
+        return None
+    idx = _resolve_monitor_index(ms, monitor) if monitor is not None else None
+    if idx is None:
+        # 与并排/竖排的实际行为一致：按第一个窗口当前所在屏
+        first = None
+        try:
+            first = _cg_rect(hs[0])
+        except Exception:  # noqa: BLE001
+            first = None
+        if first:
+            idx = _monitor_index_by_rect(ms, first[0], first[1],
+                                         first[2], first[3])
+        if idx is None:
+            idx = 0
+    if not (0 <= idx < len(ms)):
+        idx = 0
+    mon = ms[idx]
+    wl, wt, ww, wh = mon.work_rect
+    if axis == "auto":
+        axis = "col" if mon.height > mon.width else "row"
+    available = ww if axis == "row" else wh
+    gap, _edge_gap = _gap_settings()
+    need_each = []
+    for h in hs:
+        mw, mh = _QUAD_MIN_CACHE.get(h, (0, 0))
+        need_each.append(int(mw if axis == "row" else mh) or 0)
+    total_need = sum(need_each) + gap * max(0, len(need_each) - 1)
+    fit, used = 0, 0
+    for n in need_each:
+        step = n + (gap if fit else 0)
+        if used + step <= available:
+            used += step
+            fit += 1
+        else:
+            break
+    return {
+        "screen": mon.device_name, "axis": axis,
+        "fit": fit, "total": len(hs),
+        "need": total_need, "available": available,
+        "deficit": max(0, total_need - available),
+        "uncached": [h for h in hs if h not in cached],
+    }
 
 
 def quad_predict(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,

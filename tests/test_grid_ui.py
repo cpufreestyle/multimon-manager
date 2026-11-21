@@ -18,6 +18,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import ui_harness as harness  # noqa: E402 - 抑制构造期真机热键/轮询
 
 try:
     import tkinter as tk
@@ -58,7 +59,7 @@ class TestGridUi(unittest.TestCase):
     def setUp(self):
         self.root = tk.Tk()
         self.root.withdraw()      # 不抢焦点
-        self.app = ui.App(self.root)
+        self.app = harness.build_app(ui, self.root)
         # 三块屏：横、横、竖（竖屏默认不勾）
         self.app.monitors = [_Mon(0, 33, 1512, 891, "Built-in", True),
                              _Mon(0, -900, 1600, 900, "RV200"),
@@ -69,10 +70,7 @@ class TestGridUi(unittest.TestCase):
         self.root.update()
 
     def tearDown(self):
-        try:
-            self.root.destroy()
-        except Exception:  # noqa: BLE001
-            pass
+        harness.close_app(self.root, self.app)
 
     def _mapped(self, widget):
         return bool(widget and widget.winfo_ismapped())

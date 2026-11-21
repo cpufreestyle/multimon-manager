@@ -153,6 +153,38 @@ _LAUNCHER = """#!/bin/bash
 DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
 cd "$DIR" || exit 1
 
+# macOS 崩溃恢复对话框：「The last time you opened Python, it unexpectedly
+# quit while reopening windows. Do you want to try to reopen its windows
+# again?」——系统把崩溃记在 **python 二进制的 bundle**（org.python.python）
+# 上。本应用跑的正是那个 Python.app/Contents/MacOS/Python，所以只要
+# **任何** python 进程崩溃过（哪怕是别的脚本崩的），下次启动本应用就会被
+# 这个弹窗**阻塞**：log 停在「缓存已读入」，界面要等有人点按钮才出现。
+# 三条对策：
+#   1) 显式禁用窗口状态保存/恢复——本应用不依赖系统窗口恢复（tkinter
+#      不支持 NSWindowRestoration）；
+#   2) 清掉遗留的 savedState 目录——恢复弹窗就是它触发的；
+#   3) 每次拉起 python 前都清一遍：主进程 abort 后守护脚本会重启它，
+#      若不重复清理，重启链上的每一次都会再弹一次（用户看到的「反复弹」）。
+# 写失败不静默：失败原因记进应用日志，便于事后排查。
+MMM_LOG="${TMPDIR:-/tmp}/multimon-manager.log"
+DEFAULTS_BIN="${MMM_DEFAULTS_BIN:-defaults}"
+mmm_clear_python_restore_state() {
+  # 弹窗的触发源：<bundle>.savedState。只删这一条精确路径，不碰别的。
+  SAVED="$HOME/Library/Saved Application State/org.python.python.savedState"
+  if [ -d "$SAVED" ]; then
+    rm -rf "$SAVED" 2>>"$MMM_LOG"
+    echo "[launcher] 已清理遗留的 Python 窗口恢复状态" >>"$MMM_LOG"
+  fi
+  for kv in "NSQuitAlwaysKeepsWindows -bool false" \
+            "NSDisableRelaunchOnReopen -bool true" \
+            "ApplePersistenceIgnoreState -bool true"; do
+    # shellcheck disable=SC2086
+    if ! "$DEFAULTS_BIN" write org.python.python $kv >>"$MMM_LOG" 2>&1; then
+      echo "[launcher] 警告：defaults write org.python.python $kv 失败" >>"$MMM_LOG"
+    fi
+  done
+}
+
 # MMM_PY_CANDIDATES 供测试注入假解释器。顺序按 Homebrew 各版本优先
 # （自带 Tk 9.1；/usr/bin/python3 是 3.9 + Tcl 8.5，作兜底）。
 # 注意：曾把 /usr/bin/python3 提到最前想绕开一次 abort，事后证明与
@@ -168,6 +200,11 @@ PRINT_ONLY=0
 if [ "$1" = "--print-python" ]; then
   PRINT_ONLY=1
   shift
+fi
+
+# --print-python 只做解释器探测，不碰系统偏好（单测跑它时不该改用户设置）。
+if [ "$PRINT_ONLY" != "1" ]; then
+  mmm_clear_python_restore_state
 fi
 
 pick_python() {
@@ -205,6 +242,9 @@ while true; do
     rm -f "$GUARD_FLAG"
     break
   fi
+  # 重启前再清一次恢复状态：主进程 abort/crash 后系统又记了一次崩溃，
+  # 不清的话这一轮启动又会弹出恢复框。
+  mmm_clear_python_restore_state
   "$PY" main.py "$@"
   RC=$?
   # 0=用户主动退出（托盘「退出」会先写标记文件，这里只是兜底）。

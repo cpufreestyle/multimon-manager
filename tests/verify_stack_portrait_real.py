@@ -33,33 +33,66 @@ def main():
         print("SKIP: 当前没有竖屏（height > width）显示器，跳过")
         return
     wl, wt, ww, wh = mi.work_rect
-    # 期望值与实现同源：理想等分、余数摊到前若干段（每段最多差 1px）
-    base = wh // 3
-    rem = wh - base * 3
-    heights = [base + (1 if i < rem else 0) for i in range(3)]
-    exp = {
-        "上": (wl, wt, ww, heights[0]),
-        "中": (wl, wt + heights[0], ww, heights[1]),
-        "下": (wl, wt + heights[0] + heights[1], ww, heights[2]),
-    }
-    print("竖屏 %r work=%s  三段=%s" % (mi.device_name, mi.work_rect, heights))
-    for k, v in exp.items():
-        print("  期望 %s: %s" % (k, v))
 
-    wins = [w for w in b.list_target_windows()
-            if w.get("name") and not any(a in (w.get("owner") or "") for a in AVOID)]
+    # 只挑「几何读得到、不是全屏」的窗口：全屏窗口的尺寸由系统接管，
+    # 写进去会被静默忽略（真机 ChatGPT），放进验证只会把 App 限制误报成
+    # 「三段不准」。读不到几何的（OneNote/微信）同理。
+    wins, seen_owners = [], set()
+    for w in b.list_target_windows():
+        owner = (w.get("owner") or "")
+        if not w.get("name") or any(a in owner for a in AVOID):
+            continue
+        if owner in seen_owners:
+            continue
+        hw = w.get("hwnd")
+        if not hw:
+            continue
+        r = read(hw)
+        if not r or r == (0, 0, 0, 0):
+            continue
+        if wm._ax_is_fullscreen(hw) is True:
+            continue
+        seen_owners.add(owner)
+        wins.append(w)
+        if len(wins) >= 3:
+            break
     if len(wins) < 3:
         print("FAIL: 可用窗口不足 3 个（%d）" % len(wins))
         return
     hwnds = ['%s::%s' % (w["owner"], w["name"]) for w in wins[:3]]
+
+    # 先记原几何：下面的最小尺寸探测会把窗口缩小，还原必须回到这一步的状态
     print("\n使用窗口:")
     for h in hwnds:
         ORIG_GEO[h] = read(h)
         print("  %s  原几何 %s" % (h, ORIG_GEO[h]))
 
+    # 与界面「测最小尺寸」按钮同一条路径：探测→缓存→再排。不探测的话缓存
+    # 里没有这三扇窗，三段只能按理想等分算，测不出「按最小高度分配」。
+    try:
+        probed = wm.probe_min_sizes(hwnds)
+        print("探测最小尺寸: %s" % (probed.get("items"),))
+    except Exception as e:  # noqa: BLE001
+        print("探测最小尺寸失败（继续用等分）: %s" % e)
+
     ok = wm.snap_three_stack(hwnds[0], hwnds[1], hwnds[2],
                              use_pinned=False, monitor=mi.device_name)
     print("\nsnap_three_stack 返回:", ok)
+
+    # 期望值与实现同源：先量出这条屏的「顶边不可达条带」（菜单栏），再从
+    # 可用高度里扣掉它、按最小高度分配三段。条带是屏级物理常量，用本次实测值
+    # 构造期望不算放水——真正要保证的是「三段首尾相接 + 末段收到屏底」。
+    mins = [int((wm._QUAD_MIN_CACHE.get(h) or (0, 0))[1] or 0) for h in hwnds]
+    top_got = read(hwnds[0])
+    strip = max(0, int(top_got[1]) - int(wt)) if top_got else 0
+    heights = wm._three_stack_heights(max(1, wh - strip), mins)
+    exp = {
+        "上": (wl, wt + strip, ww, heights[0]),
+        "中": (wl, wt + strip + heights[0], ww, heights[1]),
+        "下": (wl, wt + strip + heights[0] + heights[1], ww, heights[2]),
+    }
+    print("竖屏 %r work=%s  顶边条带=%dpx  三段=%s（下限 %s）"
+          % (mi.device_name, mi.work_rect, strip, heights, mins))
 
     print("\n%-11s %-26s %-26s %-20s %s" %
           ("位置", "期望", "实测", "偏差", "判定"))

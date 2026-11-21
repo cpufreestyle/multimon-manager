@@ -1,23 +1,24 @@
-# 交接 — multimon-manager（2026-11-08：启动下拉修复、授权提示、顶边补偿、四格容量提示与横屏候选）
+# 交接 — multimon-manager（2026-11-13：四格「排完就废」三处根因修复 + 真机验证）
 
 > 本文件是**当前**交接入口，读完即可接管。
 > 代码根：`/Users/a1-6/AI Shared/repo/multimon-manager/`
-> 版本 0.3.2 · 全套单测通过 · `master` 与 `origin/master` 已同步（HEAD `6acb970`）
+> 版本 0.3.2 · 全套单测通过 · `master` **领先 `origin/master` 1 个提交（未推送）**，HEAD `4187716`
 > 运行形态：`dist/多屏管理器.app`（桌面快捷方式 `~/Desktop/多屏管理器`，Finder alias）
+> 上一轮（2026-11-08：启动下拉、授权提示、顶边补偿、容量提示）的细节保留在 §2.1–§2.6。
 
 ## 0. 一分钟速览
 
 | 项 | 值 |
 |---|---|
-| 本轮根因 A | `App.__init__` 丢了 `self._refresh_targets()`：启动后窗口下拉全空、排列处理器直读不存在的 `_target_map` 抛 `AttributeError`，被 Tk 吞掉后表现为「按钮点了没反应」 |
-| 本轮根因 B | 辅助功能授权被撤销后几何写入失败，界面只显示误导性的「需要至少 N 个可操作窗口」 |
-| 本轮根因 C | 四格容量文案带工作区尺寸，整行自然宽 1012px > 可视宽 765px，把行尾「自动四窗」按钮挤出映射 |
-| 修复 A | `ui.py:166` 启动即填充窗口下拉；`tests/test_startup_window_lists.py` 4 个反向验证用例 |
-| 修复 B | `windows_mac.py` 记录授权拒绝状态，`ui.py` 排列失败时给授权引导 + 一键打开系统设置 |
-| 修复 C | 固定控件先 `pack`，容量标签最后 `pack` 并 `fill/expand`；说明标签并入画布 tooltip；`quad_capacity()` 新增 `alt` 直接报「换哪块屏可排满」 |
-| 关联修复 | `place_tile()` 对贴顶窗口做顶边下压高度补偿；详见 §2.5 |
-| 测试 | 用 `python@3.14` 跑全套 37 个测试文件通过；`test_single_instance` 因运行中的 App 占锁，需隔离 `TMPDIR` 复跑 |
-| git | `master` 与 `origin/master` **已同步**（HEAD `6acb970`），工作区干净 |
+| 本轮根因 A | 四个排列处理器排完立刻 `release_window()`，把自己刚写进 `push_undo` / `remember_arranged` 的记忆删掉 → 「撤销移动」「回摆放位」对刚排的窗口全部失效 |
+| 本轮根因 B | AX 兜底无条件改用主窗口，把用户点名的 `#3` 覆盖成 `window 1` → UU远程等同名多窗口，排第 3 扇动的却是第 1 扇 |
+| 本轮根因 C | 13 个吸附按钮挤在一行，自然宽 1005px > 最小尺寸下可视宽约 775px；**packer 装不下就不映射末尾控件** → 「释放窗口 / 暂存 / 取回」对象还在、command 还绑着，但用户看不见也点不到 |
+| 修复 A | 删掉 `_snap_two_side_by_side` / `_snap_three_stack` / `_snap_four_quad` / `_fill_grid` 里的自动释放块；释放只由用户点「释放窗口」触发（`ui.py:574`） |
+| 修复 B | `_ax_window_by_geometry` / `_ax_window_by_name` 增 `seq` 参数，带显式序号时禁用主窗口兜底（`windows_mac.py:1026` / `:1098`），4 个调用点全部传 `seq` |
+| 修复 C | 吸附按钮拆成三行（8 整/半屏 + 8 三分之一/四角 + 5 记忆/暂存），`ui.py:791`；顺带删掉从未被调用的 `release_all_windows()` |
+| 测试 | `python@3.14` 全套 **508 例 OK（skipped=1，约 40 个测试文件）**，用隔离 `TMPDIR` 跑，**没停正在运行的 App**（见 §1.1 + §2.8 看门狗） |
+| 真机 | 重打包 + 重启后走托盘命令通道真排了一次 2×2：RV200 Pro 上 3 个窗口 0 重叠 0 越界，第 4 个被容量预检挡下（详见 §2.7） |
+| git | 代码 HEAD `4187716`，**本地领先 origin/master 1 个提交，用户明确选择先不推送**；**工作区另有 15 个未提交项**（省电守护 `power_guard.py` + 全量单测挂死修复，见 §2.8），全部未 commit |
 
 ## 1. 环境事实（接手前必读，能省几小时）
 
@@ -30,7 +31,15 @@ $ launchctl list | grep -i multimon
 25389  0  application.com.cpufreestyle.multimonmanager.*
 ```
 
-这些进程**不是** `Python main.py` 命令行形式，`pkill -f "main.py"` 匹配不到，`ps aux | grep 多屏管理器` 也常看不到（命令行被 launchd 改写）。清场方式：
+这些进程**不是** `Python main.py` 命令行形式，`pkill -f "main.py"` 匹配不到，`ps aux | grep 多屏管理器` 也常看不到（命令行被 launchd 改写）。
+
+**首选：不停 App 也能跑全套**——锁路径跟着 `TMPDIR` 走，给它一个临时目录即可与运行中的实例完全隔离（本轮 466 例就是这么跑绿的，用户桌面不受打扰）：
+
+```bash
+TD=$(mktemp -d); TMPDIR="$TD" bash run_tests.sh
+```
+
+**要清场时**（例如要验单例行为本身）：
 
 ```bash
 pkill -9 -f "多屏管理器"; sleep 1
@@ -38,7 +47,7 @@ lsof $TMPDIR/multimon_manager.lock   # 必须为空
 bash run_tests.sh
 ```
 
-若仍有残留，用 `lsof` 出的 PID 直接 `kill -9`。锁文件在
+`pkill` 打中的可能只是外层 shell，**真正持锁的是它的 Python 子进程**：本轮杀完 bash 后 `lsof` 仍列出另一个 PID，按那个 PID 精确 `kill -9` 才释放。**别去删锁文件**——先 `lsof` 查清谁持着，删文件只会让下一个实例和残留进程同时跑。锁文件在
 `/private/var/folders/rz/y1d6t55x5y90zd4q09s_9x000000gn/T/multimon_manager.l`
 （**不是** `/tmp/`，macOS 的 per-user TMPDIR）。同理，日志在
 `/private/var/folders/rz/y1d6t55x5y90zd4q09s_9x000000gn/T/multimon-manager.log`
@@ -178,7 +187,8 @@ WorkBuddy / Comet / OneNote / ChatGPT / 系统设置 / Marvis 全部一样——
 高度 < 120px（格子被压成一条缝）→ 保持原高度，宁可轻微重叠。
 
 **测试**：`tests/test_top_push_compensation.py` 新增 6 例（补偿/不补偿/
-钳制/写入无效/缝保护/三栏无重叠）。`run_tests.sh` → `Ran 442 tests / OK`。
+钳制/写入无效/缝保护/三栏无重叠）。当轮 `run_tests.sh` → `Ran 442 tests / OK`
+（当前全套 466 例，见 §0 与 §2.7）。
 
 **真机验证**：`python3 tests/verify_stack_portrait_real.py` 三段首尾相接、
 无重叠、末段收在屏幕底（顶边内缩 31px 属菜单栏占位，判据已按「不重叠」
@@ -202,6 +212,162 @@ App 限制不是程序不准），合计不准 0。
 「点格=填/清空 · 拖分割线=改比例」标签并进画布 tooltip。实测本机三组真实
 选择文案 145~220px，容量标签可用 317px，全部完整可读，按钮 `mapped=True`。
 
+## 2.7 四格「排完就废」的三处根因（2026-11-13，HEAD `4187716`）
+
+接手的是一批**未提交的在制品**：2×2 功能（`snap_four_quad`）本身早已实现并提交，
+但工作区里躺着三个让它「排完就废」的缺陷。三个都先写反向验证用例（红），再改（绿）。
+
+### A. 排列处理器自己删掉刚写的记忆
+
+`_snap_two_side_by_side` / `_snap_three_stack` / `_snap_four_quad` / `_fill_grid`
+末尾各有一段「释放记录：让用户后续手动拖动不被触发器吸附回去」，对刚排的每个
+窗口调 `release_window()`。但 `set_window_rect` 在写入时就同时写了**两份**记忆
+（`push_undo` → `_undo_stack`，`remember_arranged` → `_last_arranged`），这段等于
+排完立刻把两份都清掉：「撤销移动」和「回摆放位」对刚排的窗口一律失效。
+
+理由本身也站不住：`_last_arranged` **没有任何自动消费方**（只有「回摆放位」
+按钮读它），不存在「排完会被自动吸回去」这回事。所以整段删除，释放改由用户点
+「释放窗口」显式触发（`ui.py:574`，上一提交 `0f34b47` 加的按钮）。
+顺带删掉从未被任何地方调用的 `windows_mac.release_all_windows()` 及 `backend` 转发。
+
+回归：`tests/test_arrange_keeps_memory.py`（4 例）。替身 snap **复刻真实副作用**
+（两份记忆都写），再调真的 `release_window`，断言记忆仍在——不是数 mock 调用次数。
+
+### B. 主窗口兜底覆盖用户点名的 `#序号`
+
+`hwnd` 形如 `「应用名::窗口名#序号」`，序号是同名窗口里的 1-based z-order。
+Electron 类 App 会把一个 84x77 的输入法面板放在 AX `window 1`，所以此前加了
+`_ax_main_window()` 兜底（优先 `AXStandardWindow`，其次 `AXMain=true`）。
+但兜底是**无条件**的：几何匹配偏差 > 64px 时，即使用户点的是 `#3`，也会被改写成
+主窗口 → 排第 3 扇动的却是第 1 扇（UU远程 6 扇窗的场景直接踩中）。
+
+修法：`_ax_window_by_geometry(app, rect, name=None, seq=None)` 与
+`_ax_window_by_name(app, name, seq=None)` 增 `seq`；**带显式序号就禁用主窗口兜底**，
+宁可回退按序号选，也不许换窗口。4 个调用点全部传 `seq`：`set_window_rect`、
+`_readback_rect`、最小尺寸探测、`raise_window`。不带序号时兜底照旧生效。
+
+回归：`tests/test_hwnd_seq.py::TestMainWindowFallback`（7 例，含「带序号不被劫持」
+「不带序号仍享受兜底」「几何够准时仍优先几何」「AX 静默时返回 None」）。
+
+### C. 一行塞 13 个按钮，packer 静默丢掉末尾三个
+
+**这是最容易被误判成「功能没做」的一个**：Tk 的 packer 在容器放不下子控件时
+**不报错、不映射末尾控件**。按钮对象存在、`command` 绑好、`btn.invoke()` 也能跑，
+但界面上根本看不见——「释放窗口 / 暂存 / 取回」三个按钮就是这么消失的。
+实测那一行自然宽 1005px，而窗口最小尺寸下可视宽只有约 775px。
+
+修法：拆成三行（`ui.py:791`）——第一行 8 个（跨屏 3 + 半屏 4 + 最大化）、
+第二行 8 个（居中 + 三分之一 3 + 四角 4）、第三行 5 个（撤销移动 / 回摆放位 /
+释放窗口 / 暂存 / 取回）。`btns[:8]` 进第一行、`btns[8:]` 进第二行，第三行单独建。
+
+回归：`tests/test_snap_rows_mapped.py`（3 例：21 个按钮都建出来了 / 最小宽度下
+全部 `winfo_ismapped()` / 没有按钮超出画布右边缘）。**写这类测试有两个坑**：
+
+- **不能 `withdraw()`**：窗口未映射时 packer 不受窗口宽度约束，所有按钮都「放得下」，
+  映射与越界判定全部失真（本轮一度 21 个按钮全被误报越界）。
+- **整个测试类只建一个 Tk root**（`setUpClass`）：macOS 的 Tk 在同一进程里反复
+  建/销毁真实窗口会 SIGSEGV（退出码 139）。
+
+### 真机验证（用户授权后做的，不是只跑测试）
+
+重打包 → 重启 App → 走**出货路径**触发：`cmd_channel.send("snap_quad")`，由
+`ui._poll_command`（`ui.py:4938`）在 Tk 主线程消费，转 `_snap_four_quad(force_auto=True)`。
+注意 `CMD_FILE` 在 `tempfile.gettempdir()` 下，**必须用 App 真实的 TMPDIR**，
+自己 export 一个临时目录会写到另一个文件、App 永远收不到。
+
+排布前后用 `CGWindowListCopyWindowInfo` 读回几何对比。RV200 Pro（工作区
+x=0 y=-1080 w=1920 h=1080）结果：ChatGPT `(0,-1049,960,660)`、
+Qoder CN `(960,-1049,960,660)`、Tuanjie `(0,-389,1920,389)`——**0 实质重叠、0 越界**，
+分割比例横向 50% / 竖向 63%。第 4 个候选 PommeToys（最小 540x760）被容量预检
+挡在排布之外，而不是硬塞进去造成重叠——这正是 `quad_capacity()` 该有的行为。
+
+### 2.8 全量单测挂死修复（2026-11-13 末，未提交）
+
+**现象**：`unittest discover -p "test_*.py"` 全量会挂死——75s 后 SIGTERM / exit 137，
+整套 CI 拿不到任何结果。根因用 `faulthandler.dump_traceback_later` 抓栈定位（非猜）：
+
+- `ui.App.__init__` 构造期排 **7 个 `root.after`** 定时器
+  （`_poll_taskbar` / `_poll_display` / `_poll_rehome_capture` / `_start_command_poll` /
+  `_poll_rules` / `_slideshow_restore` / 600ms 的 `_toggle_hk(quiet=True)`）；
+- `settings.json` 的 `hk_enabled=true` 让最后一个在 600ms 后注册 **21 组真机全局热键**并起 `CGEventTap` 线程；
+- root 销毁时**没有取消这些 after** → 跨用例刷 `invalid command name`；
+- 更致命：已映射（未 `withdraw`）的 Tk root 调 `root.update()` 在 macOS 上**永不返回**
+  （栈停在 `tkinter/__init__.py:1314`），`test_snap_rows_mapped.py` 的 `setUpClass` 直接卡死 → 全量套件 SIGTERM。
+  `update_idletasks()` 0.1s 返回且 packer 映射仍然有效，可替代。
+
+**修法（生产 `ui.py` 零改动）**：
+
+- 新增 `tests/ui_harness.py`：`build_app()` 在构造期**冻结** `root.after` / `after_cancel`
+  （定时器只登记不排入 Tcl，并让 `settings.save` 空转），构造完恢复；
+  `close_app()` 停后台对象 → `tk.splitlist(tk.call("after","info"))` 取消该解释器**全部** pending → `destroy`。
+- 8 个界面测试改用该夹具；`test_snap_rows_mapped.py` 的 `update()` 换成 `update_idletasks()`。
+- 新增 `run_tests_guarded.py` + `run_tests.sh` 接入看门狗：`signal.alarm(240，可 MMM_TEST_TIMEOUT 覆盖)`，
+  超时打全线程栈 + 输出 `TEST_SUITE_TIMEOUT` 拒因 + `os._exit(124)`
+  （**不能 `raise SystemExit`**——会被 unittest 当用例异常吞掉、退化成 rc=1，看门狗失效）。
+- `--selfcheck` 用故意 sleep 的假套件反验看门狗 1s 内掐掉。
+
+**三个坑（已踩过，复用价值高）**：
+
+1. `tk.call("after","info")` 在 macOS Tk 返回**空格分隔字符串**，必须 `tk.splitlist`，
+   直接 `for x in` 会按字符遍历 → 一条 pending 都取消不掉。
+2. `raise SystemExit(124)` 被 unittest 框架吞成「用例错误」，rc 退化成 1，看门狗等于没装；
+   必须用 `os._exit(124)`。
+3. 夹具原名 `_ui_harness.py` 被项目 `.gitignore` 的 `_*.py` 忽略 → 改名 `ui_harness.py`
+   （不匹配 `test_*.py`，所以不会被 discover 收集，专门给别的测试 import）。
+
+**验证（全实测）**：
+
+- 全量 `./run_tests.sh` → **508/508 OK（skipped=1，既有非 macOS skip）、89s、rc=0**（原挂死/exit 137）。
+- 夹具回归 `tests/test_ui_harness.py` 10/10；看门狗 `--selfcheck` PASS（假套件 1s 内被 124 掐掉）。
+- **mutant 8/8 全按指定用例变红**（定时器集合 / settings 写入 / after 取消 / 裸 App 构造 /
+  update 回归 / close_app 接线 / 栈打印 / alarm），还原后基线仍绿——确认真绿非假绿。
+- 副作用审计：全量日志 `invalid command name`=0、热键注册行=0；`settings.json` SHA256 不变；
+  Dock 两个偏好键（`autohide-delay` / `autohide-time-modifier`）仍「不存在」→ **本轮没碰用户系统**。
+
+**状态**：本节全部未提交，属 §0 所述 15 个未提交项的一部分。要跑全套现在用
+`TD=$(mktemp -d); TMPDIR="$TD" bash run_tests.sh`（看门狗保护，不会再挂死）。
+
+### 2.9 网格/并排容量预检 + 一键探测最小尺寸（2026-11-22，已提交）
+
+- `grid_plan.capacity()`：按虚拟桌面与每格尺寸算「最多排几个、差多少像素、哪些窗口还没测过最小尺寸」。
+- `ui._update_grid_capacity()`：换布局 / 改行列数 / 勾屏 / 排列完成后都会刷新容量行；
+  容量标签**最后 pack 且 fill/expand**，否则长文案会把屏勾选框挤出可视区（老坑）。
+- 「测最小尺寸」按钮（吸附第三行末尾）逐个缩小窗口读回再放回原位，让容量提示第一次就有依据。
+- 并排/竖排的状态栏补 `_line_capacity_note` 差额提示。
+
+### 2.10 macOS「上次 Python 意外退出」恢复弹窗（2026-11-22，已提交）
+
+**现象**：反复弹
+`The last time you opened Python, it unexpectedly quit while reopening windows. Do you want to try to reopen its windows again?`
+而且**阻塞启动**——log 停在「四宫格缓存已读入」，界面要等有人点按钮才继续。
+
+**根因**：本应用跑在 `Python.app/Contents/MacOS/Python` 上，进程归属 bundle
+`org.python.python`。系统把**任何** python 进程的崩溃记到这个 bundle 头上
+（实测崩溃报告 41 个历史 + 12 个新增，全由 Codex 启动的玻璃效果探针触发，
+栈停在 pyobjc `id_to_python`，应用自身日志 0 错误）。只要记过一次崩溃，
+下次启动就弹框；主进程 abort 被守护脚本拉起时再弹一次 → 「反复弹」。
+
+**修法（全在 `build.py` 的 `_LAUNCHER`，不动应用代码）**：
+
+1. `mmm_clear_python_restore_state()`：删掉
+   `~/Library/Saved Application State/org.python.python.savedState`（弹窗触发源），
+   并写三个偏好键 `NSQuitAlwaysKeepsWindows=false` / `NSDisableRelaunchOnReopen=true` /
+   `ApplePersistenceIgnoreState=true`。
+2. **每次**拉起 python 前都调一次——守护脚本重启链上每一步都不漏。
+3. 写失败不再 `>/dev/null 2>&1` 吞掉，记进 `$TMPDIR/multimon-manager.log`（此前失败过但看不到）。
+4. `--print-python` 分支跳过清理：单测跑它时不该改用户系统偏好。
+5. `MMM_DEFAULTS_BIN` 可注入假 defaults，便于测试不碰真实系统。
+
+**测试**：`tests/test_launcher_crash_dialog.py` 3 例（假 HOME + 假 defaults + 假 python）：
+遗留 savedState 被删、三个键都写过、主进程 abort→重启链第二轮再清一次、
+`--print-python` 不写偏好。全套 **583 例 OK（skipped=1）**。
+
+**真机验证**：冷启动 5s 出界面（原要等 1 分钟）、无弹窗；手工造一个假 savedState 再重启，
+日志出现 `[launcher] 已清理遗留的 Python 窗口恢复状态`，目录确实消失。
+
+**注意**：`~/Library/Saved Application State/` 本身可能不存在，属正常；
+`defaults domains` 里查不到 `org.python.python` 不代表没生效，那是 cfprefsd 缓存的域名列表。
+
 ## 3. 已知平台限制（不要「修」，已文档化）
 
 `README.md:141` 记了一条：**窗口置顶切换是 Windows 独有**。macOS 的 `AXFloating` 写入被系统拒绝（-10006），SkyLight/CGS 接口从非 WindowServer 客户端调用无效。曾有人想「修好它」，结论是做不到，已在 README 明示不提供该按钮。
@@ -219,17 +385,26 @@ App 限制不是程序不准），合计不准 0。
 python3 tests/verify_stack_portrait_real.py
 python3 tests/verify_portrait_zones_real.py
 ```
-2. **真人鼠标点击未闭环**。本轮我用 `btn.invoke()` 验证了绑定与逻辑（确实重排了窗口），CGEventPost 合成点击送不到 App（macOS 限制）。**「用户双击桌面快捷方式后点按钮」这一环仍待真人确认**。
-3. **四窗 2×2 已存在**，叫 `snap_four_quad`（`windows_mac.py:3316`），不是 `snap_four_grid`。带容量预检（`quad_capacity()`）、最小尺寸缓存（`quad_cache.json`）、智能分配（按宽高比重排四角）、排列预演（`quad_predict`）。改四宫格行为前先读这几个函数，别新写一套数学。
+2. **真人鼠标点击仍未闭环**。2026-11-13 这轮走的是托盘命令通道（`snap_quad`）真机排布并读回几何，证明了「按钮背后的逻辑 + 出货路径」是通的；更早一轮用 `btn.invoke()` 验过绑定。**「用户双击桌面快捷方式后亲手点按钮」这一环仍待真人确认**（CGEventPost 合成点击送不到 App，macOS 限制）。
+3. **四窗 2×2 已存在**，叫 `snap_four_quad`（`windows_mac.py:3420`），不是 `snap_four_grid`。带容量预检（`quad_capacity()`）、最小尺寸缓存（`quad_cache.json`）、智能分配（按宽高比重排四角）、排列预演（`quad_predict`）。改四宫格行为前先读这几个函数，别新写一套数学。
+4. **未提交项比上一版多了一层**：`4187716` 这个提交仍在本地 `master`、用户明确选择先不推送；
+   **此外工作区还压着 15 个未提交项**（`power_guard.py` + `tests/test_power_guard.py` +
+   `tests/ui_harness.py` + `tests/test_ui_harness.py` + `run_tests_guarded.py` +
+   8 个界面测试改用夹具的改动 + 本节 §2.8 的看门狗接线）。要推/要 commit 之前先问用户，
+   别自作主张 `git push` 或 `git commit -A`。
+5. **改吸附按钮那一行时先看 §2.7 C**：加按钮很容易再次把行宽顶爆，而 packer 是静默丢控件。加完跑 `tests/test_snap_rows_mapped.py`，它会在最小窗口宽度下逐个查映射。
 
 ## 5. 快速命令
 
 ```bash
 cd "/Users/a1-6/AI Shared/repo/multimon-manager"
 
-# 跑测试（先按 §1.1 清场）
+# 跑测试（隔离 TMPDIR，不用停正在运行的 App）
+TD=$(mktemp -d); TMPDIR="$TD" bash run_tests.sh
+
+# 只有要验单例行为本身时才清场（见 §1.1，注意持锁的可能是 Python 子进程）
 pkill -9 -f "多屏管理器"; sleep 1
-bash run_tests.sh
+lsof $TMPDIR/multimon_manager.lock
 
 # 重新打包 + 启动
 python3 build.py && open ~/Desktop/多屏管理器

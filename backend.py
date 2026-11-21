@@ -88,6 +88,14 @@ is_window_portrait_suitable = getattr(windows, "is_window_portrait_suitable", la
 fill_all_monitors = getattr(windows, "fill_all_monitors", lambda *a, **k: 0)
 # 虚拟桌面网格：把勾选的多块屏当成一块大桌面，按 m×n 或加权比例网格批排
 fill_grid = getattr(windows, "fill_grid", lambda *a, **k: 0)
+# 网格容量预检（只读最小尺寸缓存，不动窗口）：界面在点「网格批排」前显示
+# 「最多排几个 / 差多少像素」
+grid_capacity = getattr(windows, "grid_capacity", lambda *a, **k: None)
+# 并排/竖排容量预检（同一份缓存）：两窗最小宽之和超过屏宽、或三窗最小高
+# 之和超过屏高时，点按钮之前就说清「差多少」
+line_capacity = getattr(windows, "line_capacity", lambda *a, **k: None)
+# 主动实测最小尺寸并写缓存：容量提示首次使用就有依据（会缩窗口，仅手动触发）
+probe_min_sizes = getattr(windows, "probe_min_sizes", lambda *a, **k: None)
 # 窗口置顶切换（Windows 实现；macOS 暂无对应实现时为 None，UI 自动隐藏入口）
 toggle_topmost = getattr(windows, "toggle_topmost", None)
 HotkeyManager = hotkeys.HotkeyManager

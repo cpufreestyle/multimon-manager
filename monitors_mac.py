@@ -395,6 +395,16 @@ def _compute_work_areas(monitors):
 DOCK_SAFETY_PT = 6
 
 
+# Dock 自动隐藏时，工作区里小于这个值的边距保留。macOS 会故意留一条
+# 「鼠标触边唤出 Dock」的感应条（Rectangle 的 minimumReliableInset 同值、
+# 同语义）；把它收回会让 Dock 再也唤不出来。
+DOCK_SMALL_INSET_PT = 8
+
+# Dock 不可能占掉屏幕某条边的三分之一以上。超过这个比例的「面板」多半是
+# Dock 的右键菜单、图标预览或其它浮动面板，拿它裁工作区会把整块屏压掉一截。
+DOCK_MAX_INSET_RATIO = 0.33
+
+
 def _intersection_area(a, b):
     """两个 `(x, y, w, h)` 矩形的交集面积。"""
     ax, ay, aw, ah = a
@@ -402,6 +412,42 @@ def _intersection_area(a, b):
     ow = max(0, min(ax + aw, bx + bw) - max(ax, bx))
     oh = max(0, min(ay + ah, by + bh) - max(ay, by))
     return ow * oh
+
+
+def _reclaim_dock_edges(m, small=DOCK_SMALL_INSET_PT):
+    """把工作区里过期的 Dock 边距收回到屏幕边缘。返回是否发生变化。
+
+    只在「Dock 自动隐藏」时调用。macOS 的 `NSScreen.visibleFrame` 在 Dock
+    刚切到自动隐藏后可能仍是旧值（Rectangle 在 #467 里记过同款问题）：
+    残留的 Dock 边距不会自己消失，窗口与屏幕边之间就永远留一条填不上的缝，
+    用户看到的是「排完没铺满」。
+
+    只收回左/右/底三条边，且小于 `small` 的边距保留——那是 macOS 留给
+    「鼠标触边唤出 Dock」的感应条，收掉会盖住唤出区。顶部一律不动：
+    菜单栏/刘海那条不属于 Dock。
+    """
+    if m is None or m.work_width <= 0 or m.work_height <= 0:
+        return False
+    sl, st = int(m.left), int(m.top)
+    sr, sb = sl + int(m.width), st + int(m.height)
+    wl, wt = int(m.work_left), int(m.work_top)
+    wr, wb = wl + int(m.work_width), wt + int(m.work_height)
+
+    left_inset = max(0, wl - sl)
+    right_inset = max(0, sr - wr)
+    bottom_inset = max(0, sb - wb)
+    nl = sl + (left_inset if left_inset <= small else 0)
+    nr = sr - (right_inset if right_inset <= small else 0)
+    nb = sb - (bottom_inset if bottom_inset <= small else 0)
+    # 顶边只做安全钳制，从不向上扩：菜单栏那条不在 Dock 的职责里
+    nt = min(max(wt, st), nb - 1)
+    if nr - nl < 1 or nb - nt < 1:
+        return False
+    if (nl, nt, nr - nl, nb - nt) == (wl, wt, wr - wl, wb - wt):
+        return False
+    m.work_left, m.work_top = nl, nt
+    m.work_width, m.work_height = nr - nl, nb - nt
+    return True
 
 
 def _dock_side(mon_rect, panel):
@@ -433,18 +479,26 @@ def _trim_work_for_dock(m, panel, safety=DOCK_SAFETY_PT):
     if side == "bottom":
         # 窗口底边必须停在 Dock 面板顶边再往上 safety 像素处。
         limit = int(py) - safety
+        if not _inset_plausible(wb - limit, m.height):
+            return False
         if limit < wb:
             wb = max(wt + 1, limit)
     elif side == "top":
         limit = int(py) + int(ph) + safety
+        if not _inset_plausible(limit - wt, m.height):
+            return False
         if limit > wt:
             wt = min(wb - 1, limit)
     elif side == "left":
         limit = int(px) + int(pw) + safety
+        if not _inset_plausible(limit - wl, m.width):
+            return False
         if limit > wl:
             wl = min(wr - 1, limit)
     else:  # right
         limit = int(px) - safety
+        if not _inset_plausible(wr - limit, m.width):
+            return False
         if limit < wr:
             wr = max(wl + 1, limit)
 
@@ -453,6 +507,23 @@ def _trim_work_for_dock(m, panel, safety=DOCK_SAFETY_PT):
         m.work_left, m.work_top = wl, wt
         m.work_width, m.work_height = wr - wl, wb - wt
     return changed
+
+
+def _inset_plausible(inset, dimension):
+    """这条边距像不像 Dock 真占出来的？
+
+    真 Dock 的厚度是几十到一百多 pt；超过屏幕该方向 1/3 的「边距」几乎
+    一定是误判（Dock 右键菜单、图标预览、或某块浮动面板压在了屏边）。
+    这类面板拿去做裁剪会把整块屏压掉一截，比不裁更糟。
+    """
+    try:
+        inset = float(inset)
+        dimension = float(dimension)
+    except (TypeError, ValueError):
+        return False
+    if dimension <= 0:
+        return False
+    return 0.5 < inset <= dimension * DOCK_MAX_INSET_RATIO
 
 
 def _trim_work_without_panel(m, safety=DOCK_SAFETY_PT):
@@ -486,8 +557,10 @@ def _trim_work_without_panel(m, safety=DOCK_SAFETY_PT):
 def _apply_dock_avoidance(monitors, autohide=None, panel=None):
     """把固定显示的 Dock 从工作区里扣掉。
 
-    Dock 自动隐藏时不额外预留：用户明确选择让 Dock 只在鼠标触边时出现，
-    此时窗口用完整 visibleFrame 是预期行为。
+    Dock 自动隐藏时不额外预留，并把 visibleFrame 里可能过期的 Dock 边距
+    收回到屏幕边缘（`_reclaim_dock_edges`）：用户明确选择让 Dock 只在鼠标
+    触边时出现，窗口就该铺到屏幕边。只收大于 8pt 的残留边距，小于 8pt 的
+    保留给「触边唤出」的感应条。
 
     autohide / panel 可显式传入，供单测固定输入；None 时读系统。panel 传
     一个 ``object()`` 以外的假矩形都按矩形处理，无法区分「未传」和「读不到」，
@@ -504,19 +577,41 @@ def _apply_dock_avoidance(monitors, autohide=None, panel=None):
             autohide, panel = None, None
 
     if autohide is True:
+        for m in monitors:
+            if _reclaim_dock_edges(m):
+                logger.debug("Dock 自动隐藏：收回过期边距（%s）",
+                             m.device_name)
         return
     if panel is None:
         for m in monitors:
             _trim_work_without_panel(m)
         return
 
-    # 多屏时 Dock 只占一块屏：按面板与完整屏幕的最大交集归属，别的屏不动。
-    owner = None
-    best = 0
-    for m in monitors:
-        area = _intersection_area((m.left, m.top, m.width, m.height), panel)
-        if area > best:
-            owner, best = m, area
+    # 多屏时 Dock 只占一块屏：按面板与完整屏幕的交集归属，别的屏不动。
+    # 三道保险（Rectangle DockUtil 同款），任何一条不过就整轮跳过：
+    #   ① 面板必须真正落在一块屏上（覆盖自身面积的一半以上）；
+    #   ② 不能有两块屏打平——那说明面板横跨了交界，归属不可靠；
+    #   ③ 面板厚度必须在合理范围（见 _inset_plausible）。
+    try:
+        panel_area = max(1, int(panel[2]) * int(panel[3]))
+    except (TypeError, ValueError, IndexError):
+        return
+    areas = sorted(
+        ((_intersection_area((m.left, m.top, m.width, m.height), panel), i)
+         for i, m in enumerate(monitors)),
+        reverse=True,
+    )
+    if not areas:
+        return
+    best, owner_idx = areas[0]
+    if best * 2 < panel_area:
+        logger.debug("Dock 面板只有 %.0f%% 落在一块屏上，跳过裁剪",
+                     best * 100.0 / panel_area)
+        return
+    if len(areas) > 1 and areas[1][0] == best:
+        logger.debug("Dock 面板同时压住两块屏，归属不可靠，跳过裁剪")
+        return
+    owner = monitors[owner_idx]
     if owner is not None and _trim_work_for_dock(owner, panel):
         logger.debug("工作区避开 Dock 面板 %s（%s）",
                      panel, owner.device_name)

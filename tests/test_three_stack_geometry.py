@@ -73,6 +73,38 @@ class TestThreeStackIdealGeometry(unittest.TestCase):
         self.assertEqual(rects[2][1] + rects[2][3], -1066 + 2048)
 
 
+class TestBandLengthHelpers(unittest.TestCase):
+    """两段/三段分配的纯函数契约：有下限先满足下限，否则对半/三等分。"""
+
+    def test_two_halves_without_mins(self):
+        self.assertEqual(wm._two_band_lengths(1000, [0, 0]), [500, 500])
+        self.assertEqual(wm._two_band_lengths(1001, [0, 0]), [500, 501])
+
+    def test_two_respects_minimum(self):
+        self.assertEqual(wm._two_band_lengths(1000, [700, 0]), [700, 300])
+
+    def test_two_infeasible_falls_back_to_halves(self):
+        self.assertEqual(wm._two_band_lengths(1000, [800, 800]), [500, 500])
+
+    def test_three_ideal_split_with_remainder_first(self):
+        self.assertEqual(wm._three_stack_heights(2048, [0, 0, 0]),
+                         [683, 683, 682])
+
+    def test_three_respects_all_minimums(self):
+        # 真机 DELL 竖屏：工作区 1920，扣掉 31px 菜单栏条带后 1889
+        self.assertEqual(wm._three_stack_heights(1889, [752, 520, 496]),
+                         [753, 568, 568])
+
+    def test_three_infeasible_falls_back_to_equal(self):
+        self.assertEqual(wm._three_stack_heights(900, [600, 600, 600]),
+                         [300, 300, 300])
+
+    def test_partial_mins_still_honoured(self):
+        """只探到部分窗口的最小尺寸时，也要先满足已知的那个。"""
+        self.assertEqual(wm._three_stack_heights(1000, [600, 0, 0]),
+                         [600, 200, 200])
+
+
 class TestThreeStackWrites(unittest.TestCase):
     """观测 snap_three_stack 实际写给 set_window_rect 的矩形。
 
