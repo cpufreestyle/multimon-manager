@@ -1,8 +1,8 @@
-# 交接 — multimon-manager（2026-11-13：四格「排完就废」三处根因修复 + 真机验证）
+# 交接 — multimon-manager（2026-11-22：macOS 崩溃恢复弹窗根治 + 网格容量预检）
 
 > 本文件是**当前**交接入口，读完即可接管。
 > 代码根：`/Users/a1-6/AI Shared/repo/multimon-manager/`
-> 版本 0.3.2 · 全套单测通过 · `master` **领先 `origin/master` 1 个提交（未推送）**，HEAD `4187716`
+> 版本 0.3.2 · 全套单测通过 · `master` 与 `origin/master` **同步**，HEAD `fd69e2d`（以 `git log -1` 为准）
 > 运行形态：`dist/多屏管理器.app`（桌面快捷方式 `~/Desktop/多屏管理器`，Finder alias）
 > 上一轮（2026-11-08：启动下拉、授权提示、顶边补偿、容量提示）的细节保留在 §2.1–§2.6。
 
@@ -16,7 +16,7 @@
 | 修复 A | 删掉 `_snap_two_side_by_side` / `_snap_three_stack` / `_snap_four_quad` / `_fill_grid` 里的自动释放块；释放只由用户点「释放窗口」触发（`ui.py:574`） |
 | 修复 B | `_ax_window_by_geometry` / `_ax_window_by_name` 增 `seq` 参数，带显式序号时禁用主窗口兜底（`windows_mac.py:1026` / `:1098`），4 个调用点全部传 `seq` |
 | 修复 C | 吸附按钮拆成三行（8 整/半屏 + 8 三分之一/四角 + 5 记忆/暂存），`ui.py:791`；顺带删掉从未被调用的 `release_all_windows()` |
-| 测试 | `python@3.14` 全套 **508 例 OK（skipped=1，约 40 个测试文件）**，用隔离 `TMPDIR` 跑，**没停正在运行的 App**（见 §1.1 + §2.8 看门狗） |
+| 测试 | `python@3.14` 全套 **583 例 OK（skipped=1）**，用隔离 `TMPDIR` 跑，**没停正在运行的 App**（见 §1.1 + §2.8 看门狗） |
 | 真机 | 重打包 + 重启后走托盘命令通道真排了一次 2×2：RV200 Pro 上 3 个窗口 0 重叠 0 越界，第 4 个被容量预检挡下（详见 §2.7） |
 | git | 代码 HEAD `4187716`，**本地领先 origin/master 1 个提交，用户明确选择先不推送**；**工作区另有 15 个未提交项**（省电守护 `power_guard.py` + 全量单测挂死修复，见 §2.8），全部未 commit |
 
