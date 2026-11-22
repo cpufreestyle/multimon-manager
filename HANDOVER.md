@@ -1,10 +1,24 @@
-# 交接 — multimon-manager（2026-11-22：macOS 崩溃恢复弹窗根治 + 网格容量预检）
+# 交接 — multimon-manager（2026-11-22：UI 玻璃效果 + 崩溃恢复弹窗根治）
 
 > 本文件是**当前**交接入口，读完即可接管。
 > 代码根：`/Users/a1-6/AI Shared/repo/multimon-manager/`
 > 版本 0.3.2 · 全套单测通过 · `master` 与 `origin/master` **同步**，HEAD `fd69e2d`（以 `git log -1` 为准）
 > 运行形态：`dist/多屏管理器.app`（桌面快捷方式 `~/Desktop/多屏管理器`，Finder alias）
 > 上一轮（2026-11-08：启动下拉、授权提示、顶边补偿、容量提示）的细节保留在 §2.1–§2.6。
+
+## 0.1 本轮增量（UI 玻璃 / 紧凑布局）
+
+- 新增 `mac_glass.py`：纯 ctypes 调系统 Objective-C runtime，给 Tk 主窗口
+  挂 `NSVisualEffectView`（`UnderWindowBackground`），不引入 PyObjC。
+- 玻璃视图插在 Tk 控件底层，不拦截点击；失败自动回退普通界面。
+  禁用方式：环境变量 `MMM_GLASS=0`。
+- `main.py` 在 `ui.App` 构建完成后调用玻璃层，日志出现
+  `mac_glass: macOS 毛玻璃已启用`。
+- `ui._configure_compact_style()` 统一收紧按钮、下拉、单选、卡片 padding。
+  窗口工具吸附按钮保持三行，但分组更清楚、间距更小；两行版本经
+  `tests/test_snap_rows_mapped.py` 验证会丢「释放窗口/暂存/取回/测最小尺寸」
+  的映射，不能回退。
+- 真机截图验证：主窗口 820×712，玻璃效果可见，三行按钮完整映射。
 
 ## 0. 一分钟速览
 

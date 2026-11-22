@@ -184,6 +184,7 @@ class App:
 
     # ---------- 构建 ----------
     def _build(self):
+        self._configure_compact_style()
         # 所有分区放在同一个页面里：纵向内容超出窗口高度时，用画布 + 垂直滑块
         # 上下滚动浏览（不再分页）。
         self.content = ttk.Frame(self.root)
@@ -314,6 +315,19 @@ class App:
                 if w.winfo_class() == "TLabelframe":
                     self._card_frames[(parent, str(w.cget("text")))] = w
         self._apply_ui_mode()
+
+    def _configure_compact_style(self):
+        """统一收紧控件间距，给主窗口留出更多有效排列空间。"""
+        try:
+            style = ttk.Style(self.root)
+            style.configure("TButton", padding=(5, 2))
+            style.configure("TCheckbutton", padding=(1, 0))
+            style.configure("TRadiobutton", padding=(1, 0))
+            style.configure("TCombobox", padding=(3, 1))
+            style.configure("TSpinbox", padding=(2, 0))
+            style.configure("TLabelframe", padding=(3, 2))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _apply_ui_mode(self):
         """极简：隐藏进阶卡并把「布局与壁纸/设置」标签一起藏掉（其全部卡片均为进阶）。"""
@@ -785,11 +799,8 @@ class App:
         if getattr(b, "toggle_topmost", None) is not None:
             btns.append(("置顶切换", lambda: self._toggle_topmost_action(),
                          "切换目标窗口是否置顶显示"))
-        # 吸附按钮分三行：8 个整/半屏 + 8 个三分之一/四角 + 5 个记忆/暂存。
-        # 曾把后两组挤在同一行，自然宽 1005px，而最小尺寸下窗口工具只有约
-        # 775px 可视宽——packer 装不下就不映射末尾控件，「释放窗口 / 暂存 /
-        # 取回」三个按钮直接消失（对象还在、command 还绑着，用户点不到）。
-        # 分行后实测每行都在可视宽内，见 tests/test_snap_rows_mapped.py。
+        # 三行紧凑分组：第一行是移动/半屏，第二行是三分之一/四角，
+        # 第三行是记忆与尺寸工具。两行会让末尾按钮被 Tk packer 静默挤掉。
         snap_rows = []
         for _ in range(3):
             r = ttk.Frame(f)
@@ -800,33 +811,35 @@ class App:
                              command=self._keep_front_after(cmd))
             btn.pack(side="left", padx=1)
             self._tooltip(btn, tip)
-        for text, cmd, tip in btns[8:]:
+        for text, cmd, tip in btns[8:16]:
             btn = ttk.Button(snap_rows[1], text=text,
+                             command=self._keep_front_after(cmd))
+            btn.pack(side="left", padx=1)
+            self._tooltip(btn, tip)
+        for text, cmd, tip in btns[16:]:
+            btn = ttk.Button(snap_rows[2], text=text,
                              command=self._keep_front_after(cmd))
             btn.pack(side="left", padx=1)
             self._tooltip(btn, tip)
         undo_btn = ttk.Button(snap_rows[2], text="撤销移动",
                               command=self._undo_move)
-        undo_btn.pack(side="left", padx=(1, 1))
+        undo_btn.pack(side="left", padx=(4, 1))
         self._tooltip(undo_btn, "回退上一次窗口的移动/缩放（快捷键 F7）")
         back_btn = ttk.Button(snap_rows[2], text="回摆放位",
                               command=self._back_to_arranged)
-        back_btn.pack(side="left", padx=(8, 1))
+        back_btn.pack(side="left", padx=(4, 1))
         self._tooltip(back_btn,
                       "把目标窗口送回上次被本程序摆好的位置"
                       "（窗口被拖乱后一键归位）")
         release_btn = ttk.Button(snap_rows[2], text="释放窗口",
                                  command=self._release_window)
-        release_btn.pack(side="left", padx=(8, 1))
+        release_btn.pack(side="left", padx=(4, 1))
         self._tooltip(release_btn,
                       "清除程序对该窗口的位置记忆，以后不会自动把它拉回"
                       "（窗口拖不动或排完后弹回时使用）")
-
-        # 暂存 / 取回（复刻 Rectangle Pro 的 Stash）：把不用的窗口收到屏幕顶边，
-        # 再按一次取回最早那个，位置尺寸原样恢复。
         stash_btn = ttk.Button(snap_rows[2], text="暂存",
                                command=self._stash_action)
-        stash_btn.pack(side="left", padx=(8, 1))
+        stash_btn.pack(side="left", padx=(4, 1))
         self._tooltip(stash_btn,
                       "把目标窗口收到当前屏幕顶边（只露一小条），"
                       "位置尺寸会记住，之后用「取回」还原（快捷键 ⌘⌥+S）")
@@ -837,7 +850,7 @@ class App:
                       "取回最早暂存的窗口到它原来的位置（快捷键 ⌘⌥+D）")
         probe_btn = ttk.Button(snap_rows[2], text="测最小尺寸",
                                command=self._probe_min_sizes)
-        probe_btn.pack(side="left", padx=(8, 1))
+        probe_btn.pack(side="left", padx=(4, 1))
         self._tooltip(
             probe_btn,
             "把下面点名过的窗口逐个缩到最小再读回，然后放回原位置——"

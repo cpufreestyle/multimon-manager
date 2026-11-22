@@ -58,6 +58,7 @@ import cmd_channel
 import settings
 import resources
 import ui
+import mac_glass
 
 
 def _single_instance():
@@ -249,6 +250,8 @@ def main():
         except Exception:  # noqa: BLE001
             pass
         raise
+    if sys.platform == "darwin":
+        mac_glass.apply(root, enabled=os.environ.get("MMM_GLASS", "1") != "0")
     logging.getLogger(__name__).info("界面构建完成")
 
     if start_minimized:
