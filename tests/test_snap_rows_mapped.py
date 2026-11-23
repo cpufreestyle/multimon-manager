@@ -65,11 +65,22 @@ class SnapRowsMappedTest(unittest.TestCase):
         w, h = cls.root.minsize()
         cls.root.geometry("%dx%d" % (w, h))
         cls.root.update_idletasks()
+        # Windows 的窗口管理器是异步的：geometry() 之后要等 WM 回一个
+        # Configure 事件，update_idletasks() 不等它。注意此时 Tk 自己的
+        # winfo_width() 已经是目标值了（它只是记下了请求），但子控件还停在
+        # 旧布局上——本机实测画布宽度卡在 1px，于是「按钮有没有超出画布
+        # 右边缘」量的是错的尺寸（报出 106~285px 溢出；真实最小宽度下
+        # 这一行自然宽 760px、画布 781px，本来是放得下的）。
+        # macOS 上几何是同步生效的，不需要这一步；而已映射 root 的
+        # update() 在 macOS Tk 上会永不返回，所以只在 Windows 这边补。
         # 这里绝不能调 cls.root.update()：本类刻意不 withdraw（窗口未映射时
         # packer 不受宽度约束，映射/越界判定会失真），而 macOS Tk 对已映射
         # root 的 update() 会持续处理 Expose/Configure 事件、永不返回。
         # 2026-11-13 faulthandler 实测栈停在 tkinter/__init__.py:1314。
         # update_idletasks() 足以完成几何与 packer 映射，实测 0.1s 返回。
+        if sys.platform == "win32":
+            cls.root.update()
+            cls.root.update_idletasks()
 
     @classmethod
     def tearDownClass(cls):

@@ -186,6 +186,8 @@ class TestKeepAwakeApply(unittest.TestCase):
         会还原（还原动作本身有「系统确实还开着」这道守门，不误关别人
         正在用的开关之外的状态）。
         """
+        if not ka.IS_MAC:
+            self.skipTest("clamshell 认领/还原流程仅 macOS 验证")
         g = ka.KeepAwake()
         self.assertFalse(g._did_set_disablesleep)
         self._orig_sd = ka.sleep_disabled_state
@@ -272,6 +274,256 @@ class TestTexts(unittest.TestCase):
                   "sleep_disabled": False}
         text = ka._fail_text(ka.MODE_CLAMSHELL, detail)
         self.assertIn("系统级禁止睡眠未开启", text)
+
+
+class TestWinFlagsFor(unittest.TestCase):
+    """共享计划 → Windows 执行状态标志的映射。"""
+
+    def test_system_only(self):
+        p = ka.plan(ka.MODE_SYSTEM)
+        self.assertEqual(
+            ka._win_flags_for(p["assertions"]),
+            ka._ES_SYSTEM_REQUIRED)
+
+    def test_display_adds_screen_flag(self):
+        p = ka.plan(ka.MODE_DISPLAY)
+        self.assertEqual(
+            ka._win_flags_for(p["assertions"]),
+            ka._ES_SYSTEM_REQUIRED | ka._ES_DISPLAY_REQUIRED)
+
+    def test_off_is_zero(self):
+        self.assertEqual(ka._win_flags_for(()), 0)
+
+
+class TestWinFailTexts(unittest.TestCase):
+    """Windows 失败说明要说清合盖动作到底卡在哪一步。"""
+
+    def test_lid_unreadable(self):
+        text = ka._win_fail_text(
+            ka.MODE_CLAMSHELL,
+            {"held": ["系统不休眠"], "lid": None})
+        self.assertIn("读不到合盖动作", text)
+
+    def test_lid_already_off(self):
+        text = ka._win_fail_text(
+            ka.MODE_CLAMSHELL,
+            {"held": [], "lid": (0, 0), "lid_already_off": True})
+        self.assertIn("本来就是", text)
+
+    def test_lid_untouched_on_silent_restore(self):
+        text = ka._win_fail_text(
+            ka.MODE_CLAMSHELL,
+            {"held": ["系统不休眠"], "lid": (1, 1), "lid_untouched": True})
+        self.assertIn("立即生效", text)
+
+    def test_lid_denied(self):
+        text = ka._win_fail_text(
+            ka.MODE_CLAMSHELL,
+            {"held": ["系统不休眠"], "lid": (1, 1)})
+        self.assertIn("管理员授权", text)
+
+    def test_exec_state_failed(self):
+        text = ka._win_fail_text(
+            ka.MODE_DISPLAY, {"held": [], "lid": (1, 1)})
+        self.assertIn("SetThreadExecutionState", text)
+
+
+class TestLidActionName(unittest.TestCase):
+    def test_known_values(self):
+        self.assertEqual(ka.lid_action_name(0), "不采取任何操作")
+        self.assertEqual(ka.lid_action_name(1), "睡眠")
+        self.assertEqual(ka.lid_action_name(2), "休眠")
+
+    def test_unknown_value(self):
+        self.assertIn("未知", ka.lid_action_name(99))
+
+
+class TestWinHolder(unittest.TestCase):
+    """_WinExecutionHolder 的线程安全与清理（真开线程，真调 API）。"""
+
+    def test_set_and_stop_roundtrip(self):
+        if not ka.IS_WIN:
+            self.skipTest("仅 Windows 验证")
+        h = ka._WinExecutionHolder()
+        try:
+            self.assertTrue(h.set(ka._ES_SYSTEM_REQUIRED))
+            self.assertIn("系统不休眠", h.current_names())
+        finally:
+            h.stop()
+        self.assertEqual(h.current_names(), [])
+
+    def test_names_empty_before_set(self):
+        h = ka._WinExecutionHolder()
+        try:
+            self.assertEqual(h.current_names(), [])
+        finally:
+            h.stop()
+
+
+class TestWinKeepAwakeApply(unittest.TestCase):
+    """Windows 编排层：执行状态 / 合盖动作备份与还原。
+
+    合盖动作真的写系统，测试里换成记录器；真跑一个 MODE_SYSTEM 看它
+    把标志持上（那是纯进程内效果，退出即失效）。
+    """
+
+    def test_system_mode_holds_flags(self):
+        if not ka.IS_WIN:
+            self.skipTest("仅 Windows 验证")
+        g = ka.KeepAwake()
+        try:
+            ok, _text, detail = g.apply(ka.MODE_SYSTEM)
+            self.assertTrue(ok)
+            self.assertEqual(detail.get("held"), ["系统不休眠"])
+        finally:
+            g.release_all()
+        self.assertEqual(g.status()["held"], [])
+
+    def test_clamshell_backs_up_and_restores(self):
+        if not ka.IS_WIN:
+            self.skipTest("仅 Windows 验证")
+        g = ka.KeepAwake()
+        orig_pair = ka._win_set_lid_pair
+        orig_state = ka._lid_state
+        calls = []
+        state = {"lid": [1, 1]}            # 假装合盖动作=睡眠
+
+        def fake_pair(ac, dc, allow_prompt=False):
+            calls.append((ac, dc, allow_prompt))
+            if allow_prompt:
+                state["lid"] = [ac, dc]    # 提权写成功
+                return True
+            return False                   # 非管理员直写失败
+
+        def fake_state():
+            return tuple(state["lid"])
+
+        ka._lid_state = fake_state
+        ka._win_set_lid_pair = fake_pair
+        try:
+            # 启动静默恢复：直写不弹框 → 失败 → 如实报「未完全生效」，不认领
+            ok, text, _detail = g.apply(ka.MODE_CLAMSHELL, allow_prompt=False)
+            self.assertFalse(ok)
+            self.assertIn("管理员授权", text)
+            self.assertIsNone(g._win_lid_backup)
+            self.assertEqual(calls, [(0, 0, False)])
+            # 用户在界面点「立即生效」：备份原值 → 提权写 0/0
+            ok2, _t2, _d2 = g.apply(ka.MODE_CLAMSHELL, allow_prompt=True)
+            self.assertTrue(ok2)
+            self.assertEqual(g._win_lid_backup, (1, 1))
+            self.assertEqual(calls[-1], (0, 0, True))
+            # 退出还原：把原值写回去
+            g.release_all()
+            self.assertEqual(calls[-1], (1, 1, True))
+            self.assertIsNone(g._win_lid_backup)
+            self.assertEqual(state["lid"], [1, 1])
+        finally:
+            ka._win_set_lid_pair = orig_pair
+            ka._lid_state = orig_state
+            g.release_all()
+
+    def test_clamshell_direct_write_ok_without_prompt(self):
+        """程序本身有管理员权限时，静默恢复的直写就该成功。"""
+        if not ka.IS_WIN:
+            self.skipTest("仅 Windows 验证")
+        g = ka.KeepAwake()
+        orig_pair = ka._win_set_lid_pair
+        orig_state = ka._lid_state
+        state = {"lid": [1, 1]}
+
+        def fake_pair(ac, dc, allow_prompt=False):
+            state["lid"] = [ac, dc]
+            return True
+
+        def fake_state():
+            return tuple(state["lid"])
+
+        ka._lid_state = fake_state
+        ka._win_set_lid_pair = fake_pair
+        try:
+            ok, _text, _d = g.apply(ka.MODE_CLAMSHELL, allow_prompt=False)
+            self.assertTrue(ok)
+            self.assertEqual(g._win_lid_backup, (1, 1))
+            self.assertEqual(state["lid"], [0, 0])
+        finally:
+            ka._win_set_lid_pair = orig_pair
+            ka._lid_state = orig_state
+            g.release_all()
+
+    def test_clamshell_already_off_not_claimed(self):
+        """合盖动作本来就是 0/0（别的工具设的）：不认领，退出不还原。"""
+        if not ka.IS_WIN:
+            self.skipTest("仅 Windows 验证")
+        g = ka.KeepAwake()
+        orig_pair = ka._win_set_lid_pair
+        orig_state = ka._lid_state
+        calls = []
+        ka._lid_state = lambda: (0, 0)
+        ka._win_set_lid_pair = lambda ac, dc, allow_prompt=False: \
+            calls.append((ac, dc)) or True
+        try:
+            ok, _text, detail = g.apply(ka.MODE_CLAMSHELL, allow_prompt=True)
+            self.assertTrue(ok)
+            self.assertTrue(detail.get("lid_already_off"))
+            self.assertIsNone(g._win_lid_backup)
+            self.assertEqual(calls, [])
+        finally:
+            ka._win_set_lid_pair = orig_pair
+            ka._lid_state = orig_state
+            g.release_all()
+
+    def test_clamshell_write_failed_keeps_state_untouched_message(self):
+        """提权后仍写不进（组策略禁改）：报具体原因，不认领。"""
+        if not ka.IS_WIN:
+            self.skipTest("仅 Windows 验证")
+        g = ka.KeepAwake()
+        orig_pair = ka._win_set_lid_pair
+        orig_state = ka._lid_state
+        ka._lid_state = lambda: (1, 1)
+        ka._win_set_lid_pair = lambda ac, dc, allow_prompt=False: False
+        try:
+            ok, text, d = g.apply(ka.MODE_CLAMSHELL, allow_prompt=True)
+            self.assertFalse(ok)
+            self.assertIn("组策略", text)
+            self.assertIsNone(g._win_lid_backup)
+            self.assertEqual(d.get("lid"), (1, 1))
+        finally:
+            ka._win_set_lid_pair = orig_pair
+            ka._lid_state = orig_state
+            g.release_all()
+
+    def test_clamshell_failed_write_does_not_own_backup(self):
+        """写入失败（UAC 取消）不能认领 backup——否则退出会把系统改回错误值。"""
+        if not ka.IS_WIN:
+            self.skipTest("仅 Windows 验证")
+        g = ka.KeepAwake()
+        orig_pair = ka._win_set_lid_pair
+        orig_state = ka._lid_state
+        ka._lid_state = lambda: (1, 1)
+        ka._win_set_lid_pair = lambda ac, dc, allow_prompt=False: False
+        try:
+            ok, _t, d = g.apply(ka.MODE_CLAMSHELL, allow_prompt=True)
+            self.assertFalse(ok)
+            self.assertIsNone(g._win_lid_backup)
+            self.assertEqual(d.get("lid"), (1, 1))
+        finally:
+            ka._win_set_lid_pair = orig_pair
+            ka._lid_state = orig_state
+            g.release_all()
+
+    def test_downgrade_releases_flags(self):
+        if not ka.IS_WIN:
+            self.skipTest("仅 Windows 验证")
+        g = ka.KeepAwake()
+        try:
+            g.apply(ka.MODE_DISPLAY)
+            self.assertTrue(g._win_holder.current_names())
+            g.apply(ka.MODE_SYSTEM)
+            self.assertEqual(g._win_holder.current_names(), ["系统不休眠"])
+            g.apply(ka.MODE_OFF)
+            self.assertEqual(g._win_holder.current_names(), [])
+        finally:
+            g.release_all()
 
 
 if __name__ == "__main__":

@@ -50,6 +50,48 @@ def _make_shortcut(lnk_path, target, icon=None, working_dir=None):
             pass
 
 
+def _desktop_dir():
+    r"""取用户真实的桌面目录。
+
+    中文 Windows 上 `%USERPROFILE%\Desktop` 常常只是个没人看的遗留空目录，
+    真正的桌面被重定向到了别处（例如 `D:\michael\桌面`）。硬拼路径会把快捷
+    方式建到那里，而用户要的就是「快捷方式放桌面」。所以先读资源管理器自己
+    记录的位置 `User Shell Folders!Desktop`，读不到或目录不存在时才退回
+    硬拼。
+    """
+    import winreg
+
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            value, _kind = winreg.QueryValueEx(key, "Desktop")
+    except OSError:
+        value = ""
+    path = os.path.expandvars((value or "").strip().strip('"'))
+    if path and os.path.isdir(path):
+        return path
+    return os.path.join(os.path.expanduser("~"), "Desktop")
+
+
+def _desktop_lnk_candidates():
+    r"""卸载时要清掉的桌面快捷方式，去重且保序。
+
+    只删「安装时实际建的那个」不够：桌面后来被重定向过的话，旧的遗留快捷
+    方式还躺在 `%USERPROFILE%\Desktop` 里，一并删掉才干净。
+    """
+    bases = [_desktop_dir(), os.path.join(os.path.expanduser("~"), "Desktop")]
+    out, seen = [], set()
+    for base in bases:
+        if not base:
+            continue
+        lnk = os.path.join(base, APP_NAME + ".lnk")
+        key = os.path.normcase(os.path.normpath(lnk))
+        if key not in seen:
+            seen.add(key)
+            out.append(lnk)
+    return out
+
+
 def _write_uninstall_bat(install_dir):
     """生成卸载批处理，删除目录、快捷方式和注册表项。"""
     bat = os.path.join(install_dir, "uninstall.bat")
@@ -57,11 +99,17 @@ def _write_uninstall_bat(install_dir):
         "@echo off",
         f'rmdir /s /q "{install_dir}"',
         f'del "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\{APP_NAME}.lnk"',
-        f'del "%USERPROFILE%\\Desktop\\{APP_NAME}.lnk"',
-        r'reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\MultiMonManager" /f',
-        "echo 卸载完成。",
     ]
-    with open(bat, "w", encoding="ascii") as f:
+    for lnk in _desktop_lnk_candidates():
+        lines.append(f'del "{lnk}" 2>nul')
+    lines.append(
+        r'reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\MultiMonManager" /f'
+    )
+    lines.append("echo 卸载完成。")
+    # 用 mbcs（Windows ANSI 代码页）而不是 ascii：最后一行 echo 是中文，
+    # ascii 编码直接 UnicodeEncodeError，安装器在中文 Windows 上必然崩。
+    # cmd 的 OEM 页在中文系统上同为 936，echo 出来不会乱码。
+    with open(bat, "w", encoding="mbcs") as f:
         f.write("\n".join(lines))
     return bat
 
@@ -117,7 +165,13 @@ def main():
         exe_dst, icon=ico_dst, working_dir=install_dir,
     )
 
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    desktop = _desktop_dir()
+    try:
+        os.makedirs(desktop, exist_ok=True)
+    except OSError as e:
+        print(f"[warn] 桌面目录不可写，退回用户目录: {e}")
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        os.makedirs(desktop, exist_ok=True)
     _make_shortcut(
         os.path.join(desktop, f"{APP_NAME}.lnk"),
         exe_dst, icon=ico_dst, working_dir=install_dir,

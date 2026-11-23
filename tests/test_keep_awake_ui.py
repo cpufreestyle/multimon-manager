@@ -217,10 +217,15 @@ class TestKeepAwakeUi(unittest.TestCase):
         self.app._refresh_keep_awake_status()
         detail = self.app._keep_awake_detail.get()
         self.assertTrue(detail, "状态行是空的")
-        self.assertIn("断言", detail)
+        if keep_awake.IS_WIN:
+            self.assertIn("标志", detail)
+        else:
+            self.assertIn("断言", detail)
 
     def test_no_lid_machine_says_so(self):
         """台式机（无盖子）状态行要明说，不显示「合盖中」。"""
+        if keep_awake.IS_WIN:
+            self.skipTest("Windows 无盖子概念，状态行不含「无盖子」文案")
         self._orig = keep_awake.has_lid
         keep_awake.has_lid = lambda: False
         try:

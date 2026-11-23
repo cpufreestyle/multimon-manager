@@ -417,6 +417,11 @@ def build_windows(icon_png):
     ico = _make_ico(icon_png, os.path.join(HERE, "app.ico"))
     cmd = [sys.executable, "-m", "PyInstaller", "--noconsole", "--onefile",
            f"--icon={ico}", f"--name={EXE_NAME}"]
+    # --icon 只设置 exe 文件本身的图标（资源管理器里看到的那个），Tk 顶层窗口
+    # 与托盘仍需要运行时读 app.ico。单文件包必须把 ico 打进 _MEIPASS，否则
+    # resources.asset_path() 找不到文件，窗口就退回解释器的羽毛图标。
+    # 分隔符必须用 os.pathsep（Windows 是 ';'），写死 ':' 会被当成路径一部分。
+    cmd.append(f"--add-data={ico}{os.pathsep}.")
     # 版本信息文件（exe 属性里的版本号）；文件存在才加，避免老环境构建失败
     version_file = os.path.join(HERE, "version_info.py")
     if os.path.exists(version_file):

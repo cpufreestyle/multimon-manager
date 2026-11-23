@@ -10,6 +10,7 @@ import logging
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import font as tkfont
 
 import autostart
 import backend as b
@@ -104,6 +105,11 @@ def _looks_like_image(path):
 
 
 class App:
+    # 窗口宽度下限：比内容还窄时横向没有滚动条可救，用户无法自救。
+    # minsize 拦不住 Windows 贴边分屏与跨 DPI 显示器拖动（两者都能把窗口
+    # 压到比最小跟踪尺寸还窄），所以 _clamp_min_width() 会再兜一次。
+    _MIN_WIN_W = 810
+
     def __init__(self, root):
         self.root = root
         self.root.title("多屏管理器 · michaelqiu 出品")
@@ -192,12 +198,32 @@ class App:
 
         top = ttk.Frame(self.content)
         top.pack(fill="x", padx=6, pady=(4, 1))
+        # 顶栏与状态栏留着引用：窗口变窄时 _fit_top_bar() 要按这两个算账
+        self._top_bar = top
         rm_btn = ttk.Button(top, text="刷新显示器", command=self.refresh_monitors)
         rm_btn.pack(side="left")
         self._tooltip(rm_btn, "重新检测当前连接的显示器（插拔屏幕后点这里）")
         self.status_var = tk.StringVar(value="")
-        ttk.Label(top, textvariable=self.status_var).pack(side="left", padx=10)
+        # 状态栏必须有宽度上限：文案最长能到 170 多字（四宫格排完的明细，
+        # 实测请求 1950px）。不限宽时 Tk packer 装不下会**不映射后 pack 的
+        # 控件**——实测 126 字时右侧的「michaelqiu 出品」整个消失，界面像
+        # 坏掉一样（本仓库历史上多次栽在同一个坑：四宫格下拉、跨屏勾选框
+        # 都是这么不见的）。超出的文字不显示，但悬停 0.5s 有全文，信息不丢。
+        # 90 只是起始值不是恒定值：窗口比顶栏自然宽度窄时，_fit_top_bar()
+        # 会按其余控件的自然宽度反推后把它缩进去。别改成「删掉 width 让
+        # Label 自适应文字」——实测那样状态栏会独吞整个顶栏，右侧控件直接
+        # 不映射（详见 _fit_top_bar 的注释）。
+        status_lbl = ttk.Label(top, textvariable=self.status_var, width=90)
+        self._status_lbl = status_lbl
+        status_lbl.pack(side="left", padx=10)
+        # 限宽后正文会被裁掉，悬停 0.5s 弹全文（气泡取**当前**状态，
+        # 不是建控件那一刻的旧文案）——信息不丢，布局不变。
+        self._tooltip(status_lbl, lambda: self.status_var.get())
         ttk.Label(top, text="michaelqiu 出品", foreground="#666666").pack(side="right", padx=(4, 2))
+        # 顶栏兜底：窗口一旦比顶栏自然宽度窄，就让状态栏让位，
+        # 保住右侧的署名不被 packer 整个吞掉。
+        top.bind("<Configure>", self._fit_top_bar)
+        self._fit_top_bar()
 
         # 辅助功能授权提示（默认隐藏，未授权时由 main 调用 show 显示）
         self._perm_frame = ttk.Frame(self.content)
@@ -360,6 +386,66 @@ class App:
             self._show_tab("common")
         self._on_body_configure()
 
+    def _fit_top_bar(self, _event=None):
+        """顶栏让位：窗口变窄时先缩状态栏，绝不动右侧的署名。
+
+        Tk 的 packer 在容器装不下时会压缩**后 pack 的控件**，而且一声不吭——
+        顶栏右侧的「michaelqiu 出品」就是这么坏的：状态栏文案一长，它就被
+        整个挤掉（不映射），界面上像凭空少了一块。
+
+        状态栏是顶栏里唯一有弹性的东西（纯文字，超长内容悬停 0.5s 有全文
+        tooltip），所以这里按「其余控件的自然宽度合计」反推它的宽度上限：
+        右侧永远拿满自然尺寸，剩下的残羹才给状态栏。宁可少显示几个字，也不
+        能让右侧控件消失。
+
+        窗口默认 820 宽，顶栏里除状态栏外的自然合计远小于它，正常情况下
+        这里算出来的值不小于 90，等于不生效；它兜的是用户把窗口拖到比内容
+        还窄（Windows 贴边分屏、跨不同 DPI 的显示器拖动，都能绕过 minsize），
+        以及以后往顶栏加控件这几种情况。
+        """
+        top = getattr(self, "_top_bar", None)
+        lbl = getattr(self, "_status_lbl", None)
+        if top is None or lbl is None:
+            return
+        try:
+            need = 0
+            for k in top.winfo_children():
+                if k is lbl:
+                    continue
+                _info = k.pack_info() or {}
+                _px = _info.get("padx") or 0
+                # pack_info 的 padx 可能是 int，也可能是 (左, 右) 元组——
+                # 直接 int() 会抛 TypeError，被下面的宽泛 except 吞掉后
+                # 整段兜底静默失效（踩过一次）
+                if isinstance(_px, (tuple, list)):
+                    _px = sum(int(v or 0) for v in _px)
+                # padx 按左右两侧都算：宁可少给状态栏几个字，也不能再把右侧
+                # 控件挤下去
+                need += k.winfo_reqwidth() + 2 * int(_px)
+            # 状态栏自己的左右内边距也要算：它 pack 时带 padx=10，两侧共
+            # 20px。漏算的话窗口窄一点时右侧控件会被挤掉几个像素。
+            _own = lbl.pack_info() or {}
+            _opx = _own.get("padx") or 0
+            if isinstance(_opx, (tuple, list)):
+                _opx = sum(int(v or 0) for v in _opx)
+            need += 2 * int(_opx)
+            # withdraw 状态下 winfo_width 恒为 1，budget 会是负数，直接返回
+            budget = top.winfo_width() - need - 16
+            if budget < 40:
+                return
+            try:
+                _cw = tkfont.nametofont("TkDefaultFont").measure("0")
+            except Exception:  # noqa: BLE001  取不到命名字体就退回经验值
+                _cw = 7
+            _cw = max(1.0, float(_cw))
+            want = int(budget / _cw)
+            cur = int(lbl.cget("width") or 0)
+            # 只往窄处改：窗口够宽时保持 90 这个起步值，不无故放大
+            if 24 <= want < cur:
+                lbl.configure(width=want)
+        except Exception:  # noqa: BLE001  顶栏排版不该拖垮主程序
+            pass
+
     def _show_tab(self, key):
         """切到指定分组：显示目标 Frame、隐藏其余，并高亮当前按钮。"""
         if key == self._tab_active:
@@ -493,11 +579,21 @@ class App:
         """给控件加悬停提示（tk 无内置 tooltip，用 Toplevel 实现）。
 
         悬停 ~0.5s 后在控件下方弹出淡黄色说明气泡，移开即消失。
+
+        text 也可以传**可调用对象**：每次弹出时现取一次值。状态栏这类
+        「内容会变、宽度又被限死」的控件需要它——限宽后正文看不全，气泡里
+        必须能给出**当前**那一条，而不是建控件那一刻的旧文案。
         """
         tip = {"win": None, "job": None}
 
         def _show(_e=None):
             if tip["win"] is not None:
+                return
+            value = text() if callable(text) else text
+            if not value:
+                # 空内容不弹泡：状态栏空闲时悬停弹一个空框，比不弹更烦。
+                # 必须在建 Toplevel **之前**返回——否则会留下一个空壳气泡
+                # 挂在控件底下（winfo_children() 里看得见）。
                 return
             w = tk.Toplevel(widget)
             tip["win"] = w
@@ -506,7 +602,7 @@ class App:
             y = widget.winfo_rooty() + widget.winfo_height() + 4
             w.wm_geometry(f"+{x}+{y}")
             lbl = tk.Label(
-                w, text=text, justify="left", background="#ffffe0",
+                w, text=value, justify="left", background="#ffffe0",
                 foreground="#333333", relief="solid", borderwidth=1,
                 font=("Arial", 11), padx=8, pady=5, wraplength=360,
             )
@@ -710,12 +806,37 @@ class App:
                 self._keep_front()
         return run
 
+    def _quad_hwnd_name(self, hwnd):
+        """把后端报上来的窗口标识转成给人看的名字。
+
+        macOS 侧的标识是「应用::窗口」复合串，Windows 侧是整数句柄。
+        以前各处直接 split("::")，在 Windows 上会 AttributeError：吸附/
+        四宫格的状态栏明细、布局还原的标题匹配整条链路静默死掉——Tk 把
+        traceback 吞在 --noconsole 里，界面像「点了没反应」。这里按类型
+        分流，优先后端自己的窗口标签函数（进程名优先），取不到再退回
+        字符串形式。
+        """
+        if hwnd is None:
+            return ""
+        if isinstance(hwnd, int):
+            try:
+                fn = getattr(self._quad_backend_mod(),
+                             "_quad_window_label", None)
+                if fn is not None:
+                    name = fn(hwnd)
+                    if name:
+                        return name
+            except Exception:  # noqa: BLE001  只是取个名字，取不到就退化
+                pass
+            return str(hwnd)
+        return str(hwnd).split("::")[0] or "窗口"
+
     def _report_snap_status(self, zone):
         report = getattr(b, "last_snap_report", None) or []
         if not report:
             return
         hwnd, want, got = report[-1]
-        app = (hwnd or "").split("::")[0] or "窗口"
+        app = self._quad_hwnd_name(hwnd) or "窗口"
         label = _SNAP_ZONE_LABELS.get(zone, zone)
         if got is None:
             self.status_var.set(f"吸附「{app}」到{label}失败：读不到窗口几何")
@@ -1967,7 +2088,7 @@ class App:
                     continue
                 dev = max(abs(g - t) for g, t in zip(got, want))
                 if dev > 8:
-                    app = (hwnd or "").split("::")[0]
+                    app = self._quad_hwnd_name(hwnd)
                     clamped.append(f"{app}差{dev}px")
             # 后端如实记录的异常情况（屏装不下四个最小尺寸、某窗口被系统判给
             # 了别的屏）。「四个窗口不在一个屏幕上」是根因级问题，必须报出来，
@@ -1977,7 +2098,7 @@ class App:
             if notes:
                 parts.append("｜ " + "；".join(notes[:2]))
             if dead:
-                names = "、".join((h or "").split("::")[0]
+                names = "、".join(self._quad_hwnd_name(h)
                                  for h in list(dead)[:4])
                 parts.append("｜ 写入无效（不开放自动化/被系统钉住）：" + names)
             if clamped:
@@ -2074,12 +2195,16 @@ class App:
     @staticmethod
     def _quad_backend_mod():
         """当前平台真正干活的窗口模块（mac 与 Windows 的模块名不同）。"""
-        try:
+        # 必须按平台判断，不能靠 try import：windows_mac 在 Windows 上也能
+        # 导入（CoreGraphics 找不到时会退化成 AppleScript），但它那边的
+        # 尺寸缓存 / 实测报告与 Windows 侧不是同一份，读过来就是空的——
+        # 状态栏的「被应用最小尺寸钳制」「写入无效」明细会整个消失，容量
+        # 预检那一行也永远是空的。
+        if sys.platform == "darwin":
             import windows_mac as wm
             return wm
-        except ImportError:  # noqa: BLE001
-            import windows as ww
-            return ww
+        import windows as ww
+        return ww
 
     def _quad_var(self, key):
         return {"TL": self.quad_tl_var, "TR": self.quad_tr_var,
@@ -3425,14 +3550,29 @@ class App:
             # 应用名兜底仍可能选错：同一 App 开多个窗口时第一个不一定是保存的
             # 那个。加一层标题宽松匹配（Rectangle Pro 的 lenientMatch /
             # TitleMatchingMode）：标题变了但实词还在，也能认出来。
-            if not target or not target.startswith(hwnd.split("::")[0] + "::"):
+            # 整数句柄（Windows）拆不出「应用::窗口」结构：应用名/窗口名改取
+            # 布局里存的 owner/name。以前这里直接 split，Windows 上一还原
+            # 布局就 AttributeError，整条链路静默死掉。
+            if isinstance(hwnd, int):
+                hwnd_app = item.get("owner") or ""
+                hwnd_title = item.get("name") or ""
+            else:
+                hwnd_app, _, hwnd_title = str(hwnd).partition("::")
+            if isinstance(target, int):
+                picked_app = current.get(target)
+            elif target:
+                picked_app = str(target).split("::", 1)[0]
+            else:
+                picked_app = None
+            if not target or picked_app != hwnd_app:
                 same_app = [(h, cur_name.get(h) or "")
                             for h, cur_name in cur_names.items()
-                            if cur_name and (h.split("::")[0]
-                                             == hwnd.split("::")[0])]
+                            if cur_name and hwnd_title
+                            and (current.get(h) if isinstance(h, int)
+                                 else str(h).split("::", 1)[0]) == hwnd_app]
                 if same_app:
                     cand_h, mode, score = title_match.best_candidate(
-                        hwnd.split("::", 1)[1], same_app)
+                        hwnd_title, same_app)
                     if cand_h and (not target or cand_h != target
                                    or mode == "exact"):
                         target = cand_h
@@ -3837,14 +3977,22 @@ class App:
         snap = b.keep_awake_snapshot()
         bits = []
         held = snap.get("held") or []
-        bits.append("持断言 %d 个" % len(held) if held else "未持断言")
-        if keep_awake.has_lid() is False:
-            bits.append("本机无盖子")
+        if keep_awake.IS_WIN:
+            # Windows 侧没有「断言/合盖」那套概念：靠 SetThreadExecutionState
+            # 的执行标志顶着，文案要说人话，别让用户看到 macOS 的术语。
+            bits.append("持标志 %d 个" % len(held) if held else "未持标志")
         else:
-            cl = snap.get("clamshell")
-            bits.append("合盖中" if cl else ("盖子合上状态:开" if cl is False else "盖子状态未知"))
+            bits.append("持断言 %d 个" % len(held) if held else "未持断言")
+            if keep_awake.has_lid() is False:
+                bits.append("本机无盖子")
+            else:
+                cl = snap.get("clamshell")
+                bits.append("合盖中" if cl else ("盖子合上状态:开" if cl is False else "盖子状态未知"))
         if snap.get("sleep_disabled"):
-            bits.append("系统级禁止睡眠已开启" + ("（本程序设的）" if snap.get("owns_disablesleep") else "（非本程序设的，退出不会还原）"))
+            if keep_awake.IS_WIN:
+                bits.append("合盖动作=不采取任何操作" + ("（本程序改的，退出还原）" if snap.get("owns_disablesleep") else "（非本程序改的，退出不会还原）"))
+            else:
+                bits.append("系统级禁止睡眠已开启" + ("（本程序设的）" if snap.get("owns_disablesleep") else "（非本程序设的，退出不会还原）"))
         self._keep_awake_detail.set(" · ".join(bits))
         if not self._keep_awake_status.get():
             hint = keep_awake.MODE_HINTS.get(cur, "")
@@ -5275,7 +5423,14 @@ class App:
     # ---------- 托盘命令通道 ----------
     def _start_command_poll(self):
         """定时轮询托盘子进程发来的命令（每 800ms）。"""
-        self._poll_command()
+        try:
+            self._poll_command()
+        except Exception:  # noqa: BLE001
+            # 一条命令出错不能带走整条轮询链：否则托盘之后的打开/刷新/
+            # 退出全部静默失效，只能重启程序才恢复。traceback 进日志，
+            # 界面保持可用。
+            import logging as _lg
+            _lg.getLogger(__name__).exception("托盘命令处理失败")
         self.root.after(800, self._start_command_poll)
 
     def _poll_command(self):
@@ -5360,6 +5515,12 @@ class App:
         self._rebuild_grid_checks()
         # 显示器数量变化后，同步「上手建议」卡片的屏数提示
         self._refresh_getting_started()
+        # 窗口下拉也必须在这里刷新：_refresh_targets 以前只在点「刷新列表」
+        # 按钮或从托盘还原（show）时才跑，新启动的下拉是空的——用户打开
+        # 「目标窗口」看到一个空列表，没法固定目标窗口（真机复现）。刷新
+        # 显示器本就是启动/换屏的必经路径，窗口列表跟着一起更新才一致；
+        # 否则用户新开了程序，点「刷新显示器」也看不到它。
+        self._refresh_targets()
 
     def _draw_layout(self):
         """在 Canvas 上按比例画出各显示器相对位置。
@@ -5427,12 +5588,31 @@ class App:
         """窗口尺寸变化后防抖重绘布局图，让其随窗口大小合理适配。"""
         if event.widget is not self.root:
             return
+        self._clamp_min_width()
         if getattr(self, "_resize_job", None) is not None:
             try:
                 self.root.after_cancel(self._resize_job)
             except Exception:  # noqa: BLE001
                 pass
         self._resize_job = self.root.after(120, self._draw_layout)
+
+    def _clamp_min_width(self):
+        """宽度掉到下限以下就拉回来。
+
+        __init__ 里的 minsize 拦不住所有情况：Windows 贴边分屏、把窗口拖到
+        另一块不同 DPI 的显示器上，都会把窗口压到比最小跟踪尺寸还窄。横向
+        没有滚动条可救，用户没法自救，所以这里主动兜回下限。高度不管：矮了
+        有纵向滚动条，缩内容不裁功能。
+        """
+        try:
+            w = self.root.winfo_width()
+            # 1 是 withdraw 状态下的假宽度，别拿它当真
+            if 1 < w < self._MIN_WIN_W:
+                self.root.geometry("%dx%d+%d+%d" % (
+                    self._MIN_WIN_W, self.root.winfo_height(),
+                    self.root.winfo_rootx(), self.root.winfo_rooty()))
+        except Exception:  # noqa: BLE001  尺寸回夹失败不影响功能
+            pass
 
     def _on_screen_click(self, index):
         """点击可视化中的屏幕，直接为该屏选择壁纸。"""

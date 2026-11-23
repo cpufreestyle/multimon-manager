@@ -8,12 +8,15 @@
 """
 import unittest
 from unittest.mock import patch, MagicMock
+import sys
 
 import monitors_mac
 import windows_mac
 from monitors_mac import MonitorInfo
 
 
+@unittest.skipIf(sys.platform != "darwin",
+                 "PullCursorMonitor 依赖 CoreGraphics，仅 macOS 可测")
 class PullCursorMonitorTest(unittest.TestCase):
     def setUp(self):
         self.m1 = MonitorInfo(

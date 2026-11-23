@@ -105,6 +105,10 @@ class TestBandLengthHelpers(unittest.TestCase):
                          [600, 200, 200])
 
 
+@unittest.skipIf(sys.platform != "darwin",
+                 "本类测的是 windows_mac.snap_three_stack：macOS 的标题栏"
+                 "会钳制写入，理想几何才需要单独一套算法；Windows 侧没有"
+                 "这个前提（对应实现见 windows.py:snap_three_stack）")
 class TestThreeStackWrites(unittest.TestCase):
     """观测 snap_three_stack 实际写给 set_window_rect 的矩形。
 

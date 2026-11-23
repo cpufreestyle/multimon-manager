@@ -149,6 +149,7 @@ class TestRevealBinary(unittest.TestCase):
             self.assertFalse(am.reveal_binary())
 
 
+@unittest.skipUnless(IS_MAC, "open_settings 只在 macOS 打开系统设置面板")
 class TestOpenSettings(unittest.TestCase):
 
     def test_opens_accessibility_pane(self):

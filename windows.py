@@ -919,13 +919,22 @@ def snap_two_side_by_side(left_hwnd=None, right_hwnd=None, use_pinned=True, moni
             ms, left_w["x"], left_w["y"], left_w["w"], left_w["h"])
     mon = ms[idx]
     wl, wt, ww, wh = mon.work_rect
-    # 默认用手动传入的比例；smart 成功时被下面的智能分配覆盖
-    sx, sy = split_x, split_y
-    half = ww // 2
-    _place_window(left_w["hwnd"], wl, wt, half, wh)
-    _place_window(right_w["hwnd"], wl + half, wt, ww - half, wh)
-    logger.info("并排完成(Windows): 左=%s 右=%s（屏幕 %s）",
-                left_w["hwnd"], right_w["hwnd"], mon.device_name)
+    # 并排只有对半这一种切法，没有可调比例，也就不需要 split_x/split_y
+    # （那两个名字是四宫格的参数，写在这里只会 NameError）。
+    if mon.height > mon.width:
+        # 竖屏：左右并排会挤成两条窄条，改成上/下各半屏堆叠。界面文案与
+        # 工具提示（「竖屏时改作上半屏」）说的就是这件事，与 macOS 侧一致。
+        half_h = wh // 2
+        _place_window(left_w["hwnd"], wl, wt, ww, half_h)
+        _place_window(right_w["hwnd"], wl, wt + half_h, ww, wh - half_h)
+        logger.info("竖屏并排(上下堆叠): 上=%s 下=%s（屏幕 %s）",
+                    left_w["hwnd"], right_w["hwnd"], mon.device_name)
+    else:
+        half = ww // 2
+        _place_window(left_w["hwnd"], wl, wt, half, wh)
+        _place_window(right_w["hwnd"], wl + half, wt, ww - half, wh)
+        logger.info("并排完成(Windows): 左=%s 右=%s（屏幕 %s）",
+                    left_w["hwnd"], right_w["hwnd"], mon.device_name)
     return True
 
 
@@ -1017,30 +1026,17 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     都由 quad_plan.plan_quad_smart 按各窗口的宽高比算出来。此时 tl/tr/bl/br
     只是「参与排列的四个窗口」（顺序不限），split_x/split_y 作为兜底值。
     """
+    _quad_reset_state()
+    picked, picked_corners, missing = _quad_pick_windows(
+        (tl_hwnd, tr_hwnd, bl_hwnd, br_hwnd), use_pinned=use_pinned)
+    if missing:
+        logger.warning("四宫格：%d 个指定窗口已不可用，只排剩下的", len(missing))
+    if len(picked) < 2:
+        logger.warning("可用窗口不足两个，无法四宫格排列")
+        return False
     ms = monitors.enum_monitors()
     if not ms:
         return False
-    cands = list_windows_front_to_back()
-    by_hwnd = {w["hwnd"]: w for w in cands}
-
-    picked, seen = [], set()
-    for want in (tl_hwnd, tr_hwnd, bl_hwnd, br_hwnd):
-        w = None
-        if want:
-            w = by_hwnd.get(want) or _find_window(want)
-        elif use_pinned and _pinned_target and _pinned_target not in seen:
-            w = _find_window(_pinned_target)
-        if w is None:
-            for c in cands:
-                if c["hwnd"] not in seen:
-                    w = c
-                    break
-        if w is None:
-            logger.warning("可用窗口不足四个，无法四宫格排列")
-            return False
-        picked.append((w["hwnd"], w))
-        seen.add(w["hwnd"])
-
     tl_hwnd, tl_w = picked[0]
     idx = _resolve_monitor_index(ms, monitor)
     if idx is None:
@@ -1077,35 +1073,91 @@ def snap_four_quad(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
     sy = min(max(float(sy), 0.15), 0.85)
     global _last_quad_splits
     _last_quad_splits = (sx, sy)
-    half_w = int(round(ww * sx))
-    half_h = int(round(wh * sy))
-    # 上排先按理想四等分摆放
-    _place_window(picked[0][0], wl, wt, half_w, half_h)
-    _place_window(picked[1][0], wl + half_w, wt, ww - half_w, half_h)
-    # 左列 App 可能有最小窗口宽度，读回实测宽度后按它定右列起点，两列不再
-    # 互相压盖（宽度不匀是应用侧钳制，无法消除）。
-    tl_rect = get_window_rect(picked[0][0])
-    right_x = wl + half_w
-    if tl_rect and tl_rect != (0, 0, 0, 0) and tl_rect[2] > 0:
-        right_x = max(wl + 1, min(wl + ww - 1, tl_rect[0] + tl_rect[2] + 1))
-    right_w = max(1, (wl + ww) - right_x)
-    if right_x != wl + half_w:
-        _place_window(picked[1][0], right_x, wt, right_w, half_h)
-    half_w = int(right_x - wl)          # 下排左列与实测左列对齐
-    # 实测闭环：部分 App 有最小窗口高度，上排可能缩不到理想 half_h；此时仍按
-    # 理想值写下排会让两排重叠。摆放完读回实测高度推导下排起点，保证不重叠。
-    bot_y = wt + half_h
-    for h, _w in picked[:2]:
-        rect = get_window_rect(h)
-        if rect and rect != (0, 0, 0, 0) and rect[3] > 0:
-            bot_y = max(bot_y, rect[1] + rect[3] + 1)
-    bot_y = min(max(bot_y, wt + 1), max(wt + 1, (wt + wh) - 1))
-    bot_h = max(1, (wt + wh) - bot_y)
-    _place_window(picked[2][0], wl, bot_y, half_w, bot_h)
-    _place_window(picked[3][0], wl + half_w, bot_y, ww - half_w, bot_h)
+    # 格子几何与预演（quad_predict）共用 quad_plan：形状由「占了哪些角」定。
+    # 三窗 T 形时那一格拉通整宽、两窗同排时那一排撑满整高——空着的角若留成
+    # 整块四分之一屏，用户看到的就是「没排好」的死区。
+    occ = sorted(set(picked_corners))
+    by_corner = {c: h for c, (h, _w) in zip(picked_corners, picked)}
+    cells = quad_plan.quad_cells(quad_plan.quad_shape(occ),
+                                 int(round(ww * sx)), int(round(wh * sy)),
+                                 wl, wt, ww, wh)
+    # 写入前记下原几何：摆放后若一字未动，就是「写入无效」（App 不开放
+    # 自动化 / 被系统钉住），与被最小尺寸钳制是两回事，必须分开报
+    before_rects = {}
+    for h, _w in picked:
+        before_rects[h] = get_window_rect(h)
+
+    def _put(corner):
+        h = by_corner[corner]
+        _last_quad_want[h] = cells[corner]
+        _place_window(h, *cells[corner])
+
+    left_w = cells[0][2] if 0 in occ else (cells[2][2] if 2 in occ else ww)
+    left_fixed = False
+    for row_i, (lc, rc) in enumerate(((0, 1), (2, 3))):
+        if lc not in occ and rc not in occ:
+            continue
+        if row_i:
+            # 下排起点按上排实测下缘让位：部分 App 有最小窗口高度，上排可能
+            # 缩不到理想高度，仍按理想值写下排会让两排重叠
+            bot_y = None
+            for tc in (0, 1):
+                if tc not in occ:
+                    continue
+                rect = get_window_rect(by_corner[tc])
+                if rect and rect != (0, 0, 0, 0) and rect[3] > 0:
+                    cand = min(max(rect[1] + rect[3] + 1, wt + 1),
+                               max(wt + 1, (wt + wh) - 1))
+                    bot_y = cand if bot_y is None else max(bot_y, cand)
+            if bot_y is not None:
+                for bc_ in (2, 3):
+                    if bc_ in occ:
+                        cells[bc_] = (cells[bc_][0], bot_y, cells[bc_][2],
+                                      max(1, (wt + wh) - bot_y))
+        if lc in occ:
+            # 左列宽以上排定下来的为准：上排被最小宽度顶宽时下排跟着让，
+            # 两排的分割线不错开。拉通整宽的那一格（T 形 / 只有一列有窗）
+            # 没有右邻居，宽度必须保持整宽
+            if rc in occ and cells[rc][2] < ww:
+                cells[lc] = (cells[lc][0], cells[lc][1], left_w, cells[lc][3])
+            _put(lc)
+            # 左窗 App 可能有最小窗口宽度，读回实测宽度后按它定右列起点，两列
+            # 不再互相压盖（宽度不匀是应用侧钳制，无法消除）
+            if rc in occ and cells[rc][2] < ww and not left_fixed:
+                tl_rect = get_window_rect(by_corner[lc])
+                if tl_rect and tl_rect != (0, 0, 0, 0) and tl_rect[2] > 0:
+                    left_w = (max(wl + 1, min(wl + ww - 1,
+                                              tl_rect[0] + tl_rect[2] + 1))
+                              - wl)
+                    left_fixed = True
+        if rc in occ:
+            if lc in occ:
+                # 上下两排沿用同一条列分割线，否则两排列宽错开，像没排齐。
+                # 拉通整宽的那一格（T 形）没有右邻居，宽度不能改
+                if cells[rc][2] < ww:
+                    cells[rc] = (wl + left_w, cells[rc][1],
+                                 max(1, ww - left_w), cells[rc][3])
+            _put(rc)
+    # 实测闭环：把「写入目标 vs 读回结果」记下来给界面逐格说明，并据实学出
+    # 各窗口的最小/上限尺寸——容量预检与排列预演消费的正是这份缓存
+    _last_quad_slots[:] = list(zip(picked_corners, [h for h, _w in picked]))
+    _last_quad_report[:] = []
+    _last_quad_unwritable[:] = []
+    for h, _w in picked:
+        want = _last_quad_want.get(h)
+        got = get_window_rect(h)
+        if not got or got == (0, 0, 0, 0):
+            _last_quad_report.append((h, want, None))
+            continue
+        _last_quad_report.append((h, want, got))
+        _quad_remember_measured(h, got)
+        if want and got == before_rects.get(h) and any(want):
+            _last_quad_unwritable.append(h)
+    _quad_cache_save()
     logger.info("四宫格排列完成(Windows): 左上=%s 右上=%s 左下=%s 右下=%s"
                 "（屏幕 %s，横向 %.0f%% / 竖向 %.0f%%）",
-                picked[0][0], picked[1][0], picked[2][0], picked[3][0],
+                by_corner.get(0), by_corner.get(1),
+                by_corner.get(2), by_corner.get(3),
                 mon.device_name, sx * 100, sy * 100)
     return True
 
@@ -1271,6 +1323,206 @@ def _is_portrait(mon):
 
 # 最近一次四宫格实际使用的比例 (split_x, split_y)，智能模式下即程序算出的值
 _last_quad_splits = (0.5, 0.5)
+
+# ── 四宫格尺寸缓存（与 macOS 侧同结构：quad_cache.json）────────────────
+
+_QUAD_MIN_CACHE = {}   # hwnd -> (min_w, min_h)，上次实测的最小尺寸
+_QUAD_MAX_CACHE = {}   # hwnd -> (max_w, max_h)，上次实测的尺寸上限
+_QUAD_CACHE_MAX_ENTRIES = 500
+_last_quad_notes = []       # 一次排布要如实告知用户的情况（状态栏显示）
+_last_quad_slots = []       # [(corner, hwnd), ...] 本次实际分配的角
+_last_quad_report = []      # [(hwnd, want, got), ...] 写入目标 vs 实测
+_last_quad_unwritable = []  # 写入后几何一步没动的 hwnd
+
+
+def _quad_cache_file():
+    """四宫格尺寸缓存文件路径（与 settings.json 同目录）。"""
+    try:
+        import settings
+        base = settings.data_dir()
+    except Exception:  # noqa: BLE001
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "quad_cache.json")
+
+
+def _quad_cache_save():
+    """把最小/上限缓存合并写盘（原子写，静默失败）。"""
+    import json
+    import tempfile
+    try:
+        data = {
+            "version": 1,
+            "mins": {h: [int(v[0]), int(v[1])]
+                     for h, v in _QUAD_MIN_CACHE.items() if v},
+            "maxes": {h: [int(v[0]), int(v[1])]
+                      for h, v in _QUAD_MAX_CACHE.items() if v},
+        }
+        for _d in (data["mins"], data["maxes"]):
+            while len(_d) > _QUAD_CACHE_MAX_ENTRIES:
+                _d.pop(next(iter(_d)))
+        path = _quad_cache_file()
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".",
+                                   prefix=".quad_cache.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:  # noqa: BLE001
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning("四宫格缓存写盘失败: %s", e)
+
+
+def _quad_cache_load():
+    """App 启动时调一次：把上次的尺寸缓存读进内存（静默失败）。"""
+    import json
+    try:
+        path = _quad_cache_file()
+        if not os.path.exists(path):
+            return
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+
+        def _pair(v):
+            return (isinstance(v, list) and len(v) == 2
+                    and all(isinstance(x, int) and not isinstance(x, bool)
+                            for x in v))
+
+        def _key(h):
+            # Windows 的 hwnd 是整数，JSON 的键只能是字符串：读回来必须还原
+            # 成 int，否则缓存永远对不上实际窗口（macOS 侧键本来就是字符串）
+            try:
+                return int(h)
+            except (TypeError, ValueError):
+                return h
+
+        for h, v in (data.get("mins") or {}).items():
+            if _pair(v):
+                _QUAD_MIN_CACHE[_key(h)] = (v[0], v[1])
+        for h, v in (data.get("maxes") or {}).items():
+            if _pair(v):
+                _QUAD_MAX_CACHE[_key(h)] = (v[0], v[1])
+        logger.info("四宫格缓存已读入：%d 个最小尺寸、%d 个尺寸上限",
+                    len(_QUAD_MIN_CACHE), len(_QUAD_MAX_CACHE))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("四宫格缓存读盘失败，按无缓存处理: %s", e)
+
+
+def _quad_remember_measured(hwnd, rect):
+    """把写入后读回的实测尺寸并入缓存（Mac 侧同语义）。
+
+    Windows 上 App 的最小尺寸表现为「SetWindowPos 后读回比目标大」：读回
+    值就是下限。上限只在「读回比目标小」时记——App 拒绝长到目标值。
+    """
+    if not rect or rect == (0, 0, 0, 0):
+        return
+    want = _last_quad_want.get(hwnd)
+    if want:
+        w, h = int(rect[2]), int(rect[3])
+        if w > int(want[2]) + 4:
+            _QUAD_MIN_CACHE[hwnd] = (w, _QUAD_MIN_CACHE.get(hwnd, (0, h))[1])
+        if h > int(want[3]) + 4:
+            mw = _QUAD_MIN_CACHE.get(hwnd, (0, 0))[0]
+            _QUAD_MIN_CACHE[hwnd] = (mw if mw > 0 else w, h)
+        if 0 < w < int(want[2]) - 4:
+            _QUAD_MAX_CACHE[hwnd] = (w, _QUAD_MAX_CACHE.get(hwnd, (0, 0))[1])
+        if 0 < h < int(want[3]) - 4:
+            mw, mh = _QUAD_MAX_CACHE.get(hwnd, (0, 0))
+            _QUAD_MAX_CACHE[hwnd] = (mw, h)
+    while len(_QUAD_MIN_CACHE) > _QUAD_CACHE_MAX_ENTRIES:
+        _QUAD_MIN_CACHE.pop(next(iter(_QUAD_MIN_CACHE)))
+    while len(_QUAD_MAX_CACHE) > _QUAD_CACHE_MAX_ENTRIES:
+        _QUAD_MAX_CACHE.pop(next(iter(_QUAD_MAX_CACHE)))
+
+
+# 本轮四宫格写入目标（hwnd -> (x, y, w, h)）：实测并入缓存时对比用
+_last_quad_want = {}
+
+
+def _gap_settings():
+    """读取窗口间距设置：(gap, gap_screen_edges)。异常时按关闭处理。"""
+    try:
+        import settings
+        s = settings.load()
+        gap = int(s.get("window_gap", 0) or 0)
+        edges = bool(s.get("gap_screen_edges", False))
+    except Exception:  # noqa: BLE001
+        return (0, False)
+    return (max(0, gap), edges)
+
+
+def _quad_reset_state():
+    """清空上一轮四宫格的实测状态（界面据此显示排布明细）。
+
+    失败路径也要清：留着上一次的 report/slots，界面会把「没排成」说成
+    「某个窗口差 N px」，用户看到的还是「不准」。
+    """
+    _last_quad_notes[:] = []
+    _last_quad_slots[:] = []
+    _last_quad_report[:] = []
+    _last_quad_unwritable[:] = []
+    _last_quad_want.clear()
+
+
+def _quad_pick_windows(wants, use_pinned=True):
+    """按四角选出要排的窗口：显式 hwnd 优先，空格自动补足。
+
+    snap_four_quad 与 quad_predict（排列预演）共用这一套：预演必须算正式
+    排布会动的那批窗口，两边选得不一样，预告本身就是错的——那正是「预告说
+    排四个、实际动了三个」的不准来源。
+
+    wants: (左上, 右上, 左下, 右下) 的 hwnd，None = 该格「自动」。
+    use_pinned: 空格是否优先用界面固定的目标窗口（与 snap_four_quad 同义）。
+    返回 (picked, picked_corners, missing)：
+      picked         [(hwnd, win_dict)]，按角序排好的待排窗口
+      picked_corners 每个窗口对应的角序号 0..3
+      missing        显式选中但已不可用（关掉）的 hwnd。如实报出来，不能
+                     静默用别的窗口顶上——用户选中的格子被换成别的窗口，
+                     看到的就是「不准」
+    显式选中 2 个及以上时不再自动补足：界面上点掉不想要的格就只排选中的
+    两三个，这块屏放不下四个是常态，能让用户主动选 2/3 个来排，比每次放不下
+    再解释一遍有用。
+    """
+    cands = list_windows_front_to_back()
+    by_hwnd = {w["hwnd"]: w for w in cands}
+    keep_only_selected = len([x for x in wants if x]) >= 2
+    picked, picked_corners, seen, missing = [], [], set(), []
+    for corner, want in enumerate(wants):
+        w = None
+        if want:
+            w = by_hwnd.get(want) or _find_window(want)
+            if w is None and want not in seen:
+                logger.warning("四宫格：指定的窗口 %s 已不可用", want)
+                missing.append(want)
+        elif (not keep_only_selected and use_pinned and _pinned_target
+              and _pinned_target not in seen):
+            w = _find_window(_pinned_target)
+        if w is None:
+            if keep_only_selected:
+                continue          # 用户点掉了这个角：留空，不补
+            for c in cands:
+                if c["hwnd"] not in seen:
+                    w = c
+                    break
+        if w is None or w["hwnd"] in seen:
+            # 桌面上一共没那么多窗口：排已有的，少于两个才失败
+            continue
+        picked.append((w["hwnd"], w))
+        picked_corners.append(corner)
+        seen.add(w["hwnd"])
+    return picked, picked_corners, missing
+
+
+def _quad_window_label(hwnd):
+    """四宫格提示里的窗口名（进程名优先，取不到退回标题/hwnd）。"""
+    w = _find_window(hwnd) or {}
+    return w.get("owner") or w.get("name") or str(hwnd)
 
 
 def is_window_portrait_suitable(hwnd_or_win, mon=None):
@@ -1538,6 +1790,253 @@ def fill_all_monitors(hwnds=None, use_pinned=True, mode="max",
                 done, len(ms), mode)
     return done
 
+
+
+def quad_capacity(hwnds, monitor=None):
+    """预检：当前选择在一块屏上最多排得下几个窗口（不动任何窗口）。
+
+    为什么需要它：四宫格的容量是硬上限——App 的最小窗口尺寸改不了，放不下
+    四个时「照排四个」的结局只能是重叠或越界。把容量在点「2×2 排列」之前
+    摆出来，用户才知道该关谁、换谁，而不是排完看到重叠以为程序算错。
+
+    最小尺寸消费上次排布的缓存（_QUAD_MIN_CACHE）。没探过的窗口按 0 计——
+    0 是乐观值，fit 因此是上限；返回值的 uncached 列出没探过的窗口，界面
+    据此说明「容量偏乐观」。
+
+    hwnds: 按 左上/右上/左下/右下 顺序的 hwnd 列表（可少于四个）。
+    monitor: int 索引 / device_name 字符串 / None（自动）。None 时在横屏里挑
+        排得最多的（竖屏不算），并列时取第一个窗口所在屏。
+
+    返回 None 表示一个窗口的最小尺寸都没缓存（从没排过），界面据此不显示。
+    """
+    hwnds = [h for h in (hwnds or []) if h]
+    if not hwnds:
+        return None
+    cached = {h: _QUAD_MIN_CACHE[h] for h in hwnds if h in _QUAD_MIN_CACHE}
+    if not cached:
+        return None
+    gap, edge_gap = _gap_settings()
+    ms = monitors.enum_monitors()
+    if not ms:
+        return None
+    wins = [(h, None) for h in hwnds]
+    mins_all = {h: _QUAD_MIN_CACHE.get(h, (0, 0)) for h in hwnds}
+
+    def _fit(m):
+        _wl, _wt, mw, mh = m.work_rect
+        slots, _unplaced = quad_plan.choose_quad_slots(
+            wins, mins_all, mw, mh, gap, edge_gap, origin=(_wl, _wt))
+        return len(slots)
+
+    # 点名屏就尊重它（放不下也照样报这块屏的容量）；否则横屏里挑最优
+    idx = _resolve_monitor_index(ms, monitor) if monitor is not None else None
+    if idx is not None and 0 <= idx < len(ms):
+        best = ms[idx]
+    else:
+        first_idx = None
+        try:
+            r = get_window_rect(hwnds[0])
+            if r and r != (0, 0, 0, 0):
+                first_idx = _monitor_index_by_rect(ms, r[0], r[1], r[2], r[3])
+        except Exception:  # noqa: BLE001  预检只是建议，读不到几何就按序取
+            first_idx = None
+        best, best_key = None, None
+        for i, m in enumerate(ms):
+            if m.height > m.width:
+                continue          # 竖屏不送
+            key = (_fit(m), 1 if i == first_idx else 0)
+            if best is None or key > best_key:
+                best, best_key = m, key
+        if best is None:          # 一台横屏都没有：退回第一块，容量照算
+            best = ms[0]
+    need = None
+    if len(cached) == len(hwnds):
+        corners = [(0, 0)] * 4
+        for corner, h in enumerate(hwnds[:4]):
+            corners[corner] = mins_all[h]
+        need = quad_plan.quad_requirements(corners)
+    return {"screen": best.device_name,
+            "work": (best.work_rect[2], best.work_rect[3]),
+            "fit": _fit(best), "total": len(hwnds),
+            "need": need,
+            "uncached": [_quad_window_label(h) for h in hwnds
+                         if h not in cached]}
+
+
+def quad_predict(tl_hwnd=None, tr_hwnd=None, bl_hwnd=None, br_hwnd=None,
+                 use_pinned=True, monitor=None, smart=False, split_x=0.5,
+                 split_y=0.5, blank_tol=100):
+    """预演：用上次实测缓存的尺寸推算一次四宫格，**不动任何窗口**。
+
+    与 snap_four_quad 的关系：同一套选窗、同一块目标屏、同一组比例，只把
+    「现场实测」换成「上次排布的缓存」（_QUAD_MIN_CACHE / _QUAD_MAX_CACHE），
+    一个 set_window_rect 都不调。放不下的窗口、会留大片空白的格子，在点
+    「2×2 排列」之前就说清楚。
+
+    任一窗口没有最小尺寸缓存（从没排过）时返回空警告——预演只能闭嘴，正式
+    排布会现场实测。这是已知限制：首次排列没有预告，行为与以前一致。
+
+    返回 (warnings, detail)：warnings 是给用户看的一句话列表（空 = 没什么
+    要预告的）；detail 是 dict，供日志与界面使用。
+    """
+    picked, picked_corners, missing = _quad_pick_windows(
+        (tl_hwnd, tr_hwnd, bl_hwnd, br_hwnd), use_pinned=use_pinned)
+    detail = {"screen": "", "work": (0, 0), "fit": 0, "total": len(picked),
+              "splits": None, "blank": [], "uncached": []}
+    warnings = []
+    if missing:
+        names = "、".join(_quad_window_label(h) for h in missing[:3])
+        warnings.append("「%s」已不可用，将只排列剩下的窗口" % names)
+    if len(picked) < 2:
+        return warnings, detail
+    mins = {}
+    for h, _w in picked:
+        m = _QUAD_MIN_CACHE.get(h)
+        if not m or m[0] <= 0 or m[1] <= 0:
+            detail["uncached"].append(h)
+            continue
+        mins[h] = m
+    if detail["uncached"]:
+        return warnings, detail
+    try:
+        ms = monitors.enum_monitors()
+    except Exception:  # noqa: BLE001  预演只是预告，读不到屏就闭嘴
+        ms = []
+    if not ms:
+        return [], detail
+    _h0, w0 = picked[0]
+    idx = _resolve_monitor_index(ms, monitor)
+    if idx is None:
+        idx = _monitor_index_by_rect(ms, w0["x"], w0["y"], w0["w"], w0["h"])
+    if idx is None or not (0 <= idx < len(ms)):
+        idx = 0
+    mon = ms[idx]
+    wl, wt, ww, wh = mon.work_rect
+    sx, sy = float(split_x), float(split_y)
+    if smart and len(picked) == 4:
+        # 与 snap_four_quad 的智能分配同一条路径：按宽高比重排角的归属
+        try:
+            planned, sx2, sy2 = quad_plan.plan_quad_smart(
+                [dict(w, hwnd=h) for h, w in picked], ww, wh)
+        except ValueError as e:  # noqa: BLE001
+            logger.warning("预演：智能分配失败，按手动比例推算: %s", e)
+        else:
+            reordered = [(w.get("hwnd"), w) for w in planned]
+            if len(reordered) == 4 and all(h for h, _w in reordered):
+                picked = reordered
+                picked_corners = [0, 1, 2, 3]
+                sx, sy = sx2, sy2
+    sx = min(max(sx, 0.15), 0.85)
+    sy = min(max(sy, 0.15), 0.85)
+    gap, edge_gap = _gap_settings()
+    slots, unplaced = quad_plan.choose_quad_slots(
+        [(h, w) for h, w in picked], mins, ww, wh, gap, edge_gap,
+        corners=list(picked_corners), origin=(wl, wt))
+    if not slots:
+        return warnings, detail
+    maxes = {h: _QUAD_MAX_CACHE[h] for _c, h, _w in slots
+             if h in _QUAD_MAX_CACHE}
+    occ = [c for c, _h, _w in slots]
+    shape = quad_plan.quad_shape(occ)
+    c1 = int(round(ww * sx))
+    r1 = int(round(wh * sy))
+    cells = quad_plan.quad_cells(shape, c1, r1, wl, wt, ww, wh)
+    for corner, h, _w in slots:
+        bx, by, bw, bh = cells[corner]
+        cap = maxes.get(h) or (0, 0)
+        # 这一格窗口实际能占多大：有上限的轴按上限，没上限的轴按格子
+        pw = min(bw, cap[0]) if cap[0] > 0 else bw
+        ph = min(bh, cap[1]) if cap[1] > 0 else bh
+        bw2, bh2 = bw - pw, bh - ph
+        if bw2 <= blank_tol and bh2 <= blank_tol:
+            continue
+        cap_s = []
+        if cap[0] > 0:
+            cap_s.append("宽最多 %d" % cap[0])
+        if cap[1] > 0:
+            cap_s.append("高最多 %d" % cap[1])
+        side = []
+        if bw2 > blank_tol:
+            side.append("右侧")
+        if bh2 > blank_tol:
+            side.append("下方")
+        warnings.append(
+            "「%s」上次实测%s，这一格是 %d×%d，排完%s约 %dpx 空白"
+            % (_quad_window_label(h), "、".join(cap_s), bw, bh,
+               "、".join(side), max(bw2, bh2)))
+        detail["blank"].append((h, bw2, bh2))
+    if unplaced:
+        names = "、".join(
+            "%s(最小%dx%d)" % (_quad_window_label(h), mins[h][0], mins[h][1])
+            for h, _w in unplaced)
+        warnings.insert(
+            0, "只排 %d/%d 个：%s 按上次实测的最小尺寸放不下这块屏的四宫格，"
+               "将保持原位" % (len(slots), len(picked), names))
+    detail["screen"] = mon.device_name
+    detail["work"] = (ww, wh)
+    detail["fit"] = len(slots)
+    detail["splits"] = (sx, sy)
+    if warnings:
+        logger.info("四宫格预演：%s（%s %dx%d，预计 %d/%d 个）",
+                    "；".join(warnings), mon.device_name, ww, wh,
+                    len(slots), len(picked))
+    return warnings, detail
+
+
+def stash_active(use_pinned=True, activate=False):
+    """把当前/目标窗口暂存到屏幕顶边（复刻 Rectangle Pro 的 Stash）。
+
+    返回 True 表示已暂存。已经暂存过的窗口不重复登记。
+    """
+    import stash
+    ms = monitors.enum_monitors()
+    if not ms:
+        return False
+    hwnd = get_foreground_window(use_pinned=use_pinned)
+    if not hwnd:
+        logger.warning("暂存：未找到可操作的前台窗口")
+        return False
+    if any(i.get("hwnd") == hwnd for i in stash.list_stashed()):
+        logger.info("暂存：%s 已在暂存列表，跳过", hwnd)
+        return False
+    x, y, w, h = get_window_rect(hwnd)
+    if not (x or y or w or h):
+        return False
+    idx = _monitor_by_relative(ms, hwnd)
+    sx, sy, sw, sh = stash.stash_rect(ms[idx])
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    set_window_rect(hwnd, sx, sy, sw, sh, activate=activate)
+    stash.push({"hwnd": hwnd, "owner": _proc_name(pid.value) or "",
+                "x": x, "y": y, "w": w, "h": h})
+    logger.info("已暂存 %s（原位 %s）", hwnd, (x, y, w, h))
+    return True
+
+
+def unstash_first(activate=False):
+    """取回最早暂存的窗口到它原来的位置（FIFO）。
+
+    返回 (hwnd, True) 或 (None, False)。窗口已关闭时返回 None。
+    """
+    import stash
+    item = stash.pop()
+    if not item:
+        return (None, False)
+    hwnd = item.get("hwnd")
+    if not hwnd:
+        return (None, False)
+    if not is_window(hwnd):
+        logger.info("取回：%s 已关闭，跳过", hwnd)
+        return (None, False)
+    try:
+        set_window_rect(hwnd, item["x"], item["y"], item["w"], item["h"],
+                        activate=activate)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("取回 %s 失败: %s", hwnd, e)
+        return (hwnd, False)
+    logger.info("已取回 %s -> %s",
+                hwnd, (item["x"], item["y"], item["w"], item["h"]))
+    return (hwnd, True)
 
 
 if __name__ == "__main__":

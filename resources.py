@@ -1,6 +1,31 @@
 """生成简单的程序图标（纯 Python 写 ICO，无第三方依赖）。"""
 import struct
 import os
+import sys
+
+
+def asset_path(name, must_exist=True):
+    """定位随程序分发的资源文件（app.ico / app.png）。
+
+    PyInstaller 单文件运行时资源被解到临时目录 `sys._MEIPASS`，源码运行时
+    就在本模块同目录。两个位置都找一遍：打包后如果某次忘了把资源打进包，
+    回退找 exe 旁边的文件仍有机会救回来（安装器会把 app.ico 复制过去）。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, name))
+    candidates.append(os.path.join(here, name))
+    exe = getattr(sys, "executable", None)
+    if exe and getattr(sys, "frozen", False):
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(exe)), name))
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    if not must_exist and candidates:
+        return candidates[0]
+    return None
 
 
 def create_ico(path, size=32):

@@ -21,7 +21,10 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import dragsnap_mac as ds  # noqa: E402
+try:
+    import dragsnap_mac as ds  # noqa: E402
+except Exception:  # noqa: BLE001  非 macOS：hotkeys_mac 的 Quartz 装不起来
+    ds = None
 
 
 class _FakeRunLoop:
@@ -108,6 +111,7 @@ class _FakeQuartz:
         self._rl.ran_run("RUN-ENTERED")
 
 
+@unittest.skipUnless(ds is not None, "dragsnap_mac 依赖 Quartz，仅 macOS 可测")
 class TestDragSnapThreading(unittest.TestCase):
     def setUp(self):
         self._rl = _FakeRunLoop()

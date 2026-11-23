@@ -20,18 +20,33 @@ import ui_harness as harness  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS_DIR = os.path.join(ROOT, "tests")
 
-# 8 个会构造真实 App 的界面测试；新增第 9 个也必须接夹具，否则下面变红。
+# 10 个会构造真实 App 的界面测试；新增第 11 个也必须接夹具，否则下面变红。
 UI_TEST_FILES = (
     "test_dock_autohide_ui.py", "test_drag_target_window.py",
     "test_grid_ui.py", "test_keep_awake_ui.py", "test_rehome_ui.py",
     "test_snap_rows_mapped.py", "test_startup_window_lists.py",
-    "test_ui_mode.py",
+    "test_top_bar_fit.py", "test_ui_hwnd_type.py", "test_ui_mode.py",
 )
 
 EXPECTED_TIMERS = {
     "_poll_taskbar", "_poll_display", "_poll_rehome_capture",
     "_start_command_poll", "_poll_rules", "_slideshow_restore", "<lambda>",
 }
+
+
+def expected_timers():
+    """构造期应当被冻结的定时器集合。
+
+    「恢复上次会话的全局快捷键」那条（<lambda>）**只在启用了快捷键时才
+    登记**——ui.App.__init__ 里是 `if self.hk_enabled.get():`。设定里没开
+    快捷键的机器上构造期只有 6 个定时器，硬编码 7 个会让这条测试在别人
+    机器上无故变红（实测：本机 settings.json 没 hk_enabled）。
+    """
+    import ui
+    names = set(EXPECTED_TIMERS)
+    if not bool(ui.settings.load().get("hk_enabled", False)):
+        names.discard("<lambda>")
+    return names
 
 
 def read(path):
@@ -62,7 +77,7 @@ class TestHarnessRuntime(unittest.TestCase):
 
     def test_frozen_jobs_are_the_seven_startup_timers(self):
         names = {name for _ms, name in self.frozen}
-        self.assertEqual(names, EXPECTED_TIMERS,
+        self.assertEqual(names, expected_timers(),
                          "构造期定时器集合变了：夹具可能漏冻结新的后台循环")
         self.assertTrue(all(ms > 0 for ms, _n in self.frozen),
                         "冻结的必须是延时定时器，不能把 after(0) 的即时回调也吞了")
@@ -134,8 +149,16 @@ class TestHarnessSourceContracts(unittest.TestCase):
         # 只认代码行；文档注释里解释「绝不能调 update()」不算调用。
         code_hits = re.findall(r"^\s*cls\.root\.update\(\)\s*(?:#.*)?$",
                                text, flags=re.MULTILINE)
-        self.assertEqual(code_hits, [],
-                         "已映射 root 调 update() 会永不返回（全量套件挂死的真因）")
+        # 「已映射 root 的 update() 永不返回」是 macOS Tk 的坑。Windows 的
+        # 窗口管理器是异步的：geometry() 之后不 update()，子控件会停在旧
+        # 布局上（实测画布宽度卡在 1px），越界/映射判定量的是错尺寸——
+        # 那一次 update() 必须由平台守住，只放行 win32 分支里那一次。
+        guarded = re.findall(
+            r'^\s*if sys\.platform == "win32":\s*\n\s*cls\.root\.update\(\)',
+            text, flags=re.MULTILINE)
+        self.assertEqual(len(code_hits) - len(guarded), 0,
+                         "已映射 root 调 update() 会永不返回（全量套件挂死的真因）；"
+                         "Windows 分支那次必须写在 sys.platform == \"win32\" 里面")
         self.assertIn("cls.root.update_idletasks()", text,
                       "必须保留一次 update_idletasks 完成 packer 映射")
 

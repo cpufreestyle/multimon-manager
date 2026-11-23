@@ -136,6 +136,27 @@ def _cleanup():
 atexit.register(_cleanup)
 
 
+def _set_appusermodelid():
+    """给进程设显式 AppUserModelID（Windows 任务栏身份）。
+
+    不设的话，任务栏用 exe 路径哈希当身份，图标按旧缓存取——换了图标后
+    任务栏还显示老的羽毛图。设成稳定 ID（exe 路径无关）后，任务栏按新身份
+    重新取窗口图标。必须在创建任何窗口之前调用。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        shell32 = ctypes.windll.shell32
+        shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
+        shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [
+            ctypes.c_wchar_p]
+        shell32.SetCurrentProcessExplicitAppUserModelID(
+            "cpufreestyle.MultiMonManager")
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger(__name__).warning("设置 AppUserModelID 失败: %s", e)
+
+
 def _activate_frontmost(root, delay_ms=400):
     """启动后把主窗口置顶显示。
 
@@ -183,6 +204,7 @@ def main():
     # --minimized：开机自启静默模式（启动后不显示主窗口，仅托盘）
     start_minimized = "--minimized" in sys.argv
     _set_dpi_aware()
+    _set_appusermodelid()
     if not _single_instance():
         logging.getLogger(__name__).info("已有实例在运行，退出")
         try:
@@ -193,12 +215,15 @@ def main():
         return
     logging.getLogger(__name__).info("单实例锁已获取，准备创建窗口…")
     # 四宫格尺寸缓存（上次实测的最小尺寸 / 尺寸上限）读入内存：排列预演
-    # （点「2×2 排列」前的空白预告）消费它。只 macOS 侧有对应模块，读不到
-    # 就按无缓存走——预演静默放行，不影响排布。
+    # （点「2×2 排列」前的空白预告）与容量预检消费它。macOS 侧与 Windows 侧
+    # 都有对应模块，读不到就按无缓存走——预演静默放行，不影响排布。
     try:
         if sys.platform == "darwin":
             import windows_mac as _wm_cache
             _wm_cache._quad_cache_load()
+        elif sys.platform.startswith("win"):
+            import windows as _win_cache
+            _win_cache._quad_cache_load()
     except Exception:  # noqa: BLE001
         pass
 
@@ -211,23 +236,27 @@ def main():
             pass
     logging.getLogger(__name__).info("Tk 窗口已创建")
 
-    # 独立打包(.app)时，Dock 图标由 bundle 的 app.icns / Info.plist 提供：
-    # 既不需要运行时设置，也避免往包内写文件（包可能已签名或只读）。
-    icon_path = None
-    if not getattr(sys, "frozen", False):
-        here = os.path.dirname(os.path.abspath(__file__))
-        icon_path = resources.create_ico(os.path.join(here, "app.ico"))
+    # 图标要按平台分发：
+    # - macOS 独立打包(.app) 时 Dock 图标由 bundle 的 app.icns / Info.plist 提供，
+    #   运行时不再往包内写文件（包可能已签名或只读）；
+    # - Windows 打包成 exe 后**仍然**要设窗口图标：exe 的图标只是资源管理器里
+    #   那个文件的图标，Tk 顶层窗口默认还是解释器的羽毛图标，必须显式 iconbitmap。
+    #   历史版本这里套了一层 `not frozen` 判断，导致 exe 里整段被跳过，用户看到
+    #   的就是「软件图标没显示」。
+    frozen = getattr(sys, "frozen", False)
+    icon_path = resources.asset_path("app.ico")
+    if icon_path:
         # macOS 上 iconbitmap 会导致 tkinter 窗口黑屏，仅 Windows 使用
-        if icon_path and sys.platform.startswith("win"):
+        if sys.platform.startswith("win"):
             try:
                 root.iconbitmap(icon_path)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger(__name__).warning("窗口图标设置失败: %s", e)
         # macOS：Tk 默认沿用 Python 解释器图标，替换成程序自己的图标（Dock 显示）
-        if sys.platform == "darwin":
+        if sys.platform == "darwin" and not frozen:
             try:
                 png = resources.ensure_transparent_icon(
-                    os.path.join(here, "app.png"))
+                    resources.asset_path("app.png") or "app.png")
                 if png:
                     import dock_icon_mac
                     ok = dock_icon_mac.set_dock_icon(png)
@@ -235,6 +264,20 @@ def main():
                         "Dock 图标%s: %s", "已设置" if ok else "设置失败", png)
             except Exception as e:  # noqa: BLE001
                 logging.getLogger(__name__).warning("设置 Dock 图标失败: %s", e)
+    else:
+        # 源码运行且图标缺失时才生成兜底图标；打包后必须由构建脚本带进来，
+        # 不在 _MEIPASS 里凭空写文件（那是每次启动都会清掉的临时目录）。
+        if not frozen:
+            here = os.path.dirname(os.path.abspath(__file__))
+            icon_path = resources.create_ico(os.path.join(here, "app.ico"))
+            if icon_path and sys.platform.startswith("win"):
+                try:
+                    root.iconbitmap(icon_path)
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            logging.getLogger(__name__).warning(
+                "打包后找不到 app.ico，窗口/托盘图标将缺失（构建时需 --add-data）")
     logging.getLogger(__name__).info("图标处理完成，开始构建界面…")
 
     # 界面构造期的异常必须落到日志：日志配置在 import backend 之前，

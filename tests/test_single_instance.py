@@ -7,17 +7,23 @@ flock 锁因此一直不释放。用户手动退出 App 再启动，日志写
 面板再手杀。macOS 上 Popen 走 posix_spawn 路径，close_fds 语义不可靠，
 所以在拿锁后直接给 fd 置 FD_CLOEXEC。
 """
-import fcntl
 import os
 import sys
 import tempfile
 import unittest
+
+try:
+    import fcntl
+except ImportError:  # noqa: BLE001  Windows 上没有 fcntl（也无 flock）
+    fcntl = None
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main  # noqa: E402
 
 
+@unittest.skipIf(fcntl is None,
+                 "fcntl/flock 仅 POSIX 有，Windows 走的是另一套单实例实现")
 class SingleInstanceTest(unittest.TestCase):
 
     def _release(self):

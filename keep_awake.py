@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""防休眠：让 Mac 在合盖、拔电、锁屏时也继续干活（复刻 LayoutKeeper 的 KeepAwake）。
+"""防休眠：让电脑在合盖、拔电、锁屏时也继续干活（复刻 LayoutKeeper 的 KeepAwake）。
 
 LayoutKeeper 的 KeepAwakeMode 分四档，本项目先做最实用的三档 + 一档高风险档：
 
@@ -29,13 +29,27 @@ LayoutKeeper 的 KeepAwakeMode 分四档，本项目先做最实用的三档 + �
 
 边界：本模块不碰任何窗口/显示器逻辑；非 macOS 上全部退化为 no-op 并返回
 「当前平台不支持」，与 display_notify.py 的做法一致。
+
+Windows 侧用等价机制实现同一套四档语义：
+1. `SetThreadExecutionState`（ES_CONTINUOUS + ES_SYSTEM_REQUIRED /
+   ES_DISPLAY_REQUIRED）——效果挂在调用线程上，线程一退就失效，所以由
+   专用后台线程持有，而不是在 Tk 主线程随手设一次。
+2. 「合盖断电也不眠」把当前电源计划的合盖动作（LIDACTION）改成 0
+   （不采取任何操作，powercfg 写入，需管理员授权），这是 Windows 上与
+   `pmset -a disablesleep 1` 最接近的等价物；原值记下，退出时还原。
+3. 读回校验同样以系统状态为准：写完用 PowerReadAC/DCValueIndex 核对，
+   与 macOS 侧「不准要说出物理原因」的规矩一致。
 """
 import ctypes
+import threading
+import os
 import subprocess
 import sys
+import uuid
 import time
 
 IS_MAC = (sys.platform == "darwin")
+IS_WIN = (sys.platform == "win32")
 
 # 四档模式（显示名 -> 内部键），顺序即界面下拉顺序
 MODE_OFF = "off"
@@ -63,10 +77,188 @@ _OWNED_KEY = "keep_awake_owns_disablesleep"
 
 _kIOPMAssertionLevelOn = 255
 
+# Windows 执行状态标志（kernel32.SetThreadExecutionState）
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_DISPLAY_REQUIRED = 0x00000002
+_WIN_FLAG_NAMES = {
+    _ES_SYSTEM_REQUIRED: "系统不休眠",
+    _ES_DISPLAY_REQUIRED: "屏幕常亮",
+}
+
+# 合盖动作：SUB_BUTTONS\LIDACTION，值 0=不采取任何操作 1=睡眠 2=休眠 3=关机
+_LID_SUB = "4f971e89-eebd-4455-a8de-9e59040e7347"
+_LID_SETTING = "5ca83367-6e45-459f-a27b-076b2d883706"
+_LID_ACTION_NAMES = {0: "不采取任何操作", 1: "睡眠", 2: "休眠", 3: "关机"}
+
 # 断言类型名（IOKit）
 _A_IDLE_SYSTEM = "PreventUserIdleSystemSleep"
 _A_SYSTEM = "PreventSystemSleep"
 _A_IDLE_DISPLAY = "PreventUserIdleDisplaySleep"
+
+
+def lid_action_name(v):
+    """合盖动作数值 → 中文名（界面状态行用）。"""
+    return _LID_ACTION_NAMES.get(int(v), "未知(%s)" % v)
+
+
+# ── Windows：电源计划读取 / 执行状态持有 ──────────────────────────────
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+
+def _guid(s):
+    b = uuid.UUID(s).bytes_le
+    g = _GUID()
+    g.Data1 = int.from_bytes(b[0:4], "little")
+    g.Data2 = int.from_bytes(b[4:6], "little")
+    g.Data3 = int.from_bytes(b[6:8], "little")
+    g.Data4 = (ctypes.c_ubyte * 8)(*b[8:16])
+    return g
+
+
+_win_powr_set = False
+
+
+def _win_powr():
+    """powrprof 的 argtypes 只装一次；失败（非 Windows）返回 None。"""
+    global _win_powr_set
+    if sys.platform != "win32":
+        return None
+    p = ctypes.windll.powrprof
+    if not _win_powr_set:
+        _win_powr_set = True
+        p.PowerGetActiveScheme.restype = ctypes.c_ulong
+        p.PowerGetActiveScheme.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(_GUID))]
+        for fn in ("PowerReadACValueIndex", "PowerReadDCValueIndex"):
+            getattr(p, fn).restype = ctypes.c_ulong
+            getattr(p, fn).argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(_GUID), ctypes.POINTER(_GUID),
+                ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_ulong)]
+    return p
+
+
+def _lid_state():
+    """当前电源计划的合盖动作 (AC, DC)；读不到（台式机/不支持）返回 None。"""
+    p = _win_powr()
+    if not p:
+        return None
+    try:
+        scheme = ctypes.POINTER(_GUID)()
+        if p.PowerGetActiveScheme(None, ctypes.byref(scheme)) != 0:
+            return None
+        try:
+            sub, setting = _guid(_LID_SUB), _guid(_LID_SETTING)
+            ac, dc = ctypes.c_ulong(), ctypes.c_ulong()
+            rc_ac = p.PowerReadACValueIndex(
+                None, scheme, ctypes.byref(sub), ctypes.byref(setting),
+                ctypes.byref(ac))
+            rc_dc = p.PowerReadDCValueIndex(
+                None, scheme, ctypes.byref(sub), ctypes.byref(setting),
+                ctypes.byref(dc))
+            if rc_ac != 0 or rc_dc != 0:
+                return None
+            return (int(ac.value), int(dc.value))
+        finally:
+            ctypes.windll.kernel32.LocalFree(scheme)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _win_flags_for(assertion_types):
+    """把共享计划里的断言名映射成 Windows 执行状态标志。"""
+    flags = 0
+    for a in assertion_types or ():
+        if a in (_A_IDLE_SYSTEM, _A_SYSTEM):
+            flags |= _ES_SYSTEM_REQUIRED
+        elif a == _A_IDLE_DISPLAY:
+            flags |= _ES_DISPLAY_REQUIRED
+    return flags
+
+
+class _WinExecutionHolder:
+    """在专用线程里持 ES_CONTINUOUS 标志。
+
+    SetThreadExecutionState 的效果挂在调用线程上：线程退出（或被再次调用
+    清掉标志）系统就恢复原来的休眠计时。这里用代数（generation）标记目标
+    集合的变化，apply 后置 applied 事件供调用方等待，stop() 清标志并收线程。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._want = 0
+        self._gen = 0
+        self._ok = False
+        self._applied = threading.Event()
+        self._wakeup = threading.Event()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def set(self, flags):
+        with self._lock:
+            self._want = int(flags) & 0xFFFFFFFF
+            self._gen += 1
+        self._applied.clear()
+        self._wakeup.set()
+        self._ensure_thread()
+        self._applied.wait(timeout=3.0)
+        with self._lock:
+            return self._ok
+
+    def current_names(self):
+        with self._lock:
+            ok = self._ok
+            want = self._want
+        if not ok:
+            return []
+        return [n for f, n in _WIN_FLAG_NAMES.items() if want & f]
+
+    def stop(self):
+        self._stop.set()
+        self._wakeup.set()
+        t = self._thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=5.0)
+        self._thread = None
+        with self._lock:
+            self._want = 0
+            self._ok = False
+
+    def _ensure_thread(self):
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run, name="keep-awake-win", daemon=True)
+            self._thread.start()
+
+    def _run(self):
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.SetThreadExecutionState.restype = ctypes.c_ulong
+        k32.SetThreadExecutionState.argtypes = [ctypes.c_ulong]
+        seen_gen = -1
+        while not self._stop.is_set():
+            self._wakeup.wait(timeout=30.0)   # 30s 是兜底，主要靠 set() 唤醒
+            self._wakeup.clear()
+            if self._stop.is_set():
+                break
+            with self._lock:
+                want, gen = self._want, self._gen
+            if gen == seen_gen:
+                continue
+            prev = k32.SetThreadExecutionState(_ES_CONTINUOUS | want)
+            with self._lock:
+                self._ok = bool(prev)
+                seen_gen = gen
+            self._applied.set()
+        # 线程退出即失去效果；主动清一次更干净
+        k32.SetThreadExecutionState(_ES_CONTINUOUS)
+        with self._lock:
+            self._ok = False
 
 
 # ── ctypes 装配 ────────────────────────────────────────────────────────
@@ -306,6 +498,56 @@ def _set_sleep_disabled(disable, allow_prompt=False):
 _ASSERTION_TYPES = (_A_IDLE_SYSTEM, _A_SYSTEM, _A_IDLE_DISPLAY)
 
 
+def _win_set_lid_pair(ac_value, dc_value):
+    """把当前电源计划的合盖动作写成 (交流, 直流)；必要时弹一次 UAC 批量写。
+
+    先无提升直写（本程序以管理员运行时零打扰）；失败且 allow_prompt 时
+    把三条 powercfg 打进一个临时 cmd，用 PowerShell Start-Process -Verb
+    runAs -Wait 提权跑——一次授权，不逐条弹框。成败以读回系统状态为准。
+    """
+    if _win_write_lid_direct(ac_value, dc_value):
+        return True
+    if not allow_prompt:
+        return False
+    return _win_apply_lid_elevated(ac_value, dc_value)
+
+
+def _win_write_lid_direct(ac_value, dc_value):
+    """无提升直写当前电源计划的合盖动作，返回是否成功（读回核对）。"""
+    for scope, v in (("AC", ac_value), ("DC", dc_value)):
+        rc, _out = _run(["powercfg", "/SET%sVALUEINDEX" % scope,
+                         "SCHEME_CURRENT", "SUB_BUTTONS", "LIDACTION",
+                         str(int(v))], timeout=60)
+        if rc:
+            return False
+    rc, _out = _run(["powercfg", "/SETACTIVE", "SCHEME_CURRENT"], timeout=60)
+    if rc:
+        return False
+    return _lid_state() == (int(ac_value), int(dc_value))
+
+
+def _win_apply_lid_elevated(ac_value, dc_value):
+    """用 UAC 提权批量写合盖动作（一个临时 cmd，一次授权）。"""
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".cmd")
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write("@echo off\r\n")
+            f.write("powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_BUTTONS "
+                    "LIDACTION %d\r\n" % int(ac_value))
+            f.write("powercfg /SETDCVALUEINDEX SCHEME_CURRENT SUB_BUTTONS "
+                    "LIDACTION %d\r\n" % int(dc_value))
+            f.write("powercfg /SETACTIVE SCHEME_CURRENT\r\n")
+        script = "Start-Process -FilePath '%s' -Verb runAs -Wait" % path
+        rc, _out = _run(["powershell", "-NoProfile", "-Command", script],
+                        timeout=180)
+        return rc == 0 and _lid_state() == (int(ac_value), int(dc_value))
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 def active_assertion_types():
     """本进程当前持有的电源断言类型集合。
 
@@ -332,11 +574,14 @@ def active_assertion_types():
 # ── 编排层：持断言 / 归还 ──────────────────────────────────────────────
 
 class KeepAwake:
-    """持断言的小状态机。非 macOS 或加载失败时所有方法都是安全的 no-op。"""
+    """持断言 / 执行状态的小状态机，macOS 与 Windows 双平台编排。"""
 
     def __init__(self):
         self._ids = {}
         self._did_set_disablesleep = False
+        # Windows 侧：执行状态持有线程 + 合盖动作原值
+        self._win_holder = _WinExecutionHolder()
+        self._win_lid_backup = None
 
     # -- 断言 --
     def _release_assertions(self):
@@ -383,10 +628,12 @@ class KeepAwake:
 
         失败不抛异常，全部转成「没生效 + 可能原因」，由界面如实显示。
         """
-        if not IS_MAC:
-            return False, "当前平台不支持（防休眠仅 macOS 有 IOKit 断言）", {}
         if mode not in MODES:
             mode = DEFAULT_MODE
+        if sys.platform == "win32":
+            return self._apply_win(mode, allow_prompt=allow_prompt)
+        if not IS_MAC:
+            return False, "当前平台不支持防休眠", {}
         clamshell = clamshell_state()
         p = plan(mode, clamshell=bool(clamshell))
         if not p["active"]:
@@ -446,13 +693,79 @@ class KeepAwake:
             self._did_set_disablesleep = False
         return ok
 
+    def _apply_win(self, mode, allow_prompt=False):
+        """Windows 侧：执行状态线程 + 合盖动作，语义对齐 macOS 四档。"""
+        p = plan(mode, clamshell=False)
+        if not p["active"]:
+            self.release_all()
+            return True, "已关闭防休眠（释放全部标志）", {"held": []}
+        # 非 clamshell 档：本程序改过的合盖动作先还原
+        if mode != MODE_CLAMSHELL and self._win_lid_backup:
+            self._restore_lid_backup()
+        flags = _win_flags_for(p["assertions"])
+        ok_exec = self._win_holder.set(flags)
+        detail = {
+            "held": self._win_holder.current_names(),
+            "lid_backup": self._win_lid_backup,
+            "prompted": False,
+        }
+        lid_now = _lid_state()
+        if mode == MODE_CLAMSHELL:
+            detail["lid"] = lid_now
+            if lid_now is not None and lid_now != (0, 0) \
+                    and not self._win_lid_backup:
+                self._win_lid_backup = lid_now
+                ok_lid = _win_set_lid_pair(0, 0, allow_prompt=allow_prompt)
+                detail["prompted"] = True   # 弹没弹 UAC 由 allow_prompt 决定，此处只标记「尝试过改系统设置」
+                detail["lid"] = _lid_state()
+                if detail["lid"] != (0, 0):
+                    # 没改成：不认领，别在退出时把用户没同意的改动背在身上
+                    self._win_lid_backup = None
+            else:
+                # 已经是 0/0：别的工具设的不认领（退出不还原）；本程序
+                # 上一轮改过的（backup 在）退出时照样还原
+                detail["lid"] = _lid_state()
+                detail["lid_already_off"] = (lid_now == (0, 0))
+        else:
+            detail["lid"] = _lid_state()
+            detail["lid_already_off"] = (_lid_state() == (0, 0))
+        detail["ok"] = ok_exec and (mode != MODE_CLAMSHELL
+                                    or detail.get("lid") == (0, 0))
+        if detail["ok"]:
+            return True, _win_ok_text(mode, detail), detail
+        return False, _win_fail_text(mode, detail), detail
+
+    def _restore_lid_backup(self, allow_prompt=False):
+        """还原本程序改过的合盖动作；原值读不到时不动（宁可不还原）。"""
+        backup = self._win_lid_backup
+        if not backup:
+            return False
+        now = _lid_state()
+        if now is not None and now == (0, 0):
+            if not _win_set_lid_pair(backup[0], backup[1],
+                                     allow_prompt=allow_prompt):
+                return False   # 还原失败：保留 backup，下次再试
+        self._win_lid_backup = None
+        return True
+
     def release_all(self):
         """释放全部断言并归还本程序设的 disablesleep（退出时调用）。"""
         self._release_assertions()
-        self._restore_disablesleep_if_needed(allow_prompt=True)
+        if sys.platform == "win32":
+            self._win_holder.stop()
+            self._restore_lid_backup(allow_prompt=True)
+        else:
+            self._restore_disablesleep_if_needed(allow_prompt=True)
 
     def status(self):
         """当前持有情况（界面状态栏用）。"""
+        if sys.platform == "win32":
+            return {
+                "held": self._win_holder.current_names(),
+                "clamshell": None,
+                "sleep_disabled": (_lid_state() == (0, 0)),
+                "owns_disablesleep": bool(self._win_lid_backup),
+            }
         return {
             "held": sorted(self._ids.keys()),
             "clamshell": clamshell_state(),
@@ -487,3 +800,30 @@ def _fail_text(mode, detail):
             and not detail.get("sleep_disabled"):
         bits.append("系统级禁止睡眠未开启（未授权或授权被取消）")
     return "防休眠未完全生效：" + "；".join(bits) if bits else "防休眠未生效（原因未知）"
+
+
+def _win_ok_text(mode, detail):
+    label = MODE_LABELS.get(mode, mode)
+    if mode == MODE_CLAMSHELL:
+        return (f"防休眠已生效：{label}（合盖动作已改为「不采取任何操作」，"
+                "退出本程序时自动还原）")
+    held = detail.get("held") or []
+    return f"防休眠已生效：{label}（{'、'.join(held)}）"
+
+
+def _win_fail_text(mode, detail):
+    label = MODE_LABELS.get(mode, mode)
+    bits = []
+    if not detail.get("held"):
+        bits.append("执行状态没持上（SetThreadExecutionState 失败）")
+    if mode == MODE_CLAMSHELL:
+        if detail.get("lid") is None:
+            bits.append("读不到合盖动作设置（可能是台式机或不支持的电源计划）")
+        elif detail.get("lid_already_off"):
+            bits.append("合盖动作本来就是「不采取任何操作」"
+                        "（可能是别的工具设的，退出不会还原）")
+        elif detail.get("lid_untouched"):
+            bits.append("合盖动作未改（启动恢复不弹授权框，请在界面点「立即生效」重新套用）")
+        elif detail.get("lid") != (0, 0):
+            bits.append("合盖动作未改成「不采取任何操作」（需要管理员授权，或组策略禁改）")
+    return f"防休眠未完全生效（{label}）：" + "；".join(bits)

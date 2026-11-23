@@ -34,6 +34,7 @@ else:
     import tray
     import display_notify
     import rehome
+    import keep_awake
     import dragsnap
 
 
@@ -85,6 +86,8 @@ reset_ax_permission_lost = getattr(windows, "reset_ax_permission_lost",
 # 四宫格排列预演（点排列前的空白/放不下预告；只读，不动任何窗口）
 quad_predict = getattr(windows, "quad_predict", lambda *a, **k: ([], {}))
 is_window_portrait_suitable = getattr(windows, "is_window_portrait_suitable", lambda *a, **k: True)
+# 四宫格容量预检（当前选择在一块屏上最多排得下几个；只读缓存）
+quad_capacity = getattr(windows, "quad_capacity", None)
 fill_all_monitors = getattr(windows, "fill_all_monitors", lambda *a, **k: 0)
 # 虚拟桌面网格：把勾选的多块屏当成一块大桌面，按 m×n 或加权比例网格批排
 fill_grid = getattr(windows, "fill_grid", lambda *a, **k: 0)
