@@ -26,7 +26,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import build  # noqa: E402
 import resources  # noqa: E402
 
+# 用例里的资源路径都是 C:\ 风格（PyInstaller 单文件解包目录），
+# 只在 Windows 上有意义；macOS/Linux 的资源布局不同，按平台跳过。
+IS_WIN = sys.platform == "win32"
 
+
+@unittest.skipUnless(IS_WIN, "Windows 专属：PyInstaller 资源布局")
 class AssetPathTest(unittest.TestCase):
     def test_finds_resource_next_to_module_when_not_frozen(self):
         with mock.patch.object(sys, "frozen", False, create=True), \
@@ -63,6 +68,7 @@ class AssetPathTest(unittest.TestCase):
             self.assertIsNone(resources.asset_path("nope.ico"))
 
 
+@unittest.skipUnless(IS_WIN, "Windows 专属：PyInstaller 资源布局")
 class BuildCommandTest(unittest.TestCase):
     """构建命令必须把 app.ico 打进包里。"""
 

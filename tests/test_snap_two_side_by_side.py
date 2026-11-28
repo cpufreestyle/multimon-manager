@@ -17,7 +17,12 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import windows  # noqa: E402
+try:
+    import windows  # noqa: E402
+except (ImportError, AttributeError):
+    # windows.py → monitors.py 在模块顶层用 ctypes.windll，Windows 专有。
+    # macOS 上无法导入，整份用例没有意义，按平台跳过。
+    windows = None
 
 
 class _Mon:
@@ -43,6 +48,7 @@ def _win(hwnd, x=0, y=0, w=400, h=300):
             "name": "win%d" % hwnd, "x": x, "y": y, "w": w, "h": h}
 
 
+@unittest.skipIf(windows is None, "Windows 专属：依赖 windows.py / ctypes.windll")
 class SnapTwoSideBySideTest(unittest.TestCase):
     def setUp(self):
         self._mon_mod = windows.monitors

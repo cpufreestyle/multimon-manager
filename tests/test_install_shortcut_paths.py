@@ -24,9 +24,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import install  # noqa: E402
 
+# 整份用例都是 Windows 专属：读注册表、写 .lnk 快捷方式和卸载 .bat。
+# macOS 上 install.py 没有 winreg 分支，这些断言注定不成立，按平台跳过。
+IS_WIN = sys.platform == "win32"
+
 _REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
 
 
+@unittest.skipUnless(IS_WIN, "Windows 专属")
 class DesktopDirTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -74,6 +79,7 @@ class DesktopDirTest(unittest.TestCase):
         self.assertTrue(os.path.isdir(install._desktop_dir()))
 
 
+@unittest.skipUnless(IS_WIN, "Windows 专属")
 class DesktopLnkCandidatesTest(unittest.TestCase):
     def test_lists_real_desktop_first_then_legacy_profile_desktop(self):
         real = r"D:\michael\桌面"
@@ -97,6 +103,7 @@ class DesktopLnkCandidatesTest(unittest.TestCase):
             got, [os.path.join(home, "Desktop", "MultiMonManager.lnk")])
 
 
+@unittest.skipUnless(IS_WIN, "Windows 专属")
 class UninstallBatTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
