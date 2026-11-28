@@ -6111,13 +6111,19 @@ class App:
 
     def on_close(self):
         self.root.withdraw()
-        # 首次关闭时告知用户：窗口只是最小化到托盘，而非退出程序
+        # 首次关闭时告知用户：窗口只是最小化到托盘，而非退出程序。
+        # 绝不能用 messagebox：那是**模态**对话框，会阻塞整个 Tk 事件循环
+        # （连 after 定时器都停摆），此时托盘命令轮询收不到、窗口无法被
+        # 唤醒——用户看到的就是「程序打不开」。改用状态栏 + 托盘命令提示，
+        # 不阻塞。
         if not getattr(self, "_close_hinted", False):
             self._close_hinted = True
-            messagebox.showinfo(
-                "提示",
-                "窗口已最小化到系统托盘。\n"
-                "双击托盘图标可重新打开，右键托盘图标可退出。")
+            try:
+                self.status_var.set(
+                    "已最小化到系统托盘：双击 App 或托盘图标可重新打开。")
+            except Exception:  # noqa: BLE001
+                pass
+            logger.info("窗口已最小化到托盘（首次关闭，状态栏提示）")
 
     def quit(self):
         # persist=False：退出只是停本次调度，不改「已启用」的持久化状态，
