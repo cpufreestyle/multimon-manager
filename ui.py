@@ -5423,15 +5423,19 @@ class App:
     # ---------- 托盘命令通道 ----------
     def _start_command_poll(self):
         """定时轮询托盘子进程发来的命令（每 800ms）。"""
+        # 先排下一次再执行本次：_poll_command 里任何一次异常（Tk 回调的
+        # 异常会被 tkinter 静默吞掉，只往 stderr 打印）如果发生在
+        # after() 之前，整条轮询链就**永久断掉**——托盘按钮从此全部失效，
+        # 而主进程还活着并持着单例锁，双击 App 只会得到「已有实例在运行」
+        # 然后静默退出，用户看到的正是「无法打开程序」。
+        self.root.after(800, self._start_command_poll)
         try:
             self._poll_command()
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             # 一条命令出错不能带走整条轮询链：否则托盘之后的打开/刷新/
             # 退出全部静默失效，只能重启程序才恢复。traceback 进日志，
             # 界面保持可用。
-            import logging as _lg
-            _lg.getLogger(__name__).exception("托盘命令处理失败")
-        self.root.after(800, self._start_command_poll)
+            logger.exception("托盘命令处理失败（轮询继续）: %s", e)
 
     def _poll_command(self):
         cmd = cmd_channel.take()
@@ -6084,11 +6088,26 @@ class App:
 
     # ---------- 窗口管理 ----------
     def show(self):
-        self.root.deiconify()
-        self.root.lift()
-        # 从托盘唤醒时刷新一次窗口列表，避免操作已关闭的窗口
-        self._refresh_targets()
-        self._apply_topmost()
+        ok = True
+        try:
+            self.root.deiconify()
+            self.root.lift()
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            logger.warning("唤醒窗口失败: %s", e)
+        try:
+            # 从托盘唤醒时刷新一次窗口列表，避免操作已关闭的窗口
+            self._refresh_targets()
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            logger.warning("唤醒后刷新窗口列表失败: %s", e)
+        try:
+            self._apply_topmost()
+        except Exception:  # noqa: BLE001
+            pass
+        # 回执告诉发起方「旧实例到底能不能显示窗口」：不能的话新实例会
+        # 接管（杀掉僵死的旧进程并自己启动），而不是让用户对着空气点图标。
+        cmd_channel.ack_open("ok" if ok else "fail")
 
     def on_close(self):
         self.root.withdraw()

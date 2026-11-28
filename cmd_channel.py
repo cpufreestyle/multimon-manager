@@ -9,13 +9,17 @@ import os
 import tempfile
 
 CMD_FILE = os.path.join(tempfile.gettempdir(), "multimon-manager.cmd")
+# 唤醒回执：第二次启动时发 open 命令，旧实例处理完会在这里回一条状态。
+# 没有回执就说明旧实例已经僵死（轮询链断掉或进程卡住），新实例可以接管。
+ACK_FILE = os.path.join(tempfile.gettempdir(), "multimon-manager.open.ack")
 
 
 def send(command):
     """写入一条命令（覆盖上一条）；成功返回 True，失败静默返回 False。"""
     try:
         with open(CMD_FILE, "w", encoding="utf-8") as f:
-            f.write(command)
+            # 带上发送者 pid：消费方据此判断「这条是新实例发的唤醒请求」
+            f.write("%s %d" % (command, os.getpid()))
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -25,16 +29,45 @@ def take():
     """读取并清空命令；无命令时返回 None。"""
     try:
         with open(CMD_FILE, "r", encoding="utf-8") as f:
-            cmd = f.read().strip()
+            raw = f.read().strip()
     except FileNotFoundError:
         return None
     except Exception:  # noqa: BLE001
         return None
-    if not cmd:
+    if not raw:
         return None
     try:
         with open(CMD_FILE, "w", encoding="utf-8") as f:
             f.write("")
     except Exception:  # noqa: BLE001
         pass
-    return cmd
+    parts = raw.split(None, 1)
+    return parts[0] if parts else None
+
+
+def ack_open(status="ok"):
+    """写一条唤醒回执（状态 ok / fail）。失败静默忽略。"""
+    try:
+        with open(ACK_FILE, "w", encoding="utf-8") as f:
+            f.write("%s %d" % (status, os.getpid()))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def read_open_ack():
+    """读取唤醒回执；没有或读不出返回 None。"""
+    try:
+        with open(ACK_FILE, "r", encoding="utf-8") as f:
+            parts = f.read().strip().split()
+    except Exception:  # noqa: BLE001
+        return None
+    if not parts:
+        return None
+    status = parts[0]
+    pid = None
+    if len(parts) > 1:
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            pid = None
+    return {"status": status, "pid": pid}

@@ -2,9 +2,11 @@
 import atexit
 import logging
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import tkinter as tk
 
 
@@ -61,6 +63,56 @@ import ui
 import mac_glass
 
 
+_LOCK_PATH = os.path.join(tempfile.gettempdir(), "multimon_manager.lock")
+
+
+def _lock_holder_pid():
+    """找出锁的持有者 PID；读不出返回 None。
+
+    优先读锁文件里记的 PID（新版本启动时写的）；旧版本创建的空锁文件
+    没有 PID，退回用 lsof 反查——macOS 自带，不引第三方依赖。
+    """
+    try:
+        with open(_LOCK_PATH, "r", encoding="utf-8") as f:
+            pid = int(f.read().strip() or 0) or None
+        if pid:
+            return pid
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        out = subprocess.run(["lsof", "-t", _LOCK_PATH], capture_output=True,
+                             text=True, timeout=10).stdout
+        pids = [int(x) for x in out.split() if x.strip().isdigit()]
+        return pids[0] if pids else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _acquire_lock():
+    """尝试拿单例锁；拿到返回文件对象，否则 None。"""
+    import fcntl
+    try:
+        # 不能用 "w"：那会先把锁文件清空，把在跑实例记的 PID 抹掉，
+        # 后面就没法判断旧实例是不是还活着了。
+        fd = os.open(_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return None
+    f = os.fdopen(fd, "r+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    try:
+        f.seek(0)
+        f.truncate()
+        f.write(str(os.getpid()))
+        f.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    return f
+
+
 def _single_instance():
     """防止多开。返回 True 表示当前是唯一实例。"""
     if sys.platform == "win32":
@@ -73,12 +125,12 @@ def _single_instance():
         kernel32.CreateMutexW(None, False, "Local\\MultiMonManager")
         return kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
     # macOS：fcntl 文件锁
-    import tempfile
+    global _lock_fd
+    f = _acquire_lock()
+    if f is None:
+        return False
+    _lock_fd = f
     try:
-        import fcntl
-        global _lock_fd
-        _lock_fd = open(os.path.join(tempfile.gettempdir(), "multimon_manager.lock"), "w")
-        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         # 给锁 fd 置 FD_CLOEXEC：托盘面板由 tray_mac.Popen 派生，macOS 上
         # Popen 走 posix_spawn 路径时不会逐个 close_fds，子进程会连带继承
         # 这个 fd；主进程退出后 fd 仍活在托盘面板里，flock 锁就一直不释放，
@@ -94,6 +146,90 @@ def _single_instance():
 
 
 _lock_fd = None
+
+
+def _pid_is_ours(pid):
+    """确认 PID 仍是本程序的主进程，避免误杀别的进程（PID 可能被回收）。"""
+    if not pid:
+        return False
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:  # noqa: BLE001
+        return False
+    cmd = out.strip()
+    return bool(cmd) and ("main.py" in cmd or "MultiMonManager" in cmd)
+
+
+def _wait_for_open_ack(timeout=3.0):
+    """等旧实例回唤醒回执；返回 ok / fail / None（无响应）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ack = cmd_channel.read_open_ack()
+        if ack:
+            return ack.get("status")
+        time.sleep(0.15)
+    return None
+
+
+def _main_window_visible():
+    """主窗口当前是否在屏上（用来独立确认唤醒是否真的生效）。"""
+    try:
+        import windows_mac as wm
+        for w in wm.list_windows_front_to_back(min_size=200):
+            name = w.get("name") or ""
+            # 主窗口标题带「michaelqiu 出品」；托盘面板只叫「多屏管理器」。
+            # 只按前缀会把托盘也算成主窗口，导致「窗口在屏=True」的误判。
+            if name.startswith("多屏管理器 ·") and w.get("w", 0) >= 600:
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _take_over_stale_instance():
+    """僵死的旧实例占着锁：杀掉它，让当前进程接管。"""
+    pid = _lock_holder_pid()
+    if not _pid_is_ours(pid):
+        return False
+    logging.getLogger(__name__).warning(
+        "旧实例无响应（pid=%s），结束它并接管", pid)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            break
+        time.sleep(1.0)
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            break
+    # 托盘子进程和 bash 守护脚本是旧实例派生的，不清理会继续占着窗口/抢锁。
+    # 按 PPID/PID 精确点名，不用 pkill -f 的宽松模式——它会把「命令行里
+    # 提到这个字符串的别的进程」（包括调用方 shell）一起带走。
+    try:
+        out = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,ppid=,command="],
+            capture_output=True, text=True, timeout=10).stdout
+        targets = []
+        for line in out.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            child_pid, parent_pid, command = int(parts[0]), int(parts[1]), parts[2]
+            if parent_pid != pid:
+                continue
+            if ("_tray_panel.py" in command or
+                    "Contents/MacOS/MultiMonManager" in command):
+                targets.append(child_pid)
+        for child_pid in targets:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return True
 
 
 def _set_dpi_aware():
@@ -206,13 +342,53 @@ def main():
     _set_dpi_aware()
     _set_appusermodelid()
     if not _single_instance():
-        logging.getLogger(__name__).info("已有实例在运行，退出")
+        # 已有实例在跑：不要静默退出——用户在主窗口被关掉（on_close 只是
+        # withdraw 缩到托盘，进程仍活着并持锁）之后再双击 App，标准做法是
+        # **唤醒已有实例的窗口**，而不是让新进程悄悄死掉。
+        # 早先的实现是「记一行日志就 return」，用户看到的就是「双击了却
+        # 什么都没发生」= 无法打开程序，而主窗口其实躲在托盘里。
+        # 通道正是主进程和托盘子进程之间用的那条（cmd_channel），主进程
+        # 每 800ms 轮询一次，收到 "open" 就 deiconify + lift。
+        logging.getLogger(__name__).info("已有实例在运行，尝试唤醒其窗口")
+        # 清掉上一次的旧回执，避免把上次的 fail 当成本次的结果
         try:
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(None, "多屏管理器已在运行。", "多屏管理器", 0x40)
-        except Exception:  # noqa: BLE001
+            os.remove(cmd_channel.ACK_FILE)
+        except OSError:
             pass
-        return
+        woke = False
+        if cmd_channel.send("open"):
+            logging.getLogger(__name__).info("已向已有实例发送 open 命令")
+            status = _wait_for_open_ack()
+            # 双保险：回执说是 ok，但再独立查一次窗口是否真在屏上。
+            # 回执也可能来自上一轮的旧文件，所以两者都要满足才算唤醒成功。
+            if status == "ok" and _main_window_visible():
+                logging.getLogger(__name__).info("已有实例已恢复显示窗口")
+                woke = True
+            else:
+                logging.getLogger(__name__).warning(
+                    "已有实例无法恢复窗口（回执=%s，窗口在屏=%s）",
+                    status, _main_window_visible())
+        else:
+            logging.getLogger(__name__).warning("唤醒已有实例失败：命令通道写入错误")
+        if woke:
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(None, "多屏管理器已在运行。", "多屏管理器", 0x40)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # 旧实例僵死（轮询链断掉 / 进程卡住 / 窗口被系统回收），它还占着
+        # 单例锁：不接管的话用户永远只能看到「无法打开程序」。
+        if _take_over_stale_instance():
+            time.sleep(1.0)
+            if _single_instance():
+                logging.getLogger(__name__).info("已接管僵死实例，继续启动")
+            else:
+                logging.getLogger(__name__).error("接管失败：锁仍被占用")
+                return
+        else:
+            logging.getLogger(__name__).error("旧实例无法接管，退出")
+            return
     logging.getLogger(__name__).info("单实例锁已获取，准备创建窗口…")
     # 四宫格尺寸缓存（上次实测的最小尺寸 / 尺寸上限）读入内存：排列预演
     # （点「2×2 排列」前的空白预告）与容量预检消费它。macOS 侧与 Windows 侧
