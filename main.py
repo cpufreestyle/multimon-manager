@@ -158,7 +158,94 @@ def _pid_is_ours(pid):
     except Exception:  # noqa: BLE001
         return False
     cmd = out.strip()
-    return bool(cmd) and ("main.py" in cmd or "MultiMonManager" in cmd)
+    if not cmd:
+        return False
+    # 命令行里带完整包路径 = 铁证是本 App；裸 `main.py` 要看 cwd。
+    target = _app_resources_dir()
+    if target in cmd or "MultiMonManager" in cmd:
+        return True
+    if cmd.endswith("main.py") or " main.py" in cmd:
+        return _pid_cwd_is_app(pid)
+    return False
+
+
+def _app_resources_dir():
+    """本 App 的代码目录（打包运行时就是包内 Resources 目录）。"""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _app_dir_markers():
+    """判定「某个进程属于本 App」时认的目录标记集合。
+
+    打包运行时主进程的 cwd 是 `dist/多屏管理器.app/Contents/Resources`，
+    源码运行时是仓库根；两个都要认，否则打包后的实例识别不出来。
+    """
+    here = _app_resources_dir()
+    markers = {here}
+    pkg_res = os.path.join(here, "dist", "多屏管理器.app", "Contents", "Resources")
+    if os.path.isdir(pkg_res):
+        markers.add(pkg_res)
+    return markers
+
+def _pid_cwd_is_app(pid):
+    """进程的 cwd 是否就在本 App 的 Resources 目录里。
+
+    主进程的命令行只有 `Python main.py`（cwd 已切到 Resources），看不出
+    是哪个项目——但 cwd 能精确区分。用 lsof 查 cwd，不依赖命令行文本。
+    """
+    try:
+        out = subprocess.run(["lsof", "-a", "-d", "cwd", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:  # noqa: BLE001
+        return False
+    for marker in _app_dir_markers():
+        for line in out.splitlines()[1:]:
+            if line.rstrip().endswith(marker):
+                return True
+    return False
+
+
+def _process_start_time(pid):
+    """进程启动时间（Unix 时间戳），读不到返回 None。"""
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        if not out:
+            return None
+        import datetime
+        return datetime.datetime.strptime(
+            out, "%a %b %d %H:%M:%S %Y").timestamp()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _our_process_pids(exclude=None):
+    """列出属于本 App 的所有进程 PID（主进程 + 托盘面板）。"""
+    exclude = exclude or set()
+    try:
+        out = subprocess.run(["ps", "-ax", "-o", "pid=,command="],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:  # noqa: BLE001
+        return []
+    pids = []
+    markers = _app_dir_markers()
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid in exclude or pid == os.getpid() or pid == os.getppid():
+            continue
+        cmd = parts[1]
+        if "_tray_panel.py" in cmd and any(m in cmd for m in markers):
+            pids.append(pid)
+        elif cmd.endswith("main.py") or " main.py" in cmd:
+            if _pid_cwd_is_app(pid):
+                pids.append(pid)
+    return pids
 
 
 def _wait_for_open_ack(timeout=3.0):
@@ -204,9 +291,29 @@ def _take_over_stale_instance():
             os.kill(pid, 0)
         except OSError:
             break
+    # 把**所有**属于本 App 的残留进程一起清掉，不只是锁的持有者。
+    # 只杀持有者不够：早先的实例可能已经攒下好几个（每次「以为打不开又
+    # 双击」就多一个），它们会互相抢锁——杀掉一个，另一个立刻占上，
+    # 表现为「接管失败：锁仍被占用」。
+    # 判定靠 cwd（主进程命令���只有 `main.py`）+ 完整包路径（托盘），
+    # 不用 pkill -f 的宽松模式：那会把「命令行里提到该字符串的别的进程」
+    # （包括调用方 shell）一起带走，实测 exit 137。
+    # 必须排除自己这条链：当前进程的 cwd 也在包内 Resources 里，
+    # 不排除就会把刚启动的自己杀掉（实测进程全灭、App 消失）。
+    protected = {pid, os.getpid(), os.getppid()}
+    # 再按启动时间过滤：只杀比当前进程更早的实例。守护脚本可能已经
+    # 拉起了另一个「同 cwd、同命令行」的自己（PID 比我们新），那个要留着。
+    my_start = _process_start_time(os.getpid())
+    for other in _our_process_pids(exclude=protected):
+        if my_start is not None:
+            other_start = _process_start_time(other)
+            if other_start is not None and other_start > my_start:
+                continue
+        try:
+            os.kill(other, signal.SIGKILL)
+        except OSError:
+            pass
     # 托盘子进程和 bash 守护脚本是旧实例派生的，不清理会继续占着窗口/抢锁。
-    # 按 PPID/PID 精确点名，不用 pkill -f 的宽松模式——它会把「命令行里
-    # 提到这个字符串的别的进程」（包括调用方 shell）一起带走。
     try:
         out = subprocess.run(
             ["ps", "-ax", "-o", "pid=,ppid=,command="],
@@ -380,9 +487,13 @@ def main():
         # 旧实例僵死（轮询链断掉 / 进程卡住 / 窗口被系统回收），它还占着
         # 单例锁：不接管的话用户永远只能看到「无法打开程序」。
         if _take_over_stale_instance():
-            time.sleep(1.0)
-            if _single_instance():
-                logging.getLogger(__name__).info("已接管僵死实例，继续启动")
+            # 残留进程被杀后内核要一会儿才释放 flock，最多试 5 次。
+            for attempt in range(5):
+                time.sleep(0.6)
+                if _single_instance():
+                    logging.getLogger(__name__).info(
+                        "已接管僵死实例，继续启动（第 %d 次尝试）", attempt + 1)
+                    break
             else:
                 logging.getLogger(__name__).error("接管失败：锁仍被占用")
                 return
